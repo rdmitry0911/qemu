@@ -420,7 +420,13 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         },
         .vram_size = vram_size,
     };
-    
+
+    /* v3.90b: Enable direct scanout if requested */
+    if (s->direct_scanout) {
+        pvg_config_set_direct_scanout_internal(&pvg_config, s->vsync_enabled ? 1 : 0);
+        qemu_log("[apple-gfx-ml] v3.90b: Direct scanout enabled (internal GLFW window)\n");
+    }
+
     s->pvg_dev = pvg_device_create(&pvg_config, &pvg_callbacks);
     if (!s->pvg_dev) {
         error_setg(errp, "Failed to create PVG device");
