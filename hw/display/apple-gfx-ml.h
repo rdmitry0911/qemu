@@ -100,11 +100,6 @@ struct AppleGfxMLState {
     bool trace_dma;
     
     /* v83: Display refresh is now handled by qmetal library's internal thread */
-
-    /* Serializes qmetal MMIO calls when BQL is released.
-     * Without BQL, multiple vCPUs can enter MMIO handlers concurrently.
-     * qmetal's global state is not thread-safe, so we serialize access. */
-    pthread_mutex_t qmu_mutex;
 };
 
 /* Properties macro for device registration
