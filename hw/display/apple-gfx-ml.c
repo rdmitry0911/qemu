@@ -6,12 +6,12 @@
  *
  * This device is intentionally minimal - following Apple's pattern where
  * the QEMU device only handles PCI registration and proxies everything
- * to the framework (pvg-host in our case).
+ * to the library (qmetal unified API).
  *
  * Compare with Apple's apple-gfx-pci.m which is ~200 lines.
  *
  * v96: Fixed critical display issue - present_frame now uses BH for
- *      thread-safe display updates from pvg-host's pthread.
+ *      thread-safe display updates from qmetal's pthread.
  */
 
 #include "qemu/osdep.h"
@@ -31,11 +31,10 @@
 #include "trace.h"
 
 #include "apple-gfx-ml.h"
-#include "pvg/pvg_device.h"
-#include "pvg/pvg_logging.h"
+#include "qmu/qmetal_unified.h"
 
 /* ============================================================
- * Memory Access Callbacks (QEMU → pvg-host)
+ * Memory Access Callbacks (QEMU → qmetal)
  * These match Apple's PGDeviceDescriptor callback interface
  * ============================================================ */
 
@@ -81,39 +80,8 @@ static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf, size_t si
 }
 
 /* ============================================================
- * PVG Library Logging Callback
- * Routes pvg-host log messages to QEMU logging infrastructure
- * ============================================================ */
-
-static void G_GNUC_PRINTF(7, 0)
-pvg_qemu_log_callback(void *ctx, PVGLogLevel level,
-                      PVGLogCategory category,
-                      const char *file, int line,
-                      const char *func,
-                      const char *fmt, va_list args)
-{
-    char buf[1024];
-    vsnprintf(buf, sizeof(buf), fmt, args);
-
-    /* Route based on log level */
-    switch (level) {
-    case PVG_LOG_ERROR:
-        qemu_log_mask(LOG_GUEST_ERROR, "PVG: %s\n", buf);
-        break;
-    case PVG_LOG_WARN:
-        qemu_log_mask(LOG_UNIMP, "PVG: %s\n", buf);
-        break;
-    default:
-        /* INFO/DEBUG/TRACE - use trace event for filtering */
-        trace_pvg_log(pvg_log_level_name(level),
-                      pvg_log_category_name(category), buf);
-        break;
-    }
-}
-
-/* ============================================================
  * v96: Thread-safe Interrupt Delivery (Apple style)
- * IRQ is raised from pvg-host pthread, must be delivered via BH
+ * IRQ is raised from qmetal pthread, must be delivered via BH
  * ============================================================ */
 
 typedef struct AppleGfxMLInterruptJob {
@@ -155,10 +123,10 @@ static void qemu_raise_irq(void *ctx, uint32_t vector)
 
 /* ============================================================
  * v96: Thread-safe Display Updates (Apple style)
- * 
- * present_frame is called from pvg-host's display_refresh_thread.
+ *
+ * present_frame is called from qmetal's display_refresh_thread.
  * QEMU display operations MUST run in main loop.
- * 
+ *
  * Solution: Double-buffered framebuffer + BH scheduling.
  * This matches Apple's approach with newFrameEventHandler + BH.
  * ============================================================ */
@@ -265,7 +233,7 @@ static void qemu_present_frame(void *ctx, const void *pixels,
                             apple_gfx_ml_present_frame_bh, s);
 }
 
-/* v83: Display refresh is handled by pvg-host library's internal thread.
+/* v83: Display refresh is handled by qmetal library's internal thread.
  * No timer needed in QEMU driver - we just receive present_frame callbacks.
  */
 
@@ -289,15 +257,21 @@ static int qemu_read_vram(void *ctx, uint64_t vram_offset, void *buf, size_t siz
 }
 
 /* ============================================================
- * MMIO Operations - Pure Proxy to pvg-host
+ * MMIO Operations - Pure Proxy to qmetal
  * (Like Apple's [pgiosfc mmioReadAtOffset:])
  * ============================================================ */
 
 static uint64_t agfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     AppleGfxMLState *s = opaque;
-    uint64_t val = pvg_mmio_read(s->pvg_dev, (uint32_t)offset, size);
-    
+    uint64_t val;
+
+    bql_unlock();
+    pthread_mutex_lock(&s->qmu_mutex);
+    val = qmu_mmio_read(s->qmu_dev, (uint32_t)offset, size);
+    pthread_mutex_unlock(&s->qmu_mutex);
+    bql_lock();
+
     trace_apple_gfx_ml_mmio_read(offset, val, size);
     return val;
 }
@@ -306,9 +280,13 @@ static void agfx_mmio_write(void *opaque, hwaddr offset,
                              uint64_t val, unsigned size)
 {
     AppleGfxMLState *s = opaque;
-    
+
     trace_apple_gfx_ml_mmio_write(offset, val, size);
-    pvg_mmio_write(s->pvg_dev, (uint32_t)offset, val, size);
+    bql_unlock();
+    pthread_mutex_lock(&s->qmu_mutex);
+    qmu_mmio_write(s->qmu_dev, (uint32_t)offset, val, size);
+    pthread_mutex_unlock(&s->qmu_mutex);
+    bql_lock();
 }
 
 static const MemoryRegionOps agfx_mmio_ops = {
@@ -327,7 +305,7 @@ static const MemoryRegionOps agfx_mmio_ops = {
 
 static void agfx_gfx_update(void *opaque)
 {
-    /* Display updates are pushed from pvg-host via present_frame callback + BH */
+    /* Display updates are pushed from qmetal via present_frame callback + BH */
 }
 
 static const GraphicHwOps agfx_gfx_ops = {
@@ -369,6 +347,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     /* Setup MMIO BAR (BAR0) - Apple only uses this one BAR */
     memory_region_init_io(&s->mmio, OBJECT(s), &agfx_mmio_ops, s,
                           "apple-gfx-mmio", APPLE_GFX_ML_MMIO_SIZE);
+    s->mmio.disable_reentrancy_guard = true;
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
     
     /* Setup host VRAM (not a PCI BAR - internal storage) */
@@ -380,6 +359,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     
     /* v96: Initialize frame mutex for thread-safe display updates */
     pthread_mutex_init(&s->frame_mutex, NULL);
+    pthread_mutex_init(&s->qmu_mutex, NULL);
     
     /* v96: Allocate double-buffered framebuffers */
     initial_fb_size = (size_t)s->display_height * s->display_width * 4;
@@ -393,8 +373,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
     
-    /* Create pvg-host device with callbacks */
-    PVGCallbacks pvg_callbacks = {
+    /* Create qmetal device with callbacks */
+    qmu_extended_callbacks qmu_callbacks = {
         .user_ctx = s,
         .map_gpa = qemu_map_gpa,
         .unmap_gpa = qemu_unmap_gpa,
@@ -404,9 +384,9 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .present_frame = qemu_present_frame,
         .read_vram = qemu_read_vram,
     };
-    
-    PVGConfig pvg_config = {
-        .struct_size = sizeof(PVGConfig),
+
+    qmu_extended_config qmu_config = {
+        .struct_size = sizeof(qmu_extended_config),
         .ram_base = 0,
         .ram_size = 0,  /* No restriction */
         .max_protocol_version = 6,
@@ -419,25 +399,17 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
             (1024 << 16) | 1280,                            /* Mode 2 */
         },
         .vram_size = vram_size,
+        .direct_scanout = s->direct_scanout,
+        .vsync_enabled = s->vsync_enabled,
     };
 
-    /* v3.90b: Enable direct scanout if requested */
-    if (s->direct_scanout) {
-        pvg_config_set_direct_scanout_internal(&pvg_config, s->vsync_enabled ? 1 : 0);
-        qemu_log("[apple-gfx-ml] v3.90b: Direct scanout enabled (internal GLFW window)\n");
-    }
-
-    s->pvg_dev = pvg_device_create(&pvg_config, &pvg_callbacks);
-    if (!s->pvg_dev) {
-        error_setg(errp, "Failed to create PVG device");
+    s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
+    if (!s->qmu_dev) {
+        error_setg(errp, "Failed to create qmetal device");
         return;
     }
-    
-    pvg_set_debug_level(s->pvg_dev, s->debug_level);
-    
-    /* Hook pvg-host logging to QEMU logging system */
-    pvg_log_set_callback(pvg_qemu_log_callback, s);
-    pvg_log_set_level(s->debug_level > 0 ? PVG_LOG_DEBUG : PVG_LOG_INFO);
+
+    qmu_set_debug_level(s->qmu_dev, s->debug_level);
     
     /* Create QEMU console */
     s->con = graphic_console_init(DEVICE(s), 0, &agfx_gfx_ops, s);
@@ -453,21 +425,22 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         s->fb_stride, s->display_fb);
     dpy_gfx_replace_surface(s->con, surface);
     
-    qemu_log("[apple-gfx-ml] Device realized successfully (v96: thread-safe display)\n");
+    qemu_log("[apple-gfx-ml] Device realized successfully (qmetal unified, v96: thread-safe display)\n");
 }
 
 static void agfx_exit(PCIDevice *pci_dev)
 {
     AppleGfxMLState *s = APPLE_GFX_ML(pci_dev);
     
-    /* Destroy pvg device first (stops display thread) */
-    if (s->pvg_dev) {
-        pvg_device_destroy(s->pvg_dev);
-        s->pvg_dev = NULL;
+    /* Destroy qmetal device first (stops display thread) */
+    if (s->qmu_dev) {
+        qmu_destroy(s->qmu_dev);
+        s->qmu_dev = NULL;
     }
     
     /* v96: Cleanup framebuffers and mutex */
     pthread_mutex_destroy(&s->frame_mutex);
+    pthread_mutex_destroy(&s->qmu_mutex);
     g_free(s->staging_fb);
     s->staging_fb = NULL;
     g_free(s->display_fb);
@@ -484,7 +457,7 @@ static void agfx_reset(Object *obj, ResetType type)
     s->has_rendered_frame = false;
     s->frame_pending = false;
     
-    /* pvg-host handles its own reset via MMIO writes from guest */
+    /* qmetal handles its own reset via MMIO writes from guest */
 }
 
 /* ============================================================
