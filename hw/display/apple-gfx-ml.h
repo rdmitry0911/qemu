@@ -90,6 +90,7 @@ struct AppleGfxMLState {
     bool vsync_enabled;
     uint32_t debug_level;
     bool direct_scanout;    /* v3.90b: Enable direct Vulkan scanout window */
+    char *spirv_cache_dir;  /* SPIR-V + VkPipelineCache disk cache directory */
 
     /* Runtime state */
     bool msi_used;
@@ -117,6 +118,7 @@ struct AppleGfxMLState {
     DEFINE_PROP_STRING("renderer", AppleGfxMLState, renderer), \
     DEFINE_PROP_BOOL("vsync", AppleGfxMLState, vsync_enabled, true), \
     DEFINE_PROP_UINT32("debug", AppleGfxMLState, debug_level, 0), \
-    DEFINE_PROP_BOOL("direct_scanout", AppleGfxMLState, direct_scanout, false)
+    DEFINE_PROP_BOOL("direct_scanout", AppleGfxMLState, direct_scanout, false), \
+    DEFINE_PROP_STRING("spirv_cache_dir", AppleGfxMLState, spirv_cache_dir)
 
 #endif /* HW_DISPLAY_APPLE_GFX_ML_H */

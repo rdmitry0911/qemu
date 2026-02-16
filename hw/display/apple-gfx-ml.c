@@ -257,6 +257,23 @@ static int qemu_read_vram(void *ctx, uint64_t vram_offset, void *buf, size_t siz
 }
 
 /* ============================================================
+ * Long-op hooks — release qmu_mutex during slow shader compilation
+ * so other vCPU threads can process MMIO on other channels.
+ * ============================================================ */
+
+static void qemu_long_op_unlock(void *ctx)
+{
+    AppleGfxMLState *s = ctx;
+    pthread_mutex_unlock(&s->qmu_mutex);
+}
+
+static void qemu_long_op_lock(void *ctx)
+{
+    AppleGfxMLState *s = ctx;
+    pthread_mutex_lock(&s->qmu_mutex);
+}
+
+/* ============================================================
  * MMIO Operations - Pure Proxy to qmetal
  * (Like Apple's [pgiosfc mmioReadAtOffset:])
  * ============================================================ */
@@ -401,6 +418,10 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .vram_size = vram_size,
         .direct_scanout = s->direct_scanout,
         .vsync_enabled = s->vsync_enabled,
+        .long_op_unlock = qemu_long_op_unlock,
+        .long_op_lock = qemu_long_op_lock,
+        .long_op_ctx = s,
+        .spirv_cache_dir = s->spirv_cache_dir,
     };
 
     s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
