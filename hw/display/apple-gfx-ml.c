@@ -18,8 +18,12 @@
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
+#include "qemu/atomic.h"
+#include "qemu/thread.h"
 #include "qemu/main-loop.h"
 #include "block/aio.h"      /* for aio_bh_schedule_oneshot */
+#include "block/aio-wait.h"
+#include "block/thread-pool.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
@@ -65,18 +69,80 @@ static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
     (void)ctx; (void)hva; (void)size; (void)dirty;
 }
 
+typedef struct AppleGfxMLReadMemoryJob {
+    QemuEvent event;
+    uint64_t gpa;
+    size_t size;
+    void *buf;
+    bool success;
+} AppleGfxMLReadMemoryJob;
+
+typedef struct AppleGfxMLWriteMemoryJob {
+    QemuEvent event;
+    uint64_t gpa;
+    size_t size;
+    const void *buf;
+    bool success;
+} AppleGfxMLWriteMemoryJob;
+
+static void apple_gfx_ml_do_read_memory(void *opaque)
+{
+    AppleGfxMLReadMemoryJob *job = opaque;
+    MemTxResult r;
+
+    r = address_space_read(&address_space_memory, job->gpa,
+                           MEMTXATTRS_UNSPECIFIED, job->buf, job->size);
+    job->success = (r == MEMTX_OK);
+    qemu_event_set(&job->event);
+}
+
+static void apple_gfx_ml_do_write_memory(void *opaque)
+{
+    AppleGfxMLWriteMemoryJob *job = opaque;
+    MemTxResult r;
+
+    r = address_space_write(&address_space_memory, job->gpa,
+                            MEMTXATTRS_UNSPECIFIED, job->buf, job->size);
+    job->success = (r == MEMTX_OK);
+    qemu_event_set(&job->event);
+}
+
 static int qemu_read_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
 {
-    MemTxResult r = address_space_read(&address_space_memory, gpa,
-                                        MEMTXATTRS_UNSPECIFIED, buf, size);
-    return (r == MEMTX_OK) ? 0 : -1;
+    (void)ctx;
+
+    AppleGfxMLReadMemoryJob job = {
+        .gpa = gpa,
+        .size = size,
+        .buf = buf,
+        .success = false,
+    };
+
+    qemu_event_init(&job.event, false);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            apple_gfx_ml_do_read_memory, &job);
+    qemu_event_wait(&job.event);
+    qemu_event_destroy(&job.event);
+    return job.success ? 0 : -1;
 }
 
 static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf, size_t size)
 {
-    MemTxResult r = address_space_write(&address_space_memory, gpa,
-                                         MEMTXATTRS_UNSPECIFIED, buf, size);
-    return (r == MEMTX_OK) ? 0 : -1;
+    (void)ctx;
+
+    AppleGfxMLWriteMemoryJob job = {
+        .gpa = gpa,
+        .size = size,
+        .buf = buf,
+        .success = false,
+    };
+
+    qemu_event_init(&job.event, false);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            apple_gfx_ml_do_write_memory, &job);
+    qemu_event_wait(&job.event);
+    qemu_event_destroy(&job.event);
+    return job.success ? 0 : -1;
 }
 
 /* ============================================================
@@ -256,21 +322,32 @@ static int qemu_read_vram(void *ctx, uint64_t vram_offset, void *buf, size_t siz
     return 0;
 }
 
-/* ============================================================
- * Long-op hooks — release qmu_mutex during slow shader compilation
- * so other vCPU threads can process MMIO on other channels.
- * ============================================================ */
+typedef struct AppleGfxMLIOJob {
+    AppleGfxMLState *state;
+    uint32_t offset;
+    uint64_t value;
+    unsigned size;
+    bool completed;
+} AppleGfxMLIOJob;
 
-static void qemu_long_op_unlock(void *ctx)
+static int apple_gfx_ml_do_mmio_read(void *opaque)
 {
-    AppleGfxMLState *s = ctx;
-    pthread_mutex_unlock(&s->qmu_mutex);
+    AppleGfxMLIOJob *job = opaque;
+
+    job->value = qmu_mmio_read(job->state->qmu_dev, job->offset, job->size);
+    qatomic_set(&job->completed, true);
+    aio_wait_kick();
+    return 0;
 }
 
-static void qemu_long_op_lock(void *ctx)
+static int apple_gfx_ml_do_mmio_write(void *opaque)
 {
-    AppleGfxMLState *s = ctx;
-    pthread_mutex_lock(&s->qmu_mutex);
+    AppleGfxMLIOJob *job = opaque;
+
+    qmu_mmio_write(job->state->qmu_dev, job->offset, job->value, job->size);
+    qatomic_set(&job->completed, true);
+    aio_wait_kick();
+    return 0;
 }
 
 /* ============================================================
@@ -280,36 +357,44 @@ static void qemu_long_op_lock(void *ctx)
 
 static uint64_t agfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
-    AppleGfxMLState *s = opaque;
-    uint64_t val;
+    AppleGfxMLIOJob job = {
+        .state = opaque,
+        .offset = (uint32_t)offset,
+        .size = size,
+        .completed = false,
+    };
 
-    bql_unlock();
-    pthread_mutex_lock(&s->qmu_mutex);
-    val = qmu_mmio_read(s->qmu_dev, (uint32_t)offset, size);
-    pthread_mutex_unlock(&s->qmu_mutex);
-    bql_lock();
+    thread_pool_submit_aio(apple_gfx_ml_do_mmio_read, &job, NULL, NULL);
+    AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
 
-    trace_apple_gfx_ml_mmio_read(offset, val, size);
-    return val;
+    trace_apple_gfx_ml_mmio_read(offset, job.value, size);
+    return job.value;
 }
 
 static void agfx_mmio_write(void *opaque, hwaddr offset,
                              uint64_t val, unsigned size)
 {
-    AppleGfxMLState *s = opaque;
+    AppleGfxMLIOJob job = {
+        .state = opaque,
+        .offset = (uint32_t)offset,
+        .value = val,
+        .size = size,
+        .completed = false,
+    };
 
+    thread_pool_submit_aio(apple_gfx_ml_do_mmio_write, &job, NULL, NULL);
+    AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
     trace_apple_gfx_ml_mmio_write(offset, val, size);
-    bql_unlock();
-    pthread_mutex_lock(&s->qmu_mutex);
-    qmu_mmio_write(s->qmu_dev, (uint32_t)offset, val, size);
-    pthread_mutex_unlock(&s->qmu_mutex);
-    bql_lock();
 }
 
 static const MemoryRegionOps agfx_mmio_ops = {
     .read = agfx_mmio_read,
     .write = agfx_mmio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
     .impl = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -376,7 +461,6 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     
     /* v96: Initialize frame mutex for thread-safe display updates */
     pthread_mutex_init(&s->frame_mutex, NULL);
-    pthread_mutex_init(&s->qmu_mutex, NULL);
     
     /* v96: Allocate double-buffered framebuffers */
     initial_fb_size = (size_t)s->display_height * s->display_width * 4;
@@ -418,9 +502,6 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .vram_size = vram_size,
         .direct_scanout = s->direct_scanout,
         .vsync_enabled = s->vsync_enabled,
-        .long_op_unlock = qemu_long_op_unlock,
-        .long_op_lock = qemu_long_op_lock,
-        .long_op_ctx = s,
         .spirv_cache_dir = s->spirv_cache_dir,
     };
 
@@ -461,7 +542,6 @@ static void agfx_exit(PCIDevice *pci_dev)
     
     /* v96: Cleanup framebuffers and mutex */
     pthread_mutex_destroy(&s->frame_mutex);
-    pthread_mutex_destroy(&s->qmu_mutex);
     g_free(s->staging_fb);
     s->staging_fb = NULL;
     g_free(s->display_fb);
