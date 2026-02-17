@@ -19,13 +19,13 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
-#include "block/aio.h"      /* for aio_bh_schedule_oneshot */
-#include "block/aio-wait.h"
+#include "qemu/aio.h"       /* for aio_bh_schedule_oneshot */
+#include "qemu/aio-wait.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
-#include "hw/qdev-properties.h"
-#include "hw/resettable.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/resettable.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "ui/console.h"
