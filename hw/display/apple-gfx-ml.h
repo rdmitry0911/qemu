@@ -15,7 +15,8 @@
 
 #include "qom/object.h"
 #include "hw/pci/pci_device.h"
-#include <pthread.h>  /* v96: for pthread_mutex_t */
+#include "qemu/thread.h"      /* QemuThread, QemuSemaphore */
+#include <pthread.h>           /* v96: for pthread_mutex_t */
 
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
@@ -98,8 +99,16 @@ struct AppleGfxMLState {
     uint64_t frame_count;
     uint64_t present_count;     /* v96: Counter for present_frame calls */
     bool trace_dma;
-    
+
     /* v83: Display refresh is now handled by qmetal library's internal thread */
+
+    /* Async MMIO worker (replaces GCD dispatch_async_f from reference) */
+    QemuThread mmio_worker;
+    QemuSemaphore mmio_sem;        /* Wake worker when job available */
+    bool mmio_worker_stop;          /* Signal worker to exit */
+
+    /* Current MMIO job for worker (per-device, replaces global pointer) */
+    struct AppleGfxMLMMIOJob *volatile pending_job;
 };
 
 /* Properties macro for device registration
