@@ -18,12 +18,9 @@
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
-#include "qemu/atomic.h"
-#include "qemu/thread.h"
 #include "qemu/main-loop.h"
 #include "block/aio.h"      /* for aio_bh_schedule_oneshot */
 #include "block/aio-wait.h"
-#include "block/thread-pool.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
@@ -69,80 +66,18 @@ static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
     (void)ctx; (void)hva; (void)size; (void)dirty;
 }
 
-typedef struct AppleGfxMLReadMemoryJob {
-    QemuEvent event;
-    uint64_t gpa;
-    size_t size;
-    void *buf;
-    bool success;
-} AppleGfxMLReadMemoryJob;
-
-typedef struct AppleGfxMLWriteMemoryJob {
-    QemuEvent event;
-    uint64_t gpa;
-    size_t size;
-    const void *buf;
-    bool success;
-} AppleGfxMLWriteMemoryJob;
-
-static void apple_gfx_ml_do_read_memory(void *opaque)
-{
-    AppleGfxMLReadMemoryJob *job = opaque;
-    MemTxResult r;
-
-    r = address_space_read(&address_space_memory, job->gpa,
-                           MEMTXATTRS_UNSPECIFIED, job->buf, job->size);
-    job->success = (r == MEMTX_OK);
-    qemu_event_set(&job->event);
-}
-
-static void apple_gfx_ml_do_write_memory(void *opaque)
-{
-    AppleGfxMLWriteMemoryJob *job = opaque;
-    MemTxResult r;
-
-    r = address_space_write(&address_space_memory, job->gpa,
-                            MEMTXATTRS_UNSPECIFIED, job->buf, job->size);
-    job->success = (r == MEMTX_OK);
-    qemu_event_set(&job->event);
-}
-
 static int qemu_read_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
 {
-    (void)ctx;
-
-    AppleGfxMLReadMemoryJob job = {
-        .gpa = gpa,
-        .size = size,
-        .buf = buf,
-        .success = false,
-    };
-
-    qemu_event_init(&job.event, false);
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_do_read_memory, &job);
-    qemu_event_wait(&job.event);
-    qemu_event_destroy(&job.event);
-    return job.success ? 0 : -1;
+    MemTxResult r = address_space_read(&address_space_memory, gpa,
+                                        MEMTXATTRS_UNSPECIFIED, buf, size);
+    return (r == MEMTX_OK) ? 0 : -1;
 }
 
 static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf, size_t size)
 {
-    (void)ctx;
-
-    AppleGfxMLWriteMemoryJob job = {
-        .gpa = gpa,
-        .size = size,
-        .buf = buf,
-        .success = false,
-    };
-
-    qemu_event_init(&job.event, false);
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_do_write_memory, &job);
-    qemu_event_wait(&job.event);
-    qemu_event_destroy(&job.event);
-    return job.success ? 0 : -1;
+    MemTxResult r = address_space_write(&address_space_memory, gpa,
+                                         MEMTXATTRS_UNSPECIFIED, buf, size);
+    return (r == MEMTX_OK) ? 0 : -1;
 }
 
 /* ============================================================
@@ -322,51 +257,62 @@ static int qemu_read_vram(void *ctx, uint64_t vram_offset, void *buf, size_t siz
     return 0;
 }
 
-typedef struct AppleGfxMLIOJob {
+/* ============================================================
+ * Async MMIO Operations (1:1 with reference apple-gfx.m pattern)
+ *
+ * Reference uses dispatch_async_f + AIO_WAIT_WHILE to release
+ * BQL during qmetal processing. On Linux we use a persistent
+ * worker thread + semaphore instead of GCD.
+ * ============================================================ */
+
+typedef struct AppleGfxMLMMIOJob {
     AppleGfxMLState *state;
-    uint32_t offset;
+    uint64_t offset;
     uint64_t value;
     unsigned size;
+    void (*func)(struct AppleGfxMLMMIOJob *);
     bool completed;
-} AppleGfxMLIOJob;
+} AppleGfxMLMMIOJob;
 
-static int apple_gfx_ml_do_mmio_read(void *opaque)
+static void *agfx_mmio_worker_thread(void *opaque)
 {
-    AppleGfxMLIOJob *job = opaque;
-
-    job->value = qmu_mmio_read(job->state->qmu_dev, job->offset, job->size);
-    qatomic_set(&job->completed, true);
-    aio_wait_kick();
-    return 0;
+    AppleGfxMLState *s = opaque;
+    while (!qatomic_read(&s->mmio_worker_stop)) {
+        qemu_sem_wait(&s->mmio_sem);
+        AppleGfxMLMMIOJob *job = qatomic_read(&s->pending_job);
+        if (job && job->func) {
+            job->func(job);
+        }
+    }
+    return NULL;
 }
 
-static int apple_gfx_ml_do_mmio_write(void *opaque)
+static void agfx_do_read(AppleGfxMLMMIOJob *job)
 {
-    AppleGfxMLIOJob *job = opaque;
-
-    qmu_mmio_write(job->state->qmu_dev, job->offset, job->value, job->size);
+    job->value = qmu_mmio_read(job->state->qmu_dev,
+                               (uint32_t)job->offset, job->size);
     qatomic_set(&job->completed, true);
     aio_wait_kick();
-    return 0;
 }
 
-/* ============================================================
- * MMIO Operations - Pure Proxy to qmetal
- * (Like Apple's [pgiosfc mmioReadAtOffset:])
- * ============================================================ */
+static void agfx_do_write(AppleGfxMLMMIOJob *job)
+{
+    qmu_mmio_write(job->state->qmu_dev,
+                   (uint32_t)job->offset, job->value, job->size);
+    qatomic_set(&job->completed, true);
+    aio_wait_kick();
+}
 
 static uint64_t agfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
-    AppleGfxMLIOJob job = {
-        .state = opaque,
-        .offset = (uint32_t)offset,
-        .size = size,
-        .completed = false,
+    AppleGfxMLState *s = opaque;
+    AppleGfxMLMMIOJob job = {
+        .state = s, .offset = offset, .size = size,
+        .func = agfx_do_read, .completed = false,
     };
-
-    thread_pool_submit_aio(apple_gfx_ml_do_mmio_read, &job, NULL, NULL);
+    qatomic_set(&s->pending_job, &job);
+    qemu_sem_post(&s->mmio_sem);
     AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
-
     trace_apple_gfx_ml_mmio_read(offset, job.value, size);
     return job.value;
 }
@@ -374,15 +320,13 @@ static uint64_t agfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
 static void agfx_mmio_write(void *opaque, hwaddr offset,
                              uint64_t val, unsigned size)
 {
-    AppleGfxMLIOJob job = {
-        .state = opaque,
-        .offset = (uint32_t)offset,
-        .value = val,
-        .size = size,
-        .completed = false,
+    AppleGfxMLState *s = opaque;
+    AppleGfxMLMMIOJob job = {
+        .state = s, .offset = offset, .value = val, .size = size,
+        .func = agfx_do_write, .completed = false,
     };
-
-    thread_pool_submit_aio(apple_gfx_ml_do_mmio_write, &job, NULL, NULL);
+    qatomic_set(&s->pending_job, &job);
+    qemu_sem_post(&s->mmio_sem);
     AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
     trace_apple_gfx_ml_mmio_write(offset, val, size);
 }
@@ -391,10 +335,6 @@ static const MemoryRegionOps agfx_mmio_ops = {
     .read = agfx_mmio_read,
     .write = agfx_mmio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 4,
-        .max_access_size = 8,
-    },
     .impl = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -413,6 +353,28 @@ static void agfx_gfx_update(void *opaque)
 static const GraphicHwOps agfx_gfx_ops = {
     .gfx_update = agfx_gfx_update,
 };
+
+/* ============================================================
+ * Long Operation Hooks (release BQL during shader compilation)
+ *
+ * qmetal calls these from the worker thread during slow ops
+ * (AIR->SPIR-V translation, vkCreateGraphicsPipelines).
+ * mmio_mutex is released by qmu_session.cpp wrappers before
+ * these are called, allowing other channels' KICKs to proceed.
+ * We additionally kick AIO to let the QEMU main loop process
+ * pending BHs (interrupts, disk I/O).
+ * ============================================================ */
+
+static void agfx_long_op_unlock(void *ctx)
+{
+    (void)ctx;
+    aio_wait_kick();
+}
+
+static void agfx_long_op_lock(void *ctx)
+{
+    (void)ctx;
+}
 
 /* ============================================================
  * Device Lifecycle
@@ -503,6 +465,9 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .direct_scanout = s->direct_scanout,
         .vsync_enabled = s->vsync_enabled,
         .spirv_cache_dir = s->spirv_cache_dir,
+        .long_op_unlock = agfx_long_op_unlock,
+        .long_op_lock = agfx_long_op_lock,
+        .long_op_ctx = s,
     };
 
     s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
@@ -512,7 +477,13 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     }
 
     qmu_set_debug_level(s->qmu_dev, s->debug_level);
-    
+
+    /* Start async MMIO worker thread (replaces GCD dispatch_async_f) */
+    qemu_sem_init(&s->mmio_sem, 0);
+    s->mmio_worker_stop = false;
+    qemu_thread_create(&s->mmio_worker, "agfx-io",
+                        agfx_mmio_worker_thread, s, QEMU_THREAD_JOINABLE);
+
     /* Create QEMU console */
     s->con = graphic_console_init(DEVICE(s), 0, &agfx_gfx_ops, s);
     
@@ -533,13 +504,19 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
 static void agfx_exit(PCIDevice *pci_dev)
 {
     AppleGfxMLState *s = APPLE_GFX_ML(pci_dev);
-    
-    /* Destroy qmetal device first (stops display thread) */
+
+    /* Stop async MMIO worker thread */
+    qatomic_set(&s->mmio_worker_stop, true);
+    qemu_sem_post(&s->mmio_sem);  /* Wake to exit */
+    qemu_thread_join(&s->mmio_worker);
+    qemu_sem_destroy(&s->mmio_sem);
+
+    /* Destroy qmetal device (stops display thread) */
     if (s->qmu_dev) {
         qmu_destroy(s->qmu_dev);
         s->qmu_dev = NULL;
     }
-    
+
     /* v96: Cleanup framebuffers and mutex */
     pthread_mutex_destroy(&s->frame_mutex);
     g_free(s->staging_fb);
