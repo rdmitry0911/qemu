@@ -1,5 +1,6 @@
 hw_display_modules = {}
 
+
 system_ss.add(when: 'CONFIG_DDC', if_true: files('i2c-ddc.c'))
 system_ss.add(when: 'CONFIG_EDID', if_true: files('edid-generate.c', 'edid-region.c'))
 
@@ -61,8 +62,78 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 
 system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
 
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
+# Apple ParavirtualizedGraphics QEMU Device (QMetal Unified Backend)
+#
+# Links with:
+#   - mlapi (qmetal): Metal→Vulkan translation with unified API
+#
+# To use in QEMU:
+# 1. Copy apple-gfx-ml.h and apple-gfx-ml.c to hw/display/
+# 2. Add this content to hw/display/meson.build
+# 3. Add Kconfig entry to hw/display/Kconfig
+# 4. Build QEMU with Vulkan support
+
+if host_os == 'darwin'
+  system_ss.add(
+    when: [pvg, 'CONFIG_MAC_PVG_PCI'],
+    if_true: files('apple-gfx.m', 'apple-gfx-pci.m')
+  )
+  system_ss.add(
+    when: [pvg, 'CONFIG_MAC_PVG_MMIO'],
+    if_true: files('apple-gfx.m', 'apple-gfx-mmio.m')
+  )
+else
+
+    # hw/vmapple/meson.build
+
+    apple_gfx_ml_ss = ss.source_set()
+    apple_gfx_ml_ss.add(files('apple-gfx-ml.c'))
+
+    cc = meson.get_compiler('c')
+
+    # ──────────────── mlapi/qmetal unified ────────────────
+    # pvg-host removed — qmetal uses direct unified API (qmu_*)
+    mlapi_dep = dependency('mlapi', required: false, static: false)
+
+    if not mlapi_dep.found()
+        # Include directories: qmetal unified API + pvg protocol headers
+        mlapi_inc = include_directories(
+            '../../../qmetal/include',
+            '../../../qmetal/include/pvg'
+        )
+        mlapi_dir = meson.current_source_dir() / '../../../qmetal/build'
+        mlapi_lib_so = mlapi_dir / 'libmlapi.so'
+
+        if not fs.exists(mlapi_lib_so)
+            error('mlapi shared library not found.\n' +
+                  'Expected: ' + mlapi_lib_so + '\n' +
+                  'Build it first, e.g.:\n' +
+                  '  cd qmetal && cmake -S . -B build && cmake --build build')
+        endif
+
+        vulkan_dep = dependency('vulkan', required: true)
+
+        mlapi_lib = cc.find_library(
+            'mlapi',
+            dirs: [mlapi_dir],
+            required: true,
+            static: false
+        )
+
+        mlapi_dep = declare_dependency(
+            include_directories: mlapi_inc,
+            dependencies: [mlapi_lib, vulkan_dep],
+            link_args: ['-Wl,-rpath,' + mlapi_dir],
+        )
+        message('Using mlapi/qmetal unified: ' + mlapi_lib_so)
+    endif
+
+    apple_gfx_ml_ss.add(mlapi_dep)
+
+    system_ss.add_all(when: 'CONFIG_APPLE_GFX_ML', if_true: apple_gfx_ml_ss)
+
+
+endif
 
 if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   virtio_gpu_ss = ss.source_set()

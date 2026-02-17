@@ -70,10 +70,15 @@ static void apple_gfx_pci_raise_interrupt(void *opaque)
     g_free(job);
 }
 
+static uint64_t g_pvg_pci_irq_count;
+
 static void apple_gfx_pci_interrupt(PCIDevice *dev, uint32_t vector)
 {
     AppleGFXPCIInterruptJob *job;
 
+    g_pvg_pci_irq_count++;
+    pvg_sync_log(1, "IRQ: vector=%u (#%llu)\n",
+                 vector, (unsigned long long)g_pvg_pci_irq_count);
     trace_apple_gfx_raise_irq(vector);
     job = g_malloc0(sizeof(*job));
     job->device = dev;

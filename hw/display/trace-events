@@ -197,6 +197,125 @@ dm163_leds(int led, uint32_t value) "led %d: 0x%x"
 dm163_channels(int channel, uint8_t value) "channel %d: 0x%x"
 dm163_refresh_rate(uint32_t rr) "refresh rate %d"
 
+# Apple GFX ML trace events
+# Add to hw/display/trace-events
+
+# ============================================================
+# MMIO Operations
+# ============================================================
+apple_gfx_ml_mmio_read(uint64_t addr, uint64_t value, unsigned size) "addr 0x%04"PRIx64" value 0x%08"PRIx64" size %u"
+apple_gfx_ml_mmio_write(uint64_t addr, uint64_t value, unsigned size) "addr 0x%04"PRIx64" value 0x%08"PRIx64" size %u"
+
+# ============================================================
+# Memory Mapping
+# ============================================================
+apple_gfx_ml_map_gpa(uint64_t gpa, uint64_t size, void *ptr, int writable) "gpa 0x%"PRIx64" size 0x%"PRIx64" -> %p writable=%d"
+apple_gfx_ml_unmap_gpa(void *ptr, uint64_t size) "ptr %p size 0x%"PRIx64
+
+# ============================================================
+# DMA Operations
+# ============================================================
+apple_gfx_ml_dma_write(uint64_t gpa, uint64_t size) "gpa 0x%"PRIx64" size %"PRIu64
+apple_gfx_ml_dma_write_failed(uint64_t gpa, uint64_t size, int result) "gpa 0x%"PRIx64" size %"PRIu64" result %d"
+apple_gfx_ml_dma_read(uint64_t gpa, uint64_t size) "gpa 0x%"PRIx64" size %"PRIu64
+apple_gfx_ml_stamp_write(uint64_t gpa, uint32_t value) "gpa 0x%"PRIx64" value 0x%x"
+
+# ============================================================
+# SHMEM (BAR2) Operations
+# ============================================================
+apple_gfx_ml_shmem_read(uint64_t offset, uint64_t size) "offset 0x%"PRIx64" size %"PRIu64
+apple_gfx_ml_shmem_read_oob(uint64_t offset, uint64_t size, uint64_t shmem_size) "offset 0x%"PRIx64" size %"PRIu64" shmem_size 0x%"PRIx64
+apple_gfx_ml_shmem_not_mapped(void) ""
+
+# ============================================================
+# Display Operations
+# ============================================================
+apple_gfx_ml_surface_create(uint32_t width, uint32_t height, uint32_t format, uint32_t stride) "size %ux%u format 0x%x stride %u"
+apple_gfx_ml_surface_info(void *surface, void *data, uint32_t stride) "surface %p data %p stride %u"
+apple_gfx_ml_frame_present(uint64_t frame_num, uint32_t width, uint32_t height) "frame %"PRIu64" size %ux%u"
+apple_gfx_ml_frame_pixels(uint64_t frame_num, uint32_t p0, uint32_t p_mid, uint32_t p_end, int has_color) "frame %"PRIu64" p0=0x%08x mid=0x%08x end=0x%08x color=%d"
+apple_gfx_ml_frame_verify(int frame_num, uint32_t src0, uint32_t dst0, uint32_t src_mid, uint32_t dst_mid) "frame %d src[0]=0x%08x dst[0]=0x%08x src[mid]=0x%08x dst[mid]=0x%08x"
+apple_gfx_ml_first_frame(void *dst, uint32_t dst_stride, uint32_t src_stride, uint32_t first_pixel) "dst %p dst_stride %u src_stride %u first_pixel 0x%08x"
+apple_gfx_ml_pixel_format(uint32_t raw, uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3) "raw=0x%08x bytes=[%02x,%02x,%02x,%02x]"
+apple_gfx_ml_first_color_frame(uint32_t px0, uint32_t px1000, uint32_t px_center) "dst[0]=0x%08x dst[1000]=0x%08x dst[center]=0x%08x"
+
+# ============================================================
+# Guest Framebuffer Callback
+# ============================================================
+apple_gfx_ml_on_frame_ready(uint32_t width, uint32_t height, uint32_t stride, void *pixels, int has_vulkan) "size %ux%u stride %u pixels %p has_vulkan %d"
+apple_gfx_ml_guest_fb_frame(uint64_t frame_num, uint32_t first_pixel, uint32_t width, uint32_t height) "frame %"PRIu64" first_pixel=0x%08x size %ux%u"
+
+# ============================================================
+# Vulkan Framebuffer Callback
+# ============================================================
+apple_gfx_ml_vulkan_present(uint32_t width, uint32_t height, uint32_t stride, void *fb) "size %ux%u stride %u fb %p"
+
+# ============================================================
+# Swapchain
+# ============================================================
+apple_gfx_ml_swapchain_create(uint32_t width, uint32_t height, uint32_t images) "size %ux%u images %u"
+
+# ============================================================
+# Interrupts
+# ============================================================
+apple_gfx_ml_irq_msi(uint32_t vector) "vector %u -> MSI#0"
+apple_gfx_ml_irq_intx(uint32_t vector) "vector %u -> INTx pulse"
+
+# ============================================================
+# ML Session / QMetal
+# ============================================================
+apple_gfx_ml_session_create(void *session) "session %p"
+apple_gfx_ml_session_close(void *session) "session %p"
+apple_gfx_ml_submit_commands(uint64_t size) "size %"PRIu64
+apple_gfx_ml_submit_commands_failed(int status) "status %d"
+apple_gfx_ml_submit_no_session(uint64_t size) "no session, dropping %"PRIu64" bytes"
+
+# ============================================================
+# PVG Translator
+# ============================================================
+apple_gfx_ml_translator_connected(void) ""
+
+# ============================================================
+# Device Lifecycle
+# ============================================================
+apple_gfx_ml_realize(uint32_t vram_mb, uint32_t width, uint32_t height) "vram %uMB display %ux%u"
+apple_gfx_ml_realize_done(void) ""
+apple_gfx_ml_reset(void) ""
+apple_gfx_ml_exit(void) ""
+
+# ============================================================
+# Errors
+# ============================================================
+apple_gfx_ml_error_no_console(void) ""
+apple_gfx_ml_error_surface_create(void) ""
+apple_gfx_ml_error_surface_data(void) ""
+
+#
+# DEBUGGING TIPS:
+#
+# 1. Run QEMU with LOG_UNIMP to see all MMIO operations:
+#    -d unimp -D /tmp/qemu.log
+#
+# 2. Check PCI configuration:
+#    Inside macOS: ioreg -lw0 | grep -i "ApplePara"
+#    Inside macOS: lspci (if installed)
+#
+# 3. The sequence should be:
+#    - WRITE 0x1200 = 1 (DEVICE_ENABLE)
+#    - READ 0x1204 -> 3 (DEVICE_STATUS ready)
+#    - WRITE 0x1208 = 0,1,2 (CAPS_SELECTOR)
+#    - READ 0x120C -> caps values
+#    - ...more init...
+#    - WRITE 0x1000 = 1 (RING_ENABLE)
+#    - WRITE 0x1008 = N (CMD_TAIL)
+#    - READ 0x100C -> N (CMD_HEAD should equal TAIL!)
+#
+# If you only see:
+#    - READ 0x122C -> 1 (CAPS_READY)
+#    - WRITE 0x1200 = 0 (DEVICE_DISABLE!)
+# Then the driver is rejecting the device, likely due to wrong PCI Device ID.
+#
+
 # apple-gfx.m
 apple_gfx_read(uint64_t offset, uint64_t res) "offset=0x%"PRIx64" res=0x%"PRIx64
 apple_gfx_write(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
@@ -226,3 +345,8 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+
+# ============================================================
+# PVG Library Logging (pvg-host callback)
+# ============================================================
+pvg_log(const char *level, const char *category, const char *message) "[PVG %s %s] %s"

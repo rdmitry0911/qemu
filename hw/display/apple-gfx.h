@@ -70,5 +70,10 @@ void *apple_gfx_host_ptr_for_gpa_range(uint64_t guest_physical,
 
 extern const PropertyInfo qdev_prop_apple_gfx_display_mode;
 
+/* Sync-focused logging gated by PVG_SYNC_LOG=1/2/3 env var */
+void pvg_sync_init(void);
+void pvg_sync_log(int min_level, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
 #endif
 
