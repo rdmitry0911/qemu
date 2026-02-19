@@ -171,14 +171,8 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
     }
     pthread_mutex_unlock(&s->frame_mutex);
 
-    /* Update display state */
-    s->fb_width = width;
-    s->fb_height = height;
-    s->fb_stride = stride;
-    s->has_rendered_frame = true;
+    /* Update frame counter and log */
     s->frame_count++;
-
-    /* Log periodically */
     if (s->frame_count <= 10 || (s->frame_count % 60) == 0) {
         qemu_log("[apple-gfx-ml] present_frame_bh #%lu: %ux%u stride=%u\n",
                  (unsigned long)s->frame_count, width, height, stride);
@@ -186,11 +180,21 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
 
     /* Update QEMU display - now safe, we're in main loop! */
     if (s->con && s->display_fb) {
-        DisplaySurface *surface = qemu_create_displaysurface_from(
-            width, height, PIXMAN_x8r8g8b8, stride, s->display_fb);
-        dpy_gfx_replace_surface(s->con, surface);
+        /* Only replace surface when dimensions change (reference: set_mode) */
+        if (width != s->fb_width || height != s->fb_height
+            || stride != s->fb_stride) {
+            DisplaySurface *surface = qemu_create_displaysurface_from(
+                width, height, PIXMAN_x8r8g8b8, stride, s->display_fb);
+            dpy_gfx_replace_surface(s->con, surface);
+        }
         dpy_gfx_update_full(s->con);
     }
+
+    /* Update display state after surface check (comparison uses old values) */
+    s->fb_width = width;
+    s->fb_height = height;
+    s->fb_stride = stride;
+    s->has_rendered_frame = true;
 }
 
 static void qemu_present_frame(void *ctx, const void *pixels,
@@ -335,6 +339,10 @@ static const MemoryRegionOps agfx_mmio_ops = {
     .read = agfx_mmio_read,
     .write = agfx_mmio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
     .impl = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -347,11 +355,19 @@ static const MemoryRegionOps agfx_mmio_ops = {
 
 static void agfx_gfx_update(void *opaque)
 {
-    /* Display updates are pushed from qmetal via present_frame callback + BH */
+    AppleGfxMLState *s = opaque;
+    if (s->has_rendered_frame) {
+        if (s->con && s->display_fb) {
+            dpy_gfx_update_full(s->con);
+        }
+        graphic_hw_update_done(s->con);
+        s->has_rendered_frame = false;
+    }
 }
 
 static const GraphicHwOps agfx_gfx_ops = {
     .gfx_update = agfx_gfx_update,
+    .gfx_update_async = true,
 };
 
 /* ============================================================
