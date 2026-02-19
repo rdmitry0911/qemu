@@ -138,6 +138,9 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
     uint32_t width, height, stride;
     size_t size;
 
+    /* Decrement in-flight counter (incremented in qemu_present_frame) */
+    __atomic_sub_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
+
     /* Get pending frame parameters under lock */
     pthread_mutex_lock(&s->frame_mutex);
     if (!s->frame_pending) {
@@ -187,14 +190,22 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
                 width, height, PIXMAN_x8r8g8b8, stride, s->display_fb);
             dpy_gfx_replace_surface(s->con, surface);
         }
-        dpy_gfx_update_full(s->con);
     }
 
     /* Update display state after surface check (comparison uses old values) */
     s->fb_width = width;
     s->fb_height = height;
     s->fb_stride = stride;
-    s->has_rendered_frame = true;
+
+    /* Coordinate with gfx_update via reference two-flag model */
+    if (s->gfx_update_requested) {
+        s->gfx_update_requested = false;
+        dpy_gfx_update_full(s->con);
+        graphic_hw_update_done(s->con);
+        s->new_frame_ready = false;
+    } else {
+        s->new_frame_ready = true;
+    }
 }
 
 static void qemu_present_frame(void *ctx, const void *pixels,
@@ -202,7 +213,13 @@ static void qemu_present_frame(void *ctx, const void *pixels,
 {
     AppleGfxMLState *s = ctx;
     size_t size = (size_t)height * stride;
-    
+
+    /* Drop frame if too many in flight (reference: pending_frames >= 2) */
+    if (__atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST) >= 2) {
+        return;
+    }
+    __atomic_add_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
+
     /* Log from pthread (before scheduling BH) */
     s->present_count++;
     if (s->present_count <= 10 || (s->present_count % 60) == 0) {
@@ -356,12 +373,17 @@ static const MemoryRegionOps agfx_mmio_ops = {
 static void agfx_gfx_update(void *opaque)
 {
     AppleGfxMLState *s = opaque;
-    if (s->has_rendered_frame) {
-        if (s->con && s->display_fb) {
-            dpy_gfx_update_full(s->con);
-        }
+    if (s->new_frame_ready) {
+        /* Path 1: Frame ready — push to display, signal done */
+        dpy_gfx_update_full(s->con);
+        s->new_frame_ready = false;
         graphic_hw_update_done(s->con);
-        s->has_rendered_frame = false;
+    } else if (s->frame_pending) {
+        /* Path 2: Frame in-flight — defer, completion BH will signal */
+        s->gfx_update_requested = true;
+    } else {
+        /* Path 3: Idle — signal done to keep polling alive */
+        graphic_hw_update_done(s->con);
     }
 }
 
@@ -548,7 +570,9 @@ static void agfx_reset(Object *obj, ResetType type)
     s->frame_count = 0;
     s->present_count = 0;
     s->display_enabled = false;
-    s->has_rendered_frame = false;
+    s->new_frame_ready = false;
+    s->gfx_update_requested = false;
+    s->pending_frames = 0;
     s->frame_pending = false;
     
     /* qmetal handles its own reset via MMIO writes from guest */
@@ -596,6 +620,9 @@ static void agfx_instance_init(Object *obj)
     
     /* v96: Initialize frame state */
     s->frame_pending = false;
+    s->new_frame_ready = false;
+    s->gfx_update_requested = false;
+    s->pending_frames = 0;
     s->staging_fb = NULL;
     s->display_fb = NULL;
 }

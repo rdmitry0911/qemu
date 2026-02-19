@@ -75,12 +75,14 @@ struct AppleGfxMLState {
     uint32_t pending_height;
     uint32_t pending_stride;
     bool frame_pending;         /* New frame waiting to be displayed */
-    
+
     /* Current display parameters */
     uint32_t fb_width;
     uint32_t fb_height;
     uint32_t fb_stride;
-    bool has_rendered_frame;
+    bool new_frame_ready;       /* Frame copied to display_fb, awaiting gfx_update poll */
+    bool gfx_update_requested;  /* gfx_update was called while frame was in-flight */
+    int pending_frames;         /* Number of frames in flight (max 2, reference pattern) */
 
     /* Configuration properties */
     uint32_t vram_size_mb;
