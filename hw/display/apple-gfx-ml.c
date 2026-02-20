@@ -10,8 +10,8 @@
  *
  * Compare with Apple's apple-gfx-pci.m which is ~200 lines.
  *
- * v96: Fixed critical display issue - present_frame now uses BH for
- *      thread-safe display updates from qmetal's pthread.
+ * Fixed critical display issue - present_frame now uses BH for
+ * thread-safe display updates from qmetal's pthread.
  */
 
 #include "qemu/osdep.h"
@@ -34,6 +34,10 @@
 #include "apple-gfx-ml.h"
 #include "qmu/qmetal_unified.h"
 
+/* Log throttling: show first N events, then every Mth */
+#define AGFX_LOG_INITIAL_COUNT  10
+#define AGFX_LOG_INTERVAL       60
+
 /* ============================================================
  * Memory Access Callbacks (QEMU → qmetal)
  * These match Apple's PGDeviceDescriptor callback interface
@@ -44,26 +48,37 @@ static void *qemu_map_gpa(void *ctx, uint64_t gpa, size_t size, int writable)
     MemoryRegion *mr = NULL;
     hwaddr xlat = 0;
     hwaddr xlat_len = size;
-    
+
     mr = address_space_translate(&address_space_memory, gpa,
                                   &xlat, &xlat_len, writable,
                                   MEMTXATTRS_UNSPECIFIED);
     if (!mr || xlat_len < size) {
         return NULL;
     }
-    
+
     if (!memory_access_is_direct(mr, writable, MEMTXATTRS_UNSPECIFIED)) {
         return NULL;
     }
-    
+
     void *ptr = memory_region_get_ram_ptr(mr);
-    return ptr ? (ptr + xlat) : NULL;
+    if (!ptr) {
+        return NULL;
+    }
+
+    memory_region_ref(mr);
+    return ptr + xlat;
 }
 
 static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
 {
-    /* Memory regions are reference-counted, no explicit unmap needed */
-    (void)ctx; (void)hva; (void)size; (void)dirty;
+    ram_addr_t offset;
+    MemoryRegion *mr = memory_region_from_host(hva, &offset);
+    if (mr) {
+        if (dirty) {
+            memory_region_set_dirty(mr, offset, size);
+        }
+        memory_region_unref(mr);
+    }
 }
 
 static int qemu_read_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
@@ -81,7 +96,7 @@ static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf, size_t si
 }
 
 /* ============================================================
- * v96: Thread-safe Interrupt Delivery (Apple style)
+ * Thread-safe Interrupt Delivery (Apple style)
  * IRQ is raised from qmetal pthread, must be delivered via BH
  * ============================================================ */
 
@@ -93,19 +108,19 @@ typedef struct AppleGfxMLInterruptJob {
 static void apple_gfx_ml_raise_interrupt_bh(void *opaque)
 {
     AppleGfxMLInterruptJob *job = opaque;
-    
-    static int irq_count = 0;
-    irq_count++;
-    
-    if (irq_count <= 10 || (irq_count % 60) == 0) {
-        qemu_log("[apple-gfx-ml] raise_irq #%d: msi_enabled=%d\n", 
-                 irq_count, msi_enabled(job->device));
+    AppleGfxMLState *s = APPLE_GFX_ML(job->device);
+
+    s->irq_count++;
+
+    if (s->irq_count <= AGFX_LOG_INITIAL_COUNT || (s->irq_count % AGFX_LOG_INTERVAL) == 0) {
+        qemu_log("[apple-gfx-ml] raise_irq #%lu: msi_enabled=%d\n",
+                 (unsigned long)s->irq_count, msi_enabled(job->device));
     }
-    
+
     if (msi_enabled(job->device)) {
         msi_notify(job->device, job->vector);
     }
-    
+
     g_free(job);
 }
 
@@ -123,7 +138,7 @@ static void qemu_raise_irq(void *ctx, uint32_t vector)
 }
 
 /* ============================================================
- * v96: Thread-safe Display Updates (Apple style)
+ * Thread-safe Display Updates (Apple style)
  *
  * present_frame is called from qmetal's display_refresh_thread.
  * QEMU display operations MUST run in main loop.
@@ -142,9 +157,9 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
     __atomic_sub_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
 
     /* Get pending frame parameters under lock */
-    pthread_mutex_lock(&s->frame_mutex);
+    qemu_mutex_lock(&s->frame_mutex);
     if (!s->frame_pending) {
-        pthread_mutex_unlock(&s->frame_mutex);
+        qemu_mutex_unlock(&s->frame_mutex);
         return;
     }
 
@@ -156,27 +171,20 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
 
     /* Reallocate display buffer if frame size increased */
     if (size > s->display_fb_size) {
-        uint8_t *new_fb = g_realloc(s->display_fb, size);
-        if (new_fb) {
-            s->display_fb = new_fb;
-            s->display_fb_size = size;
-            qemu_log("[apple-gfx-ml] display_fb reallocated: %zu bytes\n", size);
-        } else {
-            qemu_log("[apple-gfx-ml] display_fb realloc failed!\n");
-            pthread_mutex_unlock(&s->frame_mutex);
-            return;
-        }
+        s->display_fb = g_realloc(s->display_fb, size);
+        s->display_fb_size = size;
+        qemu_log("[apple-gfx-ml] display_fb reallocated: %zu bytes\n", size);
     }
 
     /* Copy from staging to display buffer */
     if (s->staging_fb && s->display_fb) {
         memcpy(s->display_fb, s->staging_fb, size);
     }
-    pthread_mutex_unlock(&s->frame_mutex);
+    qemu_mutex_unlock(&s->frame_mutex);
 
     /* Update frame counter and log */
     s->frame_count++;
-    if (s->frame_count <= 10 || (s->frame_count % 60) == 0) {
+    if (s->frame_count <= AGFX_LOG_INITIAL_COUNT || (s->frame_count % AGFX_LOG_INTERVAL) == 0) {
         qemu_log("[apple-gfx-ml] present_frame_bh #%lu: %ux%u stride=%u\n",
                  (unsigned long)s->frame_count, width, height, stride);
     }
@@ -221,23 +229,18 @@ static void qemu_present_frame(void *ctx, const void *pixels,
     __atomic_add_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
 
     /* Log from pthread (before scheduling BH) */
-    s->present_count++;
-    if (s->present_count <= 10 || (s->present_count % 60) == 0) {
+    uint64_t pc = qatomic_fetch_inc(&s->present_count) + 1;
+    if (pc <= AGFX_LOG_INITIAL_COUNT || (pc % AGFX_LOG_INTERVAL) == 0) {
         qemu_log("[apple-gfx-ml] present_frame #%lu: %ux%u stride=%u (from pthread)\n",
-                 (unsigned long)s->present_count, width, height, stride);
+                 (unsigned long)pc, width, height, stride);
     }
     
     /* Reallocate staging buffer if needed */
-    pthread_mutex_lock(&s->frame_mutex);
+    qemu_mutex_lock(&s->frame_mutex);
     if (!s->staging_fb || s->staging_fb_size < size) {
         g_free(s->staging_fb);
         s->staging_fb = g_malloc(size);
-        s->staging_fb_size = s->staging_fb ? size : 0;
-        if (!s->staging_fb) {
-            pthread_mutex_unlock(&s->frame_mutex);
-            qemu_log("[apple-gfx-ml] present_frame: staging alloc failed!\n");
-            return;
-        }
+        s->staging_fb_size = size;
     }
     
     /* Copy pixels to staging buffer */
@@ -248,14 +251,14 @@ static void qemu_present_frame(void *ctx, const void *pixels,
     s->pending_height = height;
     s->pending_stride = stride;
     s->frame_pending = true;
-    pthread_mutex_unlock(&s->frame_mutex);
+    qemu_mutex_unlock(&s->frame_mutex);
     
     /* Schedule BH to update display in QEMU main loop */
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_present_frame_bh, s);
 }
 
-/* v83: Display refresh is handled by qmetal library's internal thread.
+/* Display refresh is handled by qmetal library's internal thread.
  * No timer needed in QEMU driver - we just receive present_frame callbacks.
  */
 
@@ -324,6 +327,11 @@ static void agfx_do_write(AppleGfxMLMMIOJob *job)
     aio_wait_kick();
 }
 
+/*
+ * MMIO handlers use stack-allocated jobs. This is safe because
+ * AIO_WAIT_WHILE blocks until the worker completes the job,
+ * keeping the stack frame alive for the job's entire lifetime.
+ */
 static uint64_t agfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     AppleGfxMLState *s = opaque;
@@ -331,9 +339,11 @@ static uint64_t agfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
         .state = s, .offset = offset, .size = size,
         .func = agfx_do_read, .completed = false,
     };
+    qemu_mutex_lock(&s->mmio_job_mutex);
     qatomic_set(&s->pending_job, &job);
     qemu_sem_post(&s->mmio_sem);
     AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
+    qemu_mutex_unlock(&s->mmio_job_mutex);
     trace_apple_gfx_ml_mmio_read(offset, job.value, size);
     return job.value;
 }
@@ -346,9 +356,11 @@ static void agfx_mmio_write(void *opaque, hwaddr offset,
         .state = s, .offset = offset, .value = val, .size = size,
         .func = agfx_do_write, .completed = false,
     };
+    qemu_mutex_lock(&s->mmio_job_mutex);
     qatomic_set(&s->pending_job, &job);
     qemu_sem_post(&s->mmio_sem);
     AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
+    qemu_mutex_unlock(&s->mmio_job_mutex);
     trace_apple_gfx_ml_mmio_write(offset, val, size);
 }
 
@@ -395,21 +407,21 @@ static const GraphicHwOps agfx_gfx_ops = {
 /* ============================================================
  * Long Operation Hooks (release BQL during shader compilation)
  *
- * qmetal calls these from the worker thread during slow ops
- * (AIR->SPIR-V translation, vkCreateGraphicsPipelines).
+ * qmetal calls long_op_begin before slow operations (AIR->SPIR-V
+ * translation, vkCreateGraphicsPipelines) and long_op_end after.
  * mmio_mutex is released by qmu_session.cpp wrappers before
  * these are called, allowing other channels' KICKs to proceed.
- * We additionally kick AIO to let the QEMU main loop process
- * pending BHs (interrupts, disk I/O).
+ * We kick AIO in begin to let the QEMU main loop process
+ * pending BHs (interrupts, disk I/O) during the long op.
  * ============================================================ */
 
-static void agfx_long_op_unlock(void *ctx)
+static void agfx_long_op_begin(void *ctx)
 {
     (void)ctx;
     aio_wait_kick();
 }
 
-static void agfx_long_op_lock(void *ctx)
+static void agfx_long_op_end(void *ctx)
 {
     (void)ctx;
 }
@@ -438,7 +450,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     }
     
     /* Setup MSI - Apple style: no INTERRUPT_PIN, just msi_init */
-    int msi_ret = msi_init(pci_dev, APPLE_GFX_ML_MSI_CAP_OFFSET, 1, true, false, errp);
+    int msi_ret = msi_init(pci_dev, APPLE_GFX_ML_MSI_CAP_AUTO, 1, true, false, errp);
     if (msi_ret == 0) {
         s->msi_used = true;
         qemu_log("[apple-gfx-ml] msi_init OK, 1 vector\n");
@@ -449,7 +461,6 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     /* Setup MMIO BAR (BAR0) - Apple only uses this one BAR */
     memory_region_init_io(&s->mmio, OBJECT(s), &agfx_mmio_ops, s,
                           "apple-gfx-mmio", APPLE_GFX_ML_MMIO_SIZE);
-    s->mmio.disable_reentrancy_guard = true;
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
     
     /* Setup host VRAM (not a PCI BAR - internal storage) */
@@ -459,20 +470,15 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
     
-    /* v96: Initialize frame mutex for thread-safe display updates */
-    pthread_mutex_init(&s->frame_mutex, NULL);
+    /* Initialize frame mutex for thread-safe display updates */
+    qemu_mutex_init(&s->frame_mutex);
     
-    /* v96: Allocate double-buffered framebuffers */
+    /* Allocate double-buffered framebuffers */
     initial_fb_size = (size_t)s->display_height * s->display_width * 4;
     s->staging_fb = g_malloc0(initial_fb_size);
     s->staging_fb_size = initial_fb_size;
     s->display_fb = g_malloc0(initial_fb_size);
     s->display_fb_size = initial_fb_size;
-    
-    if (!s->staging_fb || !s->display_fb) {
-        error_setg(errp, "Failed to allocate framebuffers");
-        return;
-    }
     
     /* Create qmetal device with callbacks */
     qmu_extended_callbacks qmu_callbacks = {
@@ -493,20 +499,31 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .max_protocol_version = 6,
         .iosfc_caps = 0x03,
         .display_port_count = 1,
-        .mode_count = 3,
-        .mode_data = {
-            (s->display_height << 16) | s->display_width,  /* Mode 0 */
-            (1080 << 16) | 1440,                            /* Mode 1 */
-            (1024 << 16) | 1280,                            /* Mode 2 */
-        },
         .vram_size = vram_size,
         .direct_scanout = s->direct_scanout,
         .vsync_enabled = s->vsync_enabled,
         .spirv_cache_dir = s->spirv_cache_dir,
-        .long_op_unlock = agfx_long_op_unlock,
-        .long_op_lock = agfx_long_op_lock,
+        .long_op_unlock = agfx_long_op_begin,
+        .long_op_lock = agfx_long_op_end,
         .long_op_ctx = s,
     };
+
+    /* Generate display modes: primary + standard modes smaller than primary */
+    qmu_config.mode_data[0] = (s->display_height << 16) | s->display_width;
+    {
+        int mode_idx = 1;
+        static const uint32_t standard_modes[][2] = {
+            {1440, 1080}, {1280, 1024}, {1280, 720}, {1024, 768},
+        };
+        for (int i = 0; i < ARRAY_SIZE(standard_modes) && mode_idx < 8; i++) {
+            if (standard_modes[i][0] < s->display_width ||
+                standard_modes[i][1] < s->display_height) {
+                qmu_config.mode_data[mode_idx++] =
+                    (standard_modes[i][1] << 16) | standard_modes[i][0];
+            }
+        }
+        qmu_config.mode_count = mode_idx;
+    }
 
     s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
     if (!s->qmu_dev) {
@@ -518,6 +535,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Start async MMIO worker thread (replaces GCD dispatch_async_f) */
     qemu_sem_init(&s->mmio_sem, 0);
+    qemu_mutex_init(&s->mmio_job_mutex);
     s->mmio_worker_stop = false;
     qemu_thread_create(&s->mmio_worker, "agfx-io",
                         agfx_mmio_worker_thread, s, QEMU_THREAD_JOINABLE);
@@ -536,7 +554,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         s->fb_stride, s->display_fb);
     dpy_gfx_replace_surface(s->con, surface);
     
-    qemu_log("[apple-gfx-ml] Device realized successfully (qmetal unified, v96: thread-safe display)\n");
+    qemu_log("[apple-gfx-ml] Device realized successfully\n");
 }
 
 static void agfx_exit(PCIDevice *pci_dev)
@@ -548,6 +566,7 @@ static void agfx_exit(PCIDevice *pci_dev)
     qemu_sem_post(&s->mmio_sem);  /* Wake to exit */
     qemu_thread_join(&s->mmio_worker);
     qemu_sem_destroy(&s->mmio_sem);
+    qemu_mutex_destroy(&s->mmio_job_mutex);
 
     /* Destroy qmetal device (stops display thread) */
     if (s->qmu_dev) {
@@ -555,8 +574,8 @@ static void agfx_exit(PCIDevice *pci_dev)
         s->qmu_dev = NULL;
     }
 
-    /* v96: Cleanup framebuffers and mutex */
-    pthread_mutex_destroy(&s->frame_mutex);
+    /* Cleanup framebuffers and mutex */
+    qemu_mutex_destroy(&s->frame_mutex);
     g_free(s->staging_fb);
     s->staging_fb = NULL;
     g_free(s->display_fb);
@@ -568,7 +587,8 @@ static void agfx_reset(Object *obj, ResetType type)
     AppleGfxMLState *s = APPLE_GFX_ML(obj);
     
     s->frame_count = 0;
-    s->present_count = 0;
+    qatomic_set(&s->present_count, 0);
+    s->irq_count = 0;
     s->display_enabled = false;
     s->new_frame_ready = false;
     s->gfx_update_requested = false;
@@ -618,7 +638,7 @@ static void agfx_instance_init(Object *obj)
     s->debug_level = 0;
     s->vsync_enabled = true;
     
-    /* v96: Initialize frame state */
+    /* Initialize frame state */
     s->frame_pending = false;
     s->new_frame_ready = false;
     s->gfx_update_requested = false;
