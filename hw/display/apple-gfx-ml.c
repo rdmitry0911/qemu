@@ -262,6 +262,48 @@ static void qemu_present_frame(void *ctx, const void *pixels,
  * No timer needed in QEMU driver - we just receive present_frame callbacks.
  */
 
+/* 1:1 reference apple_gfx_mmio_map_surface_memory (apple-gfx-mmio.m:145-158).
+ * Maps guest physical memory for IOSurface backing with memory_region_ref pinning. */
+static void *qemu_iosfc_map_memory(void *ctx, uint64_t gpa, uint64_t len, int read_only)
+{
+    MemoryRegion *mr = NULL;
+    hwaddr xlat = 0;
+    hwaddr xlat_len = len;
+
+    RCU_READ_LOCK_GUARD();
+    mr = address_space_translate(&address_space_memory, gpa,
+                                  &xlat, &xlat_len, !read_only,
+                                  MEMTXATTRS_UNSPECIFIED);
+    if (!mr || xlat_len < len) {
+        return NULL;
+    }
+    if (!memory_access_is_direct(mr, !read_only, MEMTXATTRS_UNSPECIFIED)) {
+        return NULL;
+    }
+    void *ptr = memory_region_get_ram_ptr(mr);
+    if (!ptr) {
+        return NULL;
+    }
+    memory_region_ref(mr);
+    return ptr + xlat;
+}
+
+/* 1:1 reference apple_gfx_mmio_unmap_surface_memory (apple-gfx-mmio.m:160-177) */
+static int qemu_iosfc_unmap_memory(void *ctx, void *hva, uint64_t len)
+{
+    MemoryRegion *mr;
+    ram_addr_t offset = 0;
+
+    RCU_READ_LOCK_GUARD();
+    mr = memory_region_from_host(hva, &offset);
+    if (!mr) {
+        qemu_log("[apple-gfx-ml] iosfc_unmap: memory at %p not found\n", hva);
+        return -1;
+    }
+    memory_region_unref(mr);
+    return 0;
+}
+
 static int qemu_read_vram(void *ctx, uint64_t vram_offset, void *buf, size_t size)
 {
     AppleGfxMLState *s = ctx;
@@ -490,6 +532,12 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .raise_irq = qemu_raise_irq,
         .present_frame = qemu_present_frame,
         .read_vram = qemu_read_vram,
+        /* IOSurface mapper — 1:1 reference PGIOSurfaceHostDevice.
+         * For PCI: iosfc_raise_irq wires to same qemu_raise_irq (one IRQ line,
+         * matches apple-gfx-pci.m:107 — single raiseInterrupt with vector param). */
+        .iosfc_map_memory = qemu_iosfc_map_memory,
+        .iosfc_unmap_memory = qemu_iosfc_unmap_memory,
+        .iosfc_raise_irq = qemu_raise_irq,
     };
 
     qmu_extended_config qmu_config = {
@@ -506,6 +554,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .long_op_unlock = agfx_long_op_begin,
         .long_op_lock = agfx_long_op_end,
         .long_op_ctx = s,
+        .using_iosurface_mapper = 1,  /* 1:1 reference desc.usingIOSurfaceMapper = true */
     };
 
     /* Generate display modes: primary + standard modes smaller than primary */
