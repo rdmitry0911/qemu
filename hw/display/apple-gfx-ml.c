@@ -45,6 +45,7 @@
 
 static void *qemu_map_gpa(void *ctx, uint64_t gpa, size_t size, int writable)
 {
+    RCU_READ_LOCK_GUARD();   /* address_space_translate requires BQL or RCU */
     MemoryRegion *mr = NULL;
     hwaddr xlat = 0;
     hwaddr xlat_len = size;
