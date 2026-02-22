@@ -21,6 +21,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/aio.h"       /* for aio_bh_schedule_oneshot */
 #include "qemu/aio-wait.h"
+#include "qemu/thread.h"    /* QemuEvent for DMA BH synchronization */
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
@@ -82,18 +83,69 @@ static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
     }
 }
 
-static int qemu_read_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
+/* ============================================================
+ * DMA via BH+QemuEvent (reference: apple-gfx.m:2135-2168)
+ * "Performing DMA requires BQL, so do it in a BH"
+ * Called from qmetal pthread → schedules BH on main loop → waits.
+ * ============================================================ */
+
+typedef struct AgfxDMAJob {
+    uint64_t gpa;
+    void *buf;
+    size_t size;
+    bool is_write;
+    bool dirty;
+    MemTxResult result;
+    QemuEvent event;
+} AgfxDMAJob;
+
+static void agfx_do_dma(void *opaque)
 {
-    MemTxResult r = address_space_read(&address_space_memory, gpa,
-                                        MEMTXATTRS_UNSPECIFIED, buf, size);
-    return (r == MEMTX_OK) ? 0 : -1;
+    AgfxDMAJob *job = opaque;
+    if (job->is_write) {
+        job->result = address_space_write(&address_space_memory, job->gpa,
+                                           MEMTXATTRS_UNSPECIFIED,
+                                           job->buf, job->size);
+        if (job->result == MEMTX_OK && job->dirty) {
+            MemoryRegion *mr = NULL;
+            hwaddr xlat = 0, xlat_len = job->size;
+            RCU_READ_LOCK_GUARD();
+            mr = address_space_translate(&address_space_memory, job->gpa,
+                                          &xlat, &xlat_len, true,
+                                          MEMTXATTRS_UNSPECIFIED);
+            if (mr) {
+                memory_region_set_dirty(mr, xlat, job->size);
+            }
+        }
+    } else {
+        job->result = address_space_read(&address_space_memory, job->gpa,
+                                          MEMTXATTRS_UNSPECIFIED,
+                                          job->buf, job->size);
+    }
+    qemu_event_set(&job->event);
 }
 
-static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf, size_t size)
+static int qemu_read_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
 {
-    MemTxResult r = address_space_write(&address_space_memory, gpa,
-                                         MEMTXATTRS_UNSPECIFIED, buf, size);
-    return (r == MEMTX_OK) ? 0 : -1;
+    AgfxDMAJob job = { .gpa = gpa, .buf = buf, .size = size,
+                       .is_write = false };
+    qemu_event_init(&job.event, false);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), agfx_do_dma, &job);
+    qemu_event_wait(&job.event);
+    qemu_event_destroy(&job.event);
+    return (job.result == MEMTX_OK) ? 0 : -1;
+}
+
+static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf,
+                              size_t size)
+{
+    AgfxDMAJob job = { .gpa = gpa, .buf = (void *)buf, .size = size,
+                       .is_write = true, .dirty = true };
+    qemu_event_init(&job.event, false);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), agfx_do_dma, &job);
+    qemu_event_wait(&job.event);
+    qemu_event_destroy(&job.event);
+    return (job.result == MEMTX_OK) ? 0 : -1;
 }
 
 /* ============================================================
@@ -555,7 +607,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .long_op_unlock = agfx_long_op_begin,
         .long_op_lock = agfx_long_op_end,
         .long_op_ctx = s,
-        .using_iosurface_mapper = 1,  /* 1:1 reference desc.usingIOSurfaceMapper = true */
+        .using_iosurface_mapper = 0,  /* PCI variant (apple-gfx-pci.m) does NOT use IOSurface mapper */
     };
 
     /* Generate display modes: primary + standard modes smaller than primary */
