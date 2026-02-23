@@ -315,6 +315,58 @@ static void qemu_present_frame(void *ctx, const void *pixels,
  * No timer needed in QEMU driver - we just receive present_frame callbacks.
  */
 
+/* ============================================================
+ * Mainloop-safe Memory Access (for display completion BH)
+ *
+ * Direct address_space_read/write — safe when BQL is held (BH context).
+ * The regular qemu_read/write_memory use nested BHs + QemuEvent wait,
+ * which deadlocks when called from a BH (can't wait for yourself).
+ * ============================================================ */
+
+static int qemu_read_memory_mainloop(void *ctx, uint64_t gpa, void *buf,
+                                      size_t size)
+{
+    return address_space_read(&address_space_memory, gpa,
+                               MEMTXATTRS_UNSPECIFIED, buf, size) == MEMTX_OK ? 0 : -1;
+}
+
+static int qemu_write_memory_mainloop(void *ctx, uint64_t gpa, const void *buf,
+                                       size_t size)
+{
+    return address_space_write(&address_space_memory, gpa,
+                                MEMTXATTRS_UNSPECIFIED, buf, size) == MEMTX_OK ? 0 : -1;
+}
+
+/* ============================================================
+ * Display Completion BH Trampoline
+ *
+ * Matches reference GCD dispatch_async for presentSurface completion.
+ * Schedules qmetal's completion function to run in QEMU main event loop.
+ * ============================================================ */
+
+typedef struct AgfxCompletionJob {
+    void (*fn)(void *);
+    void *ctx;
+} AgfxCompletionJob;
+
+static void agfx_display_completion_bh(void *opaque)
+{
+    AgfxCompletionJob *job = opaque;
+    job->fn(job->ctx);
+    g_free(job);
+}
+
+static void qemu_schedule_display_completion(void *ctx,
+                                              void (*fn)(void *),
+                                              void *comp_ctx)
+{
+    AgfxCompletionJob *job = g_malloc(sizeof(*job));
+    job->fn = fn;
+    job->ctx = comp_ctx;
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                             agfx_display_completion_bh, job);
+}
+
 /* 1:1 reference apple_gfx_mmio_map_surface_memory (apple-gfx-mmio.m:145-158).
  * Maps guest physical memory for IOSurface backing with memory_region_ref pinning. */
 static void *qemu_iosfc_map_memory(void *ctx, uint64_t gpa, uint64_t len, int read_only)
@@ -591,6 +643,10 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .iosfc_map_memory = qemu_iosfc_map_memory,
         .iosfc_unmap_memory = qemu_iosfc_unmap_memory,
         .iosfc_raise_irq = qemu_raise_irq,
+        /* Async display completion (reference GCD dispatch_async model) */
+        .schedule_display_completion = qemu_schedule_display_completion,
+        .read_memory_mainloop = qemu_read_memory_mainloop,
+        .write_memory_mainloop = qemu_write_memory_mainloop,
     };
 
     qmu_extended_config qmu_config = {
