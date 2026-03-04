@@ -666,22 +666,12 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .using_iosurface_mapper = 0,  /* PCI variant (apple-gfx-pci.m) does NOT use IOSurface mapper */
     };
 
-    /* Generate display modes: primary + standard modes smaller than primary */
+    /* Reference apple-gfx.m:45-49: exactly 3 hardcoded modes.
+     * Mode 0 is the primary display resolution. */
     qmu_config.mode_data[0] = (s->display_height << 16) | s->display_width;
-    {
-        int mode_idx = 1;
-        static const uint32_t standard_modes[][2] = {
-            {1440, 1080}, {1280, 1024}, {1280, 720}, {1024, 768},
-        };
-        for (int i = 0; i < ARRAY_SIZE(standard_modes) && mode_idx < 8; i++) {
-            if (standard_modes[i][0] < s->display_width ||
-                standard_modes[i][1] < s->display_height) {
-                qmu_config.mode_data[mode_idx++] =
-                    (standard_modes[i][1] << 16) | standard_modes[i][0];
-            }
-        }
-        qmu_config.mode_count = mode_idx;
-    }
+    qmu_config.mode_data[1] = (1080u << 16) | 1440u;
+    qmu_config.mode_data[2] = (1024u << 16) | 1280u;
+    qmu_config.mode_count = 3;
 
     s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
     if (!s->qmu_dev) {
