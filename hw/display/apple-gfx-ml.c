@@ -22,6 +22,7 @@
 #include "qemu/aio.h"       /* for aio_bh_schedule_oneshot */
 #include "qemu/aio-wait.h"
 #include "qemu/thread.h"    /* QemuEvent for DMA BH synchronization */
+#include "qemu/cutils.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
@@ -38,6 +39,42 @@
 /* Log throttling: show first N events, then every Mth */
 #define AGFX_LOG_INITIAL_COUNT  10
 #define AGFX_LOG_INTERVAL       60
+
+static G_GNUC_PRINTF(7, 0)
+void agfx_qmu_log_callback(void *ctx,
+                           qmu_log_level level,
+                           qmu_log_category category,
+                           const char *file,
+                           int line,
+                           const char *func,
+                           const char *fmt,
+                           va_list args)
+{
+    char msg[2048];
+    const char *base = file;
+
+    (void)ctx;
+
+    if (!fmt) {
+        return;
+    }
+
+    if (file) {
+        const char *slash = strrchr(file, '/');
+        if (slash && slash[1]) {
+            base = slash + 1;
+        }
+    }
+
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    qemu_log("[apple-gfx-ml][qmetal][%s][%s] %s:%d %s: %s\n",
+             qmu_log_level_name(level),
+             qmu_log_category_name(category),
+             base ? base : "?",
+             line,
+             func ? func : "?",
+             msg);
+}
 
 /* ============================================================
  * Memory Access Callbacks (QEMU → qmetal)
@@ -679,6 +716,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
 
+    qmu_log_set_callback(agfx_qmu_log_callback, NULL);
     qmu_set_debug_level(s->qmu_dev, s->debug_level);
 
     /* Start async MMIO worker thread (replaces GCD dispatch_async_f) */
@@ -721,6 +759,7 @@ static void agfx_exit(PCIDevice *pci_dev)
         qmu_destroy(s->qmu_dev);
         s->qmu_dev = NULL;
     }
+    qmu_log_set_callback(NULL, NULL);
 
     /* Cleanup framebuffers and mutex */
     qemu_mutex_destroy(&s->frame_mutex);
