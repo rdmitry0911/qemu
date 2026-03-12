@@ -348,6 +348,145 @@ static void qemu_present_frame(void *ctx, const void *pixels,
                             apple_gfx_ml_present_frame_bh, s);
 }
 
+typedef struct AppleGfxMLCursorGlyphJob {
+    AppleGfxMLState *state;
+    uint8_t *pixels;
+    uint64_t mapped_length;
+    uint64_t stride;
+    uint32_t width;
+    uint32_t height;
+    uint32_t hot_x;
+    uint32_t hot_y;
+    uint32_t sum;
+} AppleGfxMLCursorGlyphJob;
+
+typedef struct AppleGfxMLCursorShowJob {
+    AppleGfxMLState *state;
+    uint32_t display_id;
+    bool visible;
+} AppleGfxMLCursorShowJob;
+
+static void apple_gfx_ml_update_cursor(AppleGfxMLState *s)
+{
+    if (!s->con) {
+        return;
+    }
+    dpy_mouse_set(s->con, 0, 0, s->cursor_show);
+}
+
+static void apple_gfx_ml_cursor_glyph_bh(void *opaque)
+{
+    AppleGfxMLCursorGlyphJob *job = opaque;
+    AppleGfxMLState *s = job->state;
+    const uint8_t *src = job->pixels;
+    size_t row_padding = 0;
+
+    if (job->stride >= (uint64_t)job->width * 4u) {
+        row_padding = (size_t)(job->stride - (uint64_t)job->width * 4u);
+    }
+
+    if (s->cursor) {
+        cursor_unref(s->cursor);
+        s->cursor = NULL;
+    }
+
+    s->cursor = cursor_alloc(job->width, job->height);
+    s->cursor->hot_x = job->hot_x;
+    s->cursor->hot_y = job->hot_y;
+
+    for (uint32_t y = 0; y < job->height; ++y) {
+        for (uint32_t x = 0; x < job->width; ++x) {
+            uint32_t *dst = &s->cursor->data[(size_t)y * job->width + x];
+
+            /*
+             * Match reference apple-gfx.m set_cursor_glyph conversion:
+             * source bytes are kept in guest bitmap order and converted to
+             * QEMUCursor channel layout when published to the UI.
+             */
+            *dst = ((uint32_t)src[0] << 16u) |
+                   ((uint32_t)src[1] << 8u) |
+                   ((uint32_t)src[2] << 0u) |
+                   ((uint32_t)src[3] << 24u);
+            src += 4;
+        }
+        src += row_padding;
+    }
+
+    qemu_log("[apple-gfx-ml] cursor_glyph: %ux%u stride=%" PRIu64 " hot=%u,%u sum=0x%08x\n",
+             job->width, job->height, job->stride, job->hot_x, job->hot_y,
+             job->sum);
+
+    if (s->con) {
+        dpy_cursor_define(s->con, s->cursor);
+        apple_gfx_ml_update_cursor(s);
+    }
+
+    g_free(job->pixels);
+    g_free(job);
+}
+
+static void apple_gfx_ml_cursor_show_bh(void *opaque)
+{
+    AppleGfxMLCursorShowJob *job = opaque;
+    AppleGfxMLState *s = job->state;
+
+    s->cursor_show = job->visible;
+    qemu_log("[apple-gfx-ml] cursor_show: display=%u visible=%d\n",
+             job->display_id, job->visible ? 1 : 0);
+    apple_gfx_ml_update_cursor(s);
+    g_free(job);
+}
+
+static void qemu_cursor_glyph(void *ctx,
+                              const void *pixels,
+                              uint64_t mapped_length,
+                              uint64_t stride,
+                              uint32_t width,
+                              uint32_t height,
+                              uint32_t hot_x,
+                              uint32_t hot_y,
+                              uint32_t sum)
+{
+    AppleGfxMLState *s = ctx;
+    AppleGfxMLCursorGlyphJob *job;
+
+    if (!s || !pixels || mapped_length == 0) {
+        return;
+    }
+
+    job = g_new0(AppleGfxMLCursorGlyphJob, 1);
+    job->state = s;
+    job->pixels = g_memdup2(pixels, mapped_length);
+    job->mapped_length = mapped_length;
+    job->stride = stride;
+    job->width = width;
+    job->height = height;
+    job->hot_x = hot_x;
+    job->hot_y = hot_y;
+    job->sum = sum;
+
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            apple_gfx_ml_cursor_glyph_bh, job);
+}
+
+static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
+{
+    AppleGfxMLState *s = ctx;
+    AppleGfxMLCursorShowJob *job;
+
+    if (!s) {
+        return;
+    }
+
+    job = g_new0(AppleGfxMLCursorShowJob, 1);
+    job->state = s;
+    job->display_id = display_id;
+    job->visible = visible != 0;
+
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            apple_gfx_ml_cursor_show_bh, job);
+}
+
 /* Display refresh is handled by qmetal library's internal thread.
  * No timer needed in QEMU driver - we just receive present_frame callbacks.
  */
@@ -673,6 +812,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .write_memory = qemu_write_memory,
         .raise_irq = qemu_raise_irq,
         .present_frame = qemu_present_frame,
+        .cursor_glyph = qemu_cursor_glyph,
+        .cursor_show = qemu_cursor_show,
         .read_vram = qemu_read_vram,
         /* IOSurface mapper — 1:1 reference PGIOSurfaceHostDevice.
          * For PCI: iosfc_raise_irq wires to same qemu_raise_irq (one IRQ line,
@@ -767,6 +908,10 @@ static void agfx_exit(PCIDevice *pci_dev)
     s->staging_fb = NULL;
     g_free(s->display_fb);
     s->display_fb = NULL;
+    if (s->cursor) {
+        cursor_unref(s->cursor);
+        s->cursor = NULL;
+    }
 }
 
 static void agfx_reset(Object *obj, ResetType type)
@@ -781,6 +926,7 @@ static void agfx_reset(Object *obj, ResetType type)
     s->gfx_update_requested = false;
     s->pending_frames = 0;
     s->frame_pending = false;
+    s->cursor_show = true;
     
     /* qmetal handles its own reset via MMIO writes from guest */
 }
@@ -832,6 +978,8 @@ static void agfx_instance_init(Object *obj)
     s->pending_frames = 0;
     s->staging_fb = NULL;
     s->display_fb = NULL;
+    s->cursor = NULL;
+    s->cursor_show = true;
 }
 
 static const TypeInfo agfx_type_info = {

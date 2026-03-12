@@ -50,6 +50,8 @@ struct AppleGfxMLState {
 
     /* QEMU display */
     QemuConsole *con;
+    QEMUCursor *cursor;
+    bool cursor_show;
 
     /* Double-buffered framebuffer for thread-safe display updates.
      * 
