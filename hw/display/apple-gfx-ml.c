@@ -105,11 +105,13 @@ static void *qemu_map_gpa(void *ctx, uint64_t gpa, size_t size, int writable)
     }
 
     memory_region_ref(mr);
+    trace_apple_gfx_ml_map_gpa(gpa, size, ptr + xlat, writable);
     return ptr + xlat;
 }
 
 static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
 {
+    trace_apple_gfx_ml_unmap_gpa(hva, size);
     ram_addr_t offset;
     MemoryRegion *mr = memory_region_from_host(hva, &offset);
     if (mr) {
@@ -166,6 +168,7 @@ static int qemu_read_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
 {
     AgfxDMAJob job = { .gpa = gpa, .buf = buf, .size = size,
                        .is_write = false };
+    trace_apple_gfx_ml_dma_read(gpa, size);
     qemu_event_init(&job.event, false);
     aio_bh_schedule_oneshot(qemu_get_aio_context(), agfx_do_dma, &job);
     qemu_event_wait(&job.event);
@@ -178,10 +181,14 @@ static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf,
 {
     AgfxDMAJob job = { .gpa = gpa, .buf = (void *)buf, .size = size,
                        .is_write = true, .dirty = true };
+    trace_apple_gfx_ml_dma_write(gpa, size);
     qemu_event_init(&job.event, false);
     aio_bh_schedule_oneshot(qemu_get_aio_context(), agfx_do_dma, &job);
     qemu_event_wait(&job.event);
     qemu_event_destroy(&job.event);
+    if (job.result != MEMTX_OK) {
+        trace_apple_gfx_ml_dma_write_failed(gpa, size, job.result);
+    }
     return (job.result == MEMTX_OK) ? 0 : -1;
 }
 
