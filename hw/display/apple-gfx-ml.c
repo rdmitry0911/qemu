@@ -36,6 +36,10 @@
 #include "apple-gfx-ml.h"
 #include "qmu/qmetal_unified.h"
 
+/* Forward declarations from qmu_vulkan.h (C++ header, can't include directly) */
+struct qmu_vulkan_ctx;
+int qmu_vk_request_display_frame(struct qmu_vulkan_ctx *ctx);
+
 /* Log throttling: show first N events, then every Mth */
 #define AGFX_LOG_INITIAL_COUNT  10
 #define AGFX_LOG_INTERVAL       60
@@ -311,6 +315,12 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
     } else {
         s->new_frame_ready = true;
     }
+
+    /* Reference render_frame_completed_bh (apple-gfx.m:2000-2016):
+     * Chain to next frame if pending_frames > 0. */
+    if (__atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST) > 0 && s->qmu_dev) {
+        qmu_vk_request_display_frame(qmu_session_get_vulkan(s->qmu_dev));
+    }
 }
 
 static void qemu_present_frame(void *ctx, const void *pixels,
@@ -492,6 +502,34 @@ static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
 
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_cursor_show_bh, job);
+}
+
+/* Reference newFrameEventHandler (apple-gfx.m:2694) + new_frame_handler_bh (2667).
+ * Called from qmetal when display state machine fires signalCurrentFrame equivalent.
+ * Increments pending_frames, triggers frame encode if first in queue. */
+static void qemu_new_frame_signal(void *ctx)
+{
+    AppleGfxMLState *s = ctx;
+    int pending;
+
+    if (!s || !s->qmu_dev) {
+        return;
+    }
+
+    /* Reference throttle: pending_frames >= 2 → drop (apple-gfx.m:2672) */
+    pending = __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST);
+    if (pending >= 2) {
+        return;
+    }
+    pending = __atomic_add_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
+
+    /* Reference: if pending > 1, another frame will chain from completion (2678) */
+    if (pending > 1) {
+        return;
+    }
+
+    /* First frame — request encode (reference: apple_gfx_render_new_frame) */
+    qmu_vk_request_display_frame(qmu_session_get_vulkan(s->qmu_dev));
 }
 
 /* Display refresh is handled by qmetal library's internal thread.
@@ -832,6 +870,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .schedule_display_completion = qemu_schedule_display_completion,
         .read_memory_mainloop = qemu_read_memory_mainloop,
         .write_memory_mainloop = qemu_write_memory_mainloop,
+        /* Reference: newFrameEventHandler via signalCurrentFrame (apple-gfx.m:2694) */
+        .new_frame_signal = qemu_new_frame_signal,
     };
 
     qmu_extended_config qmu_config = {
