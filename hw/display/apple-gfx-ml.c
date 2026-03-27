@@ -254,7 +254,8 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
     uint32_t width, height, stride;
     size_t size;
 
-    /* Decrement in-flight counter (incremented in qemu_present_frame) */
+    /* Reference render_frame_completed_bh:
+     * balance pending_frames from qemu_new_frame_signal(). */
     __atomic_sub_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
 
     /* Get pending frame parameters under lock */
@@ -328,12 +329,6 @@ static void qemu_present_frame(void *ctx, const void *pixels,
 {
     AppleGfxMLState *s = ctx;
     size_t size = (size_t)height * stride;
-
-    /* Drop frame if too many in flight (reference: pending_frames >= 2) */
-    if (__atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST) >= 2) {
-        return;
-    }
-    __atomic_add_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
 
     /* Log from pthread (before scheduling BH) */
     uint64_t pc = qatomic_fetch_inc(&s->present_count) + 1;
