@@ -499,12 +499,13 @@ static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
                             apple_gfx_ml_cursor_show_bh, job);
 }
 
-/* Reference newFrameEventHandler (apple-gfx.m:2694) + new_frame_handler_bh (2667).
- * Called from qmetal when display state machine fires signalCurrentFrame equivalent.
- * Increments pending_frames, triggers frame encode if first in queue. */
-static void qemu_new_frame_signal(void *ctx)
+/* Reference newFrameEventHandler (apple-gfx.m:2694) schedules
+ * new_frame_handler_bh (2667) onto the AIO/mainloop. Keep the pending_frames
+ * accounting on that BH path rather than calling into qmetal synchronously
+ * from the signal source. */
+static void qemu_new_frame_signal_bh(void *opaque)
 {
-    AppleGfxMLState *s = ctx;
+    AppleGfxMLState *s = opaque;
     int pending;
 
     if (!s || !s->qmu_dev) {
@@ -525,6 +526,17 @@ static void qemu_new_frame_signal(void *ctx)
 
     /* First frame — request encode (reference: apple_gfx_render_new_frame) */
     qmu_vk_request_display_frame(qmu_session_get_vulkan(s->qmu_dev));
+}
+
+static void qemu_new_frame_signal(void *ctx)
+{
+    AppleGfxMLState *s = ctx;
+    if (!s) {
+        return;
+    }
+
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            qemu_new_frame_signal_bh, s);
 }
 
 /* Display refresh is handled by qmetal library's internal thread.
