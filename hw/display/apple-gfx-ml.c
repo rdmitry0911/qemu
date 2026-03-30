@@ -780,28 +780,6 @@ static const GraphicHwOps agfx_gfx_ops = {
 };
 
 /* ============================================================
- * Long Operation Hooks (release BQL during shader compilation)
- *
- * qmetal calls long_op_begin before slow operations (AIR->SPIR-V
- * translation, vkCreateGraphicsPipelines) and long_op_end after.
- * mmio_mutex is released by qmu_session.cpp wrappers before
- * these are called, allowing other channels' KICKs to proceed.
- * We kick AIO in begin to let the QEMU main loop process
- * pending BHs (interrupts, disk I/O) during the long op.
- * ============================================================ */
-
-static void agfx_long_op_begin(void *ctx)
-{
-    (void)ctx;
-    aio_wait_kick();
-}
-
-static void agfx_long_op_end(void *ctx)
-{
-    (void)ctx;
-}
-
-/* ============================================================
  * Device Lifecycle
  * ============================================================ */
 
@@ -892,9 +870,13 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .direct_scanout = s->direct_scanout,
         .vsync_enabled = s->vsync_enabled,
         .spirv_cache_dir = s->spirv_cache_dir,
-        .long_op_unlock = agfx_long_op_begin,
-        .long_op_lock = agfx_long_op_end,
-        .long_op_ctx = s,
+        /* Reference wrapper semantics rely on async MMIO worker +
+         * AIO_WAIT_WHILE in the host module itself. Do not enable qmetal
+         * long_op hooks here: local sync notes mark them as non-reference
+         * interleaving for apple-gfx-ml. */
+        .long_op_unlock = NULL,
+        .long_op_lock = NULL,
+        .long_op_ctx = NULL,
         .using_iosurface_mapper = 0,  /* PCI variant (apple-gfx-pci.m) does NOT use IOSurface mapper */
     };
 
