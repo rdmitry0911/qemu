@@ -39,6 +39,7 @@
 /* Forward declarations from qmu_vulkan.h (C++ header, can't include directly) */
 struct qmu_vulkan_ctx;
 int qmu_vk_request_display_frame(struct qmu_vulkan_ctx *ctx);
+void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
 
 /* Log throttling: show first N events, then every Mth */
 #define AGFX_LOG_INITIAL_COUNT  10
@@ -506,11 +507,22 @@ static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
 static void qemu_new_frame_signal_bh(void *opaque)
 {
     AppleGfxMLState *s = opaque;
+    struct qmu_vulkan_ctx *vk;
     int pending;
 
     if (!s || !s->qmu_dev) {
         return;
     }
+
+    vk = qmu_session_get_vulkan(s->qmu_dev);
+    if (!vk) {
+        return;
+    }
+
+    /* Reference dispatch_source_merge_data delivers a mergeable pending event
+     * that is consumed when the handler runs. Clear qmetal's queued
+     * signalCurrentFrame state on BH delivery before throttle/encode logic. */
+    qmu_vk_consume_current_frame_signal(vk);
 
     /* Reference throttle: pending_frames >= 2 → drop (apple-gfx.m:2672) */
     pending = __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST);
@@ -525,7 +537,7 @@ static void qemu_new_frame_signal_bh(void *opaque)
     }
 
     /* First frame — request encode (reference: apple_gfx_render_new_frame) */
-    qmu_vk_request_display_frame(qmu_session_get_vulkan(s->qmu_dev));
+    qmu_vk_request_display_frame(vk);
 }
 
 static void qemu_new_frame_signal(void *ctx)
