@@ -106,9 +106,28 @@ struct AppleGfxMLState {
     QemuSemaphore mmio_sem;        /* Wake worker when job available */
     bool mmio_worker_stop;          /* Signal worker to exit */
 
-    /* Current MMIO job for worker (per-device, replaces global pointer) */
-    struct AppleGfxMLMMIOJob *volatile pending_job;
-    QemuMutex mmio_job_mutex;  /* Serializes MMIO dispatch (BQL released during AIO_WAIT_WHILE) */
+    /* MMIO job queue owned by the wrapper. */
+    struct AppleGfxMLSessionJob *session_job_head;
+    struct AppleGfxMLSessionJob *session_job_tail;
+    QemuMutex mmio_job_mutex;  /* Protects MMIO session job queue */
+    QemuMutex session_mutex;   /* Serializes qmetal session mutation across workers */
+    int mmio_wait_active;      /* Main thread is inside AIO_WAIT_WHILE for MMIO */
+
+    /* Reference-like background render queue separate from MMIO dispatch_async path. */
+    QemuThread render_worker;
+    QemuSemaphore render_sem;
+    QemuMutex render_mutex;
+    bool render_worker_stop;
+    int render_requests;
+
+    QemuMutex frame_signal_mutex;
+    bool new_frame_source_armed;
+
+    /* Reference: scheduleFramePresents → timer → encodeCurrentFrameToCommandBuffer.
+     * This timer lives in the wrapper (display plane), not in PVG library.
+     * Runs continuously at ~10Hz, independent of IOSFC_ENABLE. */
+    QEMUTimer *display_frame_timer;
+    bool display_frame_timer_active;
 };
 
 /* Properties macro for device registration
