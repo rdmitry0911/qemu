@@ -665,8 +665,7 @@ static void qemu_new_frame_signal(void *ctx)
     s->new_frame_source_armed = true;
     qemu_mutex_unlock(&s->frame_signal_mutex);
 
-    /* Start display frame timer on first signal (display backing now exists).
-     * Reference: scheduleFramePresents starts once display surface is available. */
+    /* Reference: scheduleFramePresents starts once display surface is available. */
     if (!s->display_frame_timer_active) {
         agfx_start_display_frame_timer(s);
     }
@@ -880,9 +879,11 @@ static void *agfx_render_worker_thread(void *opaque)
                  request_count,
                  qatomic_read(&s->mmio_wait_active),
                  __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
-        qemu_mutex_lock(&s->session_mutex);
+        /* Reference: encodeCurrentFrameToCommandBuffer runs on its own dispatch
+         * queue without session mutex. Display path is fully isolated: own
+         * display_cmd_pool, own display_cmd_buffer, own submit. No session_mutex
+         * needed — avoids blocking MMIO reads during GPU fence wait. */
         (void)qmu_vk_request_display_frame(vk);
-        qemu_mutex_unlock(&s->session_mutex);
     }
 
     return NULL;
