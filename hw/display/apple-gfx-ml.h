@@ -128,6 +128,23 @@ struct AppleGfxMLState {
      * Runs continuously at ~10Hz, independent of IOSFC_ENABLE. */
     QEMUTimer *display_frame_timer;
     bool display_frame_timer_active;
+
+    /* Async log sink: hot paths enqueue formatted lines, one worker serializes
+     * qemu_log() writes off the producer threads. */
+    QemuThread log_writer;
+    QemuSemaphore log_sem;
+    QemuMutex log_mutex;
+    bool log_writer_started;
+    bool log_writer_stop;
+    struct AgfxLogEntry *log_head;
+    struct AgfxLogEntry *log_tail;
+    uint32_t log_depth;
+    uint64_t log_dropped;
+
+    uint64_t frame_completed_log_count;
+    uint64_t new_frame_handler_log_count;
+    uint64_t new_frame_signal_log_count;
+    uint64_t render_worker_log_count;
 };
 
 /* Properties macro for device registration
