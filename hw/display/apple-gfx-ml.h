@@ -118,10 +118,12 @@ struct AppleGfxMLState {
     QemuSemaphore render_sem;
     QemuMutex render_mutex;
     bool render_worker_stop;
-    int render_requests;
+    int bootstrap_requests;
+    int display_render_requests;
 
     QemuMutex frame_signal_mutex;
     bool new_frame_source_armed;
+    int iosfc_bootstrap_active;
 
     /* Reference: scheduleFramePresents → timer → encodeCurrentFrameToCommandBuffer.
      * This timer lives in the wrapper (display plane), not in PVG library.

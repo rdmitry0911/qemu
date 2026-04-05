@@ -34,6 +34,7 @@
 #include "trace.h"
 
 #include "apple-gfx-ml.h"
+#include "qmu/pvg_regs.h"
 #include "qmu/qmetal_unified.h"
 
 /* Forward declarations from qmu_vulkan.h (C++ header, can't include directly) */
@@ -447,7 +448,8 @@ static void qemu_raise_irq(void *ctx, uint32_t vector)
  * This matches Apple's approach with newFrameEventHandler + BH.
  * ============================================================ */
 
-static void agfx_request_render_frame(AppleGfxMLState *s);
+static void agfx_request_display_render(AppleGfxMLState *s);
+static void agfx_request_bootstrap_tick(AppleGfxMLState *s);
 static void apple_gfx_ml_frame_completed_bh(void *opaque);
 static void agfx_start_display_frame_timer(AppleGfxMLState *s);
 static void agfx_enqueue_session_job(AppleGfxMLState *s,
@@ -612,7 +614,7 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
     }
 
     if (pending > 0 && s->qmu_dev) {
-        agfx_request_render_frame(s);
+        agfx_request_display_render(s);
     }
 }
 
@@ -767,14 +769,26 @@ static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
                             apple_gfx_ml_cursor_show_bh, job);
 }
 
-static void agfx_request_render_frame(AppleGfxMLState *s)
+static void agfx_request_display_render(AppleGfxMLState *s)
 {
     if (!s || !s->qmu_dev) {
         return;
     }
 
     qemu_mutex_lock(&s->render_mutex);
-    s->render_requests++;
+    s->display_render_requests++;
+    qemu_mutex_unlock(&s->render_mutex);
+    qemu_sem_post(&s->render_sem);
+}
+
+static void agfx_request_bootstrap_tick(AppleGfxMLState *s)
+{
+    if (!s || !s->qmu_dev) {
+        return;
+    }
+
+    qemu_mutex_lock(&s->render_mutex);
+    s->bootstrap_requests++;
     qemu_mutex_unlock(&s->render_mutex);
     qemu_sem_post(&s->render_sem);
 }
@@ -840,7 +854,7 @@ static void agfx_new_frame_handler_bh(void *opaque)
                  "[apple-gfx-ml] new_frame_handler_bh: queue_render pending_frames=%d\n",
                  pending);
     }
-    agfx_request_render_frame(s);
+    agfx_request_display_render(s);
 }
 
 static void qemu_new_frame_signal(void *ctx)
@@ -919,6 +933,7 @@ static void qemu_schedule_display_completion(void *ctx,
  * Maps guest physical memory for IOSurface backing with memory_region_ref pinning. */
 static void *qemu_iosfc_map_memory(void *ctx, uint64_t gpa, uint64_t len, int read_only)
 {
+    AppleGfxMLState *s = ctx;
     MemoryRegion *mr = NULL;
     hwaddr xlat = 0;
     hwaddr xlat_len = len;
@@ -938,14 +953,26 @@ static void *qemu_iosfc_map_memory(void *ctx, uint64_t gpa, uint64_t len, int re
         return NULL;
     }
     memory_region_ref(mr);
+
+    if (s) {
+        qatomic_set(&s->iosfc_bootstrap_active, 1);
+        if (!s->display_frame_timer_active) {
+            agfx_start_display_frame_timer(s);
+        }
+    }
     return ptr + xlat;
 }
 
 /* 1:1 reference apple_gfx_mmio_unmap_surface_memory (apple-gfx-mmio.m:160-177) */
 static int qemu_iosfc_unmap_memory(void *ctx, void *hva, uint64_t len)
 {
+    AppleGfxMLState *s = ctx;
     MemoryRegion *mr;
     ram_addr_t offset = 0;
+
+    if (s) {
+        qatomic_set(&s->iosfc_bootstrap_active, 0);
+    }
 
     RCU_READ_LOCK_GUARD();
     mr = memory_region_from_host(hva, &offset);
@@ -1056,6 +1083,9 @@ static void *agfx_render_worker_thread(void *opaque)
     AppleGfxMLState *s = opaque;
 
     while (true) {
+        int bootstrap_count = 0;
+        int display_count = 0;
+        const char *work_kind = NULL;
         int request_count = 0;
         struct qmu_vulkan_ctx *vk = NULL;
 
@@ -1065,14 +1095,21 @@ static void *agfx_render_worker_thread(void *opaque)
             break;
         }
 
+        /* Reference: one timer tick → one encode attempt. Consume exactly
+         * one request per sem_wait wakeup. Remaining sem count drives the
+         * next iteration. pending_frames throttles rate, not coalescing. */
         qemu_mutex_lock(&s->render_mutex);
-        if (s->render_requests > 0) {
-            request_count = s->render_requests;
-            s->render_requests = 0;
+        if (s->display_render_requests > 0) {
+            display_count = 1;
+            s->display_render_requests--;
+        }
+        if (s->bootstrap_requests > 0 && display_count <= 0) {
+            bootstrap_count = 1;
+            s->bootstrap_requests--;
         }
         qemu_mutex_unlock(&s->render_mutex);
 
-        if (request_count <= 0 || !s->qmu_dev) {
+        if ((display_count <= 0 && bootstrap_count <= 0) || !s->qmu_dev) {
             continue;
         }
 
@@ -1082,18 +1119,31 @@ static void *agfx_render_worker_thread(void *opaque)
             continue;
         }
 
+        if (display_count > 0) {
+            work_kind = "request_display_frame";
+            request_count = display_count;
+        } else {
+            work_kind = "iosfc_present_tick";
+            request_count = bootstrap_count;
+        }
+
         if (agfx_log_should_emit(&s->render_worker_log_count)) {
             agfx_log(s,
-                     "[apple-gfx-ml] render_worker: request_display_frame x%d mmio_wait=%d pending_frames=%d\n",
+                     "[apple-gfx-ml] render_worker: %s x%d mmio_wait=%d pending_frames=%d\n",
+                     work_kind,
                      request_count,
                      qatomic_read(&s->mmio_wait_active),
                      __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
         }
-        /* Reference: encodeCurrentFrameToCommandBuffer runs on its own dispatch
-         * queue without session mutex. Display path is fully isolated: own
-         * display_cmd_pool, own display_cmd_buffer, own submit. No session_mutex
-         * needed — avoids blocking MMIO reads during GPU fence wait. */
-        (void)qmu_vk_request_display_frame(vk);
+        /* Reference: wrapper/display plane owns both bootstrap IOSFC cadence
+         * and regular encodeCurrentFrame cadence. Both run on the isolated
+         * render worker without session_mutex so MMIO reads/writes do not wait
+         * behind display-plane GPU fences. */
+        if (display_count > 0) {
+            (void)qmu_vk_request_display_frame(vk);
+        } else if (qatomic_read(&s->iosfc_bootstrap_active)) {
+            (void)qmu_iosfc_present_tick(s->qmu_dev);
+        }
     }
 
     return NULL;
@@ -1137,6 +1187,21 @@ static void agfx_mmio_write(void *opaque, hwaddr offset,
     agfx_enqueue_session_job(s, &job);
     AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
     qatomic_set(&s->mmio_wait_active, 0);
+
+    /* Reference PCI path shows bootstrap new-frame cadence starting after
+     * IOSFC MAP_ADDR commits, without requiring a separate IOSurface-mapper
+     * mode switch. Keep bootstrap scheduling ownership in the wrapper plane
+     * by arming/disarming it on the IOSFC MMIO commit points observed here. */
+    if (offset == PVG_REG_IOSFC_MAP_ADDR && val != 0) {
+        qatomic_set(&s->iosfc_bootstrap_active, 1);
+        if (!s->display_frame_timer_active) {
+            agfx_start_display_frame_timer(s);
+        }
+    } else if ((offset == PVG_REG_IOSFC_ENABLE && val == 0) ||
+               offset == PVG_REG_IOSFC_UNMAP) {
+        qatomic_set(&s->iosfc_bootstrap_active, 0);
+    }
+
     if (s->debug_level >= 5) {
         trace_apple_gfx_ml_mmio_write(offset, val, size);
     }
@@ -1180,9 +1245,19 @@ static void agfx_display_frame_timer_cb(void *opaque)
         return;
     }
 
-    /* Request a display frame encode (same path as newFrameEventHandler).
-     * The render_worker + pending_frames throttle handles rate limiting. */
-    agfx_request_render_frame(s);
+    /* Reference: display timer only PUSHES already-completed frames.
+     * It does NOT trigger new composites (apple-gfx.m:2230-2243
+     * apple_gfx_fb_update_display only calls dpy_gfx_update_full
+     * when new_frame_ready is set by the completion BH).
+     *
+     * Composites are triggered ONLY by signalCurrentFrame (Transaction3).
+     * Timer-triggered composites read from backing textures that may be
+     * invalidated/stale between transactions → BLACK frames with CLEAR.
+     *
+     * Bootstrap mode still needs active ticks (no Transaction3 yet). */
+    if (qatomic_read(&s->iosfc_bootstrap_active)) {
+        agfx_request_bootstrap_tick(s);
+    }
 
     /* Re-arm timer */
     timer_mod(s->display_frame_timer,
@@ -1283,10 +1358,12 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     qemu_sem_init(&s->render_sem, 0);
     s->mmio_wait_active = 0;
     s->new_frame_source_armed = false;
+    s->iosfc_bootstrap_active = 0;
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
     s->render_worker_stop = false;
-    s->render_requests = 0;
+    s->bootstrap_requests = 0;
+    s->display_render_requests = 0;
     
     /* Allocate double-buffered framebuffers */
     initial_fb_size = (size_t)s->display_height * s->display_width * 4;
@@ -1336,7 +1413,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .long_op_unlock = NULL,
         .long_op_lock = NULL,
         .long_op_ctx = NULL,
-        .using_iosurface_mapper = 0,  /* PCI variant (apple-gfx-pci.m) does NOT use IOSurface mapper */
+        .using_iosurface_mapper = 0,
     };
 
     /* Reference apple-gfx.m:45-49: exactly 3 hardcoded modes.
@@ -1463,7 +1540,8 @@ static void agfx_reset(Object *obj, ResetType type)
     s->pending_frames = 0;
     s->mmio_wait_active = 0;
     qemu_mutex_lock(&s->render_mutex);
-    s->render_requests = 0;
+    s->bootstrap_requests = 0;
+    s->display_render_requests = 0;
     qemu_mutex_unlock(&s->render_mutex);
     qemu_mutex_lock(&s->frame_signal_mutex);
     s->new_frame_source_armed = false;
@@ -1523,7 +1601,8 @@ static void agfx_instance_init(Object *obj)
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
     s->render_worker_stop = false;
-    s->render_requests = 0;
+    s->bootstrap_requests = 0;
+    s->display_render_requests = 0;
     s->pending_frames = 0;
     s->staging_fb = NULL;
     s->display_fb = NULL;
