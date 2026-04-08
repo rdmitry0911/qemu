@@ -472,7 +472,6 @@ struct AppleGfxMLSessionJob {
 };
 
 typedef struct AgfxCompletionJob {
-    AppleGfxMLState *state;
     void (*fn)(void *);
     void *ctx;
 } AgfxCompletionJob;
@@ -480,22 +479,16 @@ typedef struct AgfxCompletionJob {
 static void agfx_display_completion_bh(void *opaque)
 {
     AgfxCompletionJob *job = opaque;
-    AppleGfxMLState *s = NULL;
 
     if (!job) {
         return;
     }
 
-    s = job->state;
-    if (s) {
-        /* Completion remains async on the QEMU main-loop AioContext, matching
-         * reference apple-gfx.m callback routing. */
-        qemu_mutex_lock(&s->session_mutex);
-    }
+    /* Keep the completion BH lock-free on the main loop. qmu's Transaction3
+     * completion path is designed to run asynchronously after releasing its
+     * internal display lock so the MMIO worker can keep waiting on main-loop
+     * BH/AIO progress without the completion callback blocking that loop. */
     job->fn(job->ctx);
-    if (s) {
-        qemu_mutex_unlock(&s->session_mutex);
-    }
     g_free(job);
 }
 
@@ -914,7 +907,7 @@ static void qemu_new_frame_signal(void *ctx)
  * Display Completion BH Trampoline
  *
  * Matches reference GCD dispatch_async for presentSurface completion.
- * qmu_session expects this to run in the outer main-loop plane with
+ * qmu_session expects this to run in the main-loop BH plane with
  * read_memory_mainloop/write_memory_mainloop semantics.
  * ============================================================ */
 
@@ -930,7 +923,6 @@ static void qemu_schedule_display_completion(void *ctx,
     }
 
     job = g_new0(AgfxCompletionJob, 1);
-    job->state = s;
     job->fn = fn;
     job->ctx = comp_ctx;
 
