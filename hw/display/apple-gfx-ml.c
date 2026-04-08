@@ -472,6 +472,7 @@ struct AppleGfxMLSessionJob {
 };
 
 typedef struct AgfxCompletionJob {
+    AppleGfxMLState *state;
     void (*fn)(void *);
     void *ctx;
 } AgfxCompletionJob;
@@ -479,12 +480,23 @@ typedef struct AgfxCompletionJob {
 static void agfx_display_completion_bh(void *opaque)
 {
     AgfxCompletionJob *job = opaque;
+    AppleGfxMLState *s = NULL;
 
     if (!job) {
         return;
     }
 
+    s = job->state;
+    if (s) {
+        /* Completion remains async on the main loop, but must not publish
+         * guest-visible Transaction3 side effects concurrently with MMIO
+         * worker mutations of the same qmetal session. */
+        qemu_mutex_lock(&s->session_mutex);
+    }
     job->fn(job->ctx);
+    if (s) {
+        qemu_mutex_unlock(&s->session_mutex);
+    }
     g_free(job);
 }
 
@@ -920,6 +932,7 @@ static void qemu_schedule_display_completion(void *ctx,
     }
 
     job = g_new0(AgfxCompletionJob, 1);
+    job->state = s;
     job->fn = fn;
     job->ctx = comp_ctx;
 
