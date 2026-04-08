@@ -488,9 +488,8 @@ static void agfx_display_completion_bh(void *opaque)
 
     s = job->state;
     if (s) {
-        /* Completion remains async on the main loop, but must not publish
-         * guest-visible Transaction3 side effects concurrently with MMIO
-         * worker mutations of the same qmetal session. */
+        /* Completion remains async on the QEMU main-loop AioContext, matching
+         * reference apple-gfx.m callback routing. */
         qemu_mutex_lock(&s->session_mutex);
     }
     job->fn(job->ctx);
@@ -598,9 +597,8 @@ static void qemu_present_frame(void *ctx, const void *pixels,
     s->frame_pending = true;
     qemu_mutex_unlock(&s->frame_mutex);
     
-    /* Route display/UI callbacks through iohandler AioContext so they are
-     * delivered by the outer main loop, not recursively from AIO_WAIT_WHILE. */
-    aio_bh_schedule_oneshot(iohandler_get_aio_context(),
+    /* Match reference apple-gfx.m display/UI callback routing. */
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_present_frame_bh, s);
 }
 
@@ -638,7 +636,7 @@ static void qemu_frame_completed(void *ctx)
         return;
     }
 
-    aio_bh_schedule_oneshot(iohandler_get_aio_context(),
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_frame_completed_bh, s);
 }
 
@@ -759,7 +757,7 @@ static void qemu_cursor_glyph(void *ctx,
     job->hot_y = hot_y;
     job->sum = sum;
 
-    aio_bh_schedule_oneshot(iohandler_get_aio_context(),
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_cursor_glyph_bh, job);
 }
 
@@ -777,7 +775,7 @@ static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
     job->display_id = display_id;
     job->visible = visible != 0;
 
-    aio_bh_schedule_oneshot(iohandler_get_aio_context(),
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_cursor_show_bh, job);
 }
 
@@ -904,7 +902,7 @@ static void qemu_new_frame_signal(void *ctx)
                  __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
                  qatomic_read(&s->mmio_wait_active));
     }
-    aio_bh_schedule_oneshot(iohandler_get_aio_context(),
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             agfx_new_frame_handler_bh, s);
 }
 
@@ -938,7 +936,7 @@ static void qemu_schedule_display_completion(void *ctx,
 
     agfx_log(s, "[apple-gfx-ml] schedule_display_completion: enqueue mmio_wait=%d\n",
              qatomic_read(&s->mmio_wait_active));
-    aio_bh_schedule_oneshot(iohandler_get_aio_context(),
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             agfx_display_completion_bh, job);
 }
 
@@ -1515,6 +1513,7 @@ static void agfx_exit(PCIDevice *pci_dev)
         }
         job = next;
     }
+
     qemu_mutex_destroy(&s->mmio_job_mutex);
     qemu_mutex_destroy(&s->session_mutex);
     qemu_mutex_destroy(&s->render_mutex);
