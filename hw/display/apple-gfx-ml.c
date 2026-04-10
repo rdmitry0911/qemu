@@ -943,10 +943,11 @@ static void qemu_schedule_display_completion(void *ctx,
  * Maps guest physical memory for IOSurface backing with memory_region_ref pinning. */
 static void *qemu_iosfc_map_memory(void *ctx, uint64_t gpa, uint64_t len, int read_only)
 {
-    AppleGfxMLState *s = ctx;
     MemoryRegion *mr = NULL;
     hwaddr xlat = 0;
     hwaddr xlat_len = len;
+
+    (void)ctx;
 
     RCU_READ_LOCK_GUARD();
     mr = address_space_translate(&address_space_memory, gpa,
@@ -963,26 +964,17 @@ static void *qemu_iosfc_map_memory(void *ctx, uint64_t gpa, uint64_t len, int re
         return NULL;
     }
     memory_region_ref(mr);
-
-    if (s) {
-        qatomic_set(&s->iosfc_bootstrap_active, 1);
-        if (!s->display_frame_timer_active) {
-            agfx_start_display_frame_timer(s);
-        }
-    }
     return ptr + xlat;
 }
 
 /* 1:1 reference apple_gfx_mmio_unmap_surface_memory (apple-gfx-mmio.m:160-177) */
 static int qemu_iosfc_unmap_memory(void *ctx, void *hva, uint64_t len)
 {
-    AppleGfxMLState *s = ctx;
     MemoryRegion *mr;
     ram_addr_t offset = 0;
 
-    if (s) {
-        qatomic_set(&s->iosfc_bootstrap_active, 0);
-    }
+    (void)ctx;
+    (void)len;
 
     RCU_READ_LOCK_GUARD();
     mr = memory_region_from_host(hva, &offset);
@@ -1198,14 +1190,17 @@ static void agfx_mmio_write(void *opaque, hwaddr offset,
     AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
     qatomic_set(&s->mmio_wait_active, 0);
 
-    /* Reference PCI path shows bootstrap new-frame cadence starting after
-     * IOSFC MAP_ADDR commits, without requiring a separate IOSurface-mapper
-     * mode switch. Keep bootstrap scheduling ownership in the wrapper plane
-     * by arming/disarming it on the IOSFC MMIO commit points observed here. */
+    /* Reference scheduleFramePresents is owned by the wrapper plane, not by
+     * the IOSurface map/unmap callbacks themselves. Mirror that ownership on
+     * the IOSFC MMIO commit points: first MAP_ADDR starts the timer with an
+     * immediate first fire, later MAP_ADDR commits merge one pending tick into
+     * the already-armed source. */
     if (offset == PVG_REG_IOSFC_MAP_ADDR && val != 0) {
         qatomic_set(&s->iosfc_bootstrap_active, 1);
         if (!s->display_frame_timer_active) {
             agfx_start_display_frame_timer(s);
+        } else {
+            agfx_request_bootstrap_tick(s);
         }
     } else if ((offset == PVG_REG_IOSFC_ENABLE && val == 0) ||
                offset == PVG_REG_IOSFC_UNMAP) {
@@ -1281,9 +1276,11 @@ static void agfx_start_display_frame_timer(AppleGfxMLState *s)
         return;
     }
     s->display_frame_timer_active = true;
+    /* Reference scheduleFramePresents uses dispatch_source_set_timer with
+     * start = dispatch_walltime(NULL, 0), so the first fire is immediate
+     * instead of being delayed by one full interval. */
     timer_mod(s->display_frame_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-              AGFX_DISPLAY_FRAME_INTERVAL_MS);
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
     agfx_log(s, "[apple-gfx-ml] display frame timer started (%dms interval)\n",
              AGFX_DISPLAY_FRAME_INTERVAL_MS);
 }
