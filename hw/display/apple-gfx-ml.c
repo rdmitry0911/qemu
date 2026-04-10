@@ -492,17 +492,20 @@ static void agfx_display_completion_bh(void *opaque)
     g_free(job);
 }
 
-static void apple_gfx_ml_present_frame_bh(void *opaque)
+static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s)
 {
-    AppleGfxMLState *s = opaque;
     uint32_t width, height, stride;
     size_t size;
+
+    if (!s) {
+        return false;
+    }
 
     /* Get pending frame parameters under lock */
     qemu_mutex_lock(&s->frame_mutex);
     if (!s->frame_pending) {
         qemu_mutex_unlock(&s->frame_mutex);
-        return;
+        return false;
     }
 
     width = s->pending_width;
@@ -527,7 +530,7 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
     /* Update frame counter and log */
     s->frame_count++;
     if (s->frame_count <= AGFX_LOG_INITIAL_COUNT || (s->frame_count % AGFX_LOG_INTERVAL) == 0) {
-        agfx_log(s, "[apple-gfx-ml] present_frame_bh #%lu: %ux%u stride=%u\n",
+        agfx_log(s, "[apple-gfx-ml] frame_completed_bh: present #%lu %ux%u stride=%u\n",
                  (unsigned long)s->frame_count, width, height, stride);
     }
 
@@ -557,6 +560,7 @@ static void apple_gfx_ml_present_frame_bh(void *opaque)
         s->new_frame_ready = true;
     }
 
+    return true;
 }
 
 static void qemu_present_frame(void *ctx, const void *pixels,
@@ -590,15 +594,16 @@ static void qemu_present_frame(void *ctx, const void *pixels,
     s->frame_pending = true;
     qemu_mutex_unlock(&s->frame_mutex);
     
-    /* Match reference apple-gfx.m display/UI callback routing. */
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_present_frame_bh, s);
+    /* Reference apple_gfx_render_frame_completed_bh applies the completed
+     * texture and pending-frame accounting in one BH. Keep this producer as
+     * staging-only; qemu_frame_completed schedules the single completion BH. */
 }
 
 static void apple_gfx_ml_frame_completed_bh(void *opaque)
 {
     AppleGfxMLState *s = opaque;
     int pending;
+    bool frame_applied;
 
     if (!s) {
         return;
@@ -609,10 +614,13 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
         pending = __atomic_sub_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
     }
 
+    frame_applied = apple_gfx_ml_apply_staged_frame(s);
+
     if (agfx_log_should_emit(&s->frame_completed_log_count)) {
         agfx_log(s,
-                 "[apple-gfx-ml] frame_completed_bh: pending_frames=%d mmio_wait=%d\n",
+                 "[apple-gfx-ml] frame_completed_bh: pending_frames=%d frame_applied=%d mmio_wait=%d\n",
                  __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
+                 frame_applied ? 1 : 0,
                  qatomic_read(&s->mmio_wait_active));
     }
 
