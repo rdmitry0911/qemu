@@ -1295,13 +1295,22 @@ static void agfx_start_display_frame_timer(AppleGfxMLState *s)
 static void agfx_gfx_update(void *opaque)
 {
     AppleGfxMLState *s = opaque;
+    int pending_frames = 0;
+
+    if (!s) {
+        return;
+    }
+
+    pending_frames = __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST);
     if (s->new_frame_ready) {
         /* Path 1: Frame ready — push to display, signal done */
         dpy_gfx_update_full(s->con);
         s->new_frame_ready = false;
         graphic_hw_update_done(s->con);
-    } else if (s->frame_pending) {
-        /* Path 2: Frame in-flight — defer, completion BH will signal */
+    } else if (pending_frames > 0) {
+        /* Reference apple_gfx_fb_update_display defers while render work is
+         * still in flight (pending_frames > 0), not only while a completed
+         * CPU-side staging copy is waiting in frame_pending. */
         s->gfx_update_requested = true;
     } else {
         /* Path 3: Idle — signal done to keep polling alive */
