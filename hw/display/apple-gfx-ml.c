@@ -791,9 +791,16 @@ static void agfx_request_bootstrap_tick(AppleGfxMLState *s)
     }
 
     qemu_mutex_lock(&s->render_mutex);
-    s->bootstrap_requests++;
+    /* Reference PGEFIDisplay::scheduleFramePresents uses dispatch_source_merge_data
+     * for timer delivery, so bootstrap ticks coalesce to one pending event rather
+     * than accumulating an unbounded backlog while the render queue is busy. */
+    if (s->bootstrap_requests <= 0) {
+        s->bootstrap_requests = 1;
+        qemu_mutex_unlock(&s->render_mutex);
+        qemu_sem_post(&s->render_sem);
+        return;
+    }
     qemu_mutex_unlock(&s->render_mutex);
-    qemu_sem_post(&s->render_sem);
 }
 
 /* Reference newFrameEventHandler schedules a BH onto the QEMU main loop from
