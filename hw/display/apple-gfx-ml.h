@@ -20,6 +20,7 @@
 
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
+struct AppleGfxMLFrameCompletionJob;
 
 #define TYPE_APPLE_GFX_ML "apple-gfx-ml"
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGfxMLState, APPLE_GFX_ML)
@@ -76,6 +77,8 @@ struct AppleGfxMLState {
     uint32_t pending_height;
     uint32_t pending_stride;
     bool frame_pending;         /* New frame waiting to be displayed */
+    struct AppleGfxMLFrameCompletionJob *frame_completion_wait_head;
+    struct AppleGfxMLFrameCompletionJob *frame_completion_wait_tail;
 
     /* Current display parameters */
     uint32_t fb_width;

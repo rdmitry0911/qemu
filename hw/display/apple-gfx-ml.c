@@ -43,6 +43,7 @@ int qmu_vk_request_display_frame(struct qmu_vulkan_ctx *ctx);
 void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
 typedef struct AgfxLogEntry AgfxLogEntry;
+typedef struct AppleGfxMLFrameCompletionJob AppleGfxMLFrameCompletionJob;
 
 /* Log throttling: show first N events, then every Mth */
 #define AGFX_LOG_INITIAL_COUNT  10
@@ -52,6 +53,14 @@ typedef struct AgfxLogEntry AgfxLogEntry;
 struct AgfxLogEntry {
     AgfxLogEntry *next;
     char *text;
+};
+
+struct AppleGfxMLFrameCompletionJob {
+    AppleGfxMLState *state;
+    AppleGfxMLFrameCompletionJob *next;
+    bool frame_expected;
+    bool pending_accounted;
+    bool chain_needed;
 };
 
 static void agfx_log_write_direct(const char *text)
@@ -71,6 +80,25 @@ static bool agfx_log_should_emit(uint64_t *counter)
 
     value = ++(*counter);
     return value <= AGFX_LOG_INITIAL_COUNT || (value % AGFX_LOG_INTERVAL) == 0;
+}
+
+static void agfx_free_waiting_frame_completion_jobs(AppleGfxMLState *s)
+{
+    AppleGfxMLFrameCompletionJob *job;
+
+    if (!s) {
+        return;
+    }
+
+    job = s->frame_completion_wait_head;
+    s->frame_completion_wait_head = NULL;
+    s->frame_completion_wait_tail = NULL;
+
+    while (job) {
+        AppleGfxMLFrameCompletionJob *next = job->next;
+        g_free(job);
+        job = next;
+    }
 }
 
 static void agfx_enqueue_log_owned(AppleGfxMLState *s, char *text)
@@ -569,6 +597,7 @@ static void qemu_present_frame(void *ctx, const void *pixels,
 {
     AppleGfxMLState *s = ctx;
     size_t size = (size_t)height * stride;
+    AppleGfxMLFrameCompletionJob *wait_job = NULL;
 
     /* Log from pthread (before scheduling BH) */
     uint64_t pc = qatomic_fetch_inc(&s->present_count) + 1;
@@ -593,29 +622,58 @@ static void qemu_present_frame(void *ctx, const void *pixels,
     s->pending_height = height;
     s->pending_stride = stride;
     s->frame_pending = true;
+    wait_job = s->frame_completion_wait_head;
+    if (wait_job) {
+        s->frame_completion_wait_head = wait_job->next;
+        if (!s->frame_completion_wait_head) {
+            s->frame_completion_wait_tail = NULL;
+        }
+        wait_job->next = NULL;
+    }
     qemu_mutex_unlock(&s->frame_mutex);
     
     /* Reference apple_gfx_render_frame_completed_bh applies the completed
      * texture and pending-frame accounting in one BH. Keep this producer as
      * staging-only; qemu_frame_completed schedules the single completion BH. */
+    if (wait_job) {
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                apple_gfx_ml_frame_completed_bh, wait_job);
+    }
 }
 
 static void apple_gfx_ml_frame_completed_bh(void *opaque)
 {
-    AppleGfxMLState *s = opaque;
-    int pending;
+    AppleGfxMLFrameCompletionJob *job = opaque;
+    AppleGfxMLState *s = job ? job->state : NULL;
     bool frame_applied;
 
-    if (!s) {
+    if (!job || !s) {
+        g_free(job);
         return;
     }
 
-    pending = __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST);
-    if (pending > 0) {
-        pending = __atomic_sub_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
+    if (!job->pending_accounted) {
+        int pending = __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST);
+        if (pending > 0) {
+            pending = __atomic_sub_fetch(&s->pending_frames, 1, __ATOMIC_SEQ_CST);
+        }
+        job->chain_needed = pending > 0;
+        job->pending_accounted = true;
     }
 
     frame_applied = apple_gfx_ml_apply_staged_frame(s);
+    if (!frame_applied && job->frame_expected) {
+        qemu_mutex_lock(&s->frame_mutex);
+        job->next = NULL;
+        if (s->frame_completion_wait_tail) {
+            s->frame_completion_wait_tail->next = job;
+        } else {
+            s->frame_completion_wait_head = job;
+        }
+        s->frame_completion_wait_tail = job;
+        qemu_mutex_unlock(&s->frame_mutex);
+        return;
+    }
 
     if (agfx_log_should_emit(&s->frame_completed_log_count)) {
         agfx_log(s,
@@ -625,21 +683,27 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
                  qatomic_read(&s->mmio_wait_active));
     }
 
-    if (pending > 0 && s->qmu_dev) {
+    if (job->chain_needed && s->qmu_dev) {
         agfx_request_display_render(s);
     }
+
+    g_free(job);
 }
 
-static void qemu_frame_completed(void *ctx)
+static void qemu_frame_completed(void *ctx, int frame_expected)
 {
     AppleGfxMLState *s = ctx;
+    AppleGfxMLFrameCompletionJob *job;
 
     if (!s) {
         return;
     }
 
+    job = g_new0(AppleGfxMLFrameCompletionJob, 1);
+    job->state = s;
+    job->frame_expected = frame_expected != 0;
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_frame_completed_bh, s);
+                            apple_gfx_ml_frame_completed_bh, job);
 }
 
 typedef struct AppleGfxMLCursorGlyphJob {
@@ -1148,7 +1212,7 @@ static void *agfx_render_worker_thread(void *opaque)
                          "[apple-gfx-ml] render_worker: request_display_frame retired without callback pending_frames=%d\n",
                          __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
             }
-            qemu_frame_completed(s);
+            qemu_frame_completed(s, 0);
         }
     }
 
@@ -1535,6 +1599,9 @@ static void agfx_exit(PCIDevice *pci_dev)
     agfx_log_stop(s);
 
     /* Cleanup framebuffers and mutex */
+    qemu_mutex_lock(&s->frame_mutex);
+    agfx_free_waiting_frame_completion_jobs(s);
+    qemu_mutex_unlock(&s->frame_mutex);
     qemu_mutex_destroy(&s->frame_mutex);
     g_free(s->staging_fb);
     s->staging_fb = NULL;
@@ -1564,7 +1631,10 @@ static void agfx_reset(Object *obj, ResetType type)
     qemu_mutex_lock(&s->frame_signal_mutex);
     s->new_frame_source_armed = false;
     qemu_mutex_unlock(&s->frame_signal_mutex);
+    qemu_mutex_lock(&s->frame_mutex);
     s->frame_pending = false;
+    agfx_free_waiting_frame_completion_jobs(s);
+    qemu_mutex_unlock(&s->frame_mutex);
     s->cursor_show = true;
     
     /* qmetal handles its own reset via MMIO writes from guest */
@@ -1622,6 +1692,8 @@ static void agfx_instance_init(Object *obj)
     s->display_render_requests = 0;
     s->bootstrap_present_bh = NULL;
     s->pending_frames = 0;
+    s->frame_completion_wait_head = NULL;
+    s->frame_completion_wait_tail = NULL;
     s->staging_fb = NULL;
     s->display_fb = NULL;
     s->cursor = NULL;
