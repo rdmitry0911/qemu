@@ -60,6 +60,7 @@ struct AppleGfxMLFrameCompletionJob {
     AppleGfxMLState *state;
     AppleGfxMLFrameCompletionJob *next;
     bool frame_expected;
+    bool frame_staged;
     bool pending_accounted;
     bool chain_needed;
 };
@@ -575,6 +576,7 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s)
     stride = s->pending_stride;
     size = (size_t)height * stride;
     s->frame_pending = false;
+    s->frame_claimed = false;
 
     /* Reallocate display buffer if frame size increased */
     if (size > s->display_fb_size) {
@@ -655,6 +657,7 @@ static void qemu_present_frame(void *ctx, const void *pixels,
     s->pending_height = height;
     s->pending_stride = stride;
     s->frame_pending = true;
+    s->frame_claimed = false;
     wait_job = s->frame_completion_wait_head;
     if (wait_job) {
         s->frame_completion_wait_head = wait_job->next;
@@ -662,16 +665,48 @@ static void qemu_present_frame(void *ctx, const void *pixels,
             s->frame_completion_wait_tail = NULL;
         }
         wait_job->next = NULL;
+        wait_job->frame_staged = true;
+        s->frame_claimed = true;
     }
     qemu_mutex_unlock(&s->frame_mutex);
     
-    /* Reference apple_gfx_render_frame_completed_bh applies the completed
-     * texture and pending-frame accounting in one BH. Keep this producer as
-     * staging-only; qemu_frame_completed schedules the single completion BH. */
+    /* Keep this producer staging-only. If completion arrived first, wake that
+     * same job now that its framebuffer payload is available. */
     if (wait_job) {
         aio_bh_schedule_oneshot(qemu_get_aio_context(),
                                 apple_gfx_ml_frame_completed_bh, wait_job);
     }
+}
+
+static bool apple_gfx_ml_defer_until_staged_frame(AppleGfxMLState *s,
+                                                  AppleGfxMLFrameCompletionJob *job)
+{
+    if (!s || !job || job->frame_staged) {
+        return false;
+    }
+
+    qemu_mutex_lock(&s->frame_mutex);
+    if (s->frame_pending && !s->frame_claimed) {
+        s->frame_claimed = true;
+        job->frame_staged = true;
+        qemu_mutex_unlock(&s->frame_mutex);
+        return false;
+    }
+    if (!s->frame_pending || s->frame_claimed) {
+        job->next = NULL;
+        job->frame_staged = false;
+        if (s->frame_completion_wait_tail) {
+            s->frame_completion_wait_tail->next = job;
+        } else {
+            s->frame_completion_wait_head = job;
+        }
+        s->frame_completion_wait_tail = job;
+        qemu_mutex_unlock(&s->frame_mutex);
+        return true;
+    }
+    qemu_mutex_unlock(&s->frame_mutex);
+
+    return false;
 }
 
 static void apple_gfx_ml_frame_completed_bh(void *opaque)
@@ -685,6 +720,10 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
         return;
     }
 
+    if (job->frame_expected && apple_gfx_ml_defer_until_staged_frame(s, job)) {
+        return;
+    }
+
     if (!job->pending_accounted) {
         int pending = __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST);
         if (pending > 0) {
@@ -694,19 +733,7 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
         job->pending_accounted = true;
     }
 
-    frame_applied = apple_gfx_ml_apply_staged_frame(s);
-    if (!frame_applied && job->frame_expected) {
-        qemu_mutex_lock(&s->frame_mutex);
-        job->next = NULL;
-        if (s->frame_completion_wait_tail) {
-            s->frame_completion_wait_tail->next = job;
-        } else {
-            s->frame_completion_wait_head = job;
-        }
-        s->frame_completion_wait_tail = job;
-        qemu_mutex_unlock(&s->frame_mutex);
-        return;
-    }
+    frame_applied = job->frame_expected ? apple_gfx_ml_apply_staged_frame(s) : false;
 
     if (agfx_log_should_emit(&s->frame_completed_log_count)) {
         agfx_log(s,
@@ -1671,6 +1698,7 @@ static void agfx_reset(Object *obj, ResetType type)
     qemu_mutex_unlock(&s->frame_signal_mutex);
     qemu_mutex_lock(&s->frame_mutex);
     s->frame_pending = false;
+    s->frame_claimed = false;
     agfx_free_waiting_frame_completion_jobs(s);
     qemu_mutex_unlock(&s->frame_mutex);
     s->cursor_show = true;
@@ -1720,6 +1748,7 @@ static void agfx_instance_init(Object *obj)
     
     /* Initialize frame state */
     s->frame_pending = false;
+    s->frame_claimed = false;
     s->new_frame_ready = false;
     s->gfx_update_requested = false;
     s->mmio_wait_active = 0;

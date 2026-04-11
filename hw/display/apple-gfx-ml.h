@@ -77,6 +77,7 @@ struct AppleGfxMLState {
     uint32_t pending_height;
     uint32_t pending_stride;
     bool frame_pending;         /* New frame waiting to be displayed */
+    bool frame_claimed;         /* Pending frame is owned by a completion job */
     struct AppleGfxMLFrameCompletionJob *frame_completion_wait_head;
     struct AppleGfxMLFrameCompletionJob *frame_completion_wait_tail;
 
