@@ -1142,7 +1142,14 @@ static void *agfx_render_worker_thread(void *opaque)
                      qatomic_read(&s->mmio_wait_active),
                      __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
         }
-        (void)qmu_vk_request_display_frame(vk);
+        if (qmu_vk_request_display_frame(vk) <= 0) {
+            if (agfx_log_should_emit(&s->render_worker_log_count)) {
+                agfx_log(s,
+                         "[apple-gfx-ml] render_worker: request_display_frame retired without callback pending_frames=%d\n",
+                         __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
+            }
+            qemu_frame_completed(s);
+        }
     }
 
     return NULL;
