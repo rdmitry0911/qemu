@@ -1030,23 +1030,6 @@ static void qemu_new_frame_signal(void *ctx)
                             agfx_new_frame_handler_bh, s);
 }
 
-static void qemu_display_frame_ready(void *ctx)
-{
-    AppleGfxMLState *s = ctx;
-
-    if (!s || !s->qmu_dev) {
-        return;
-    }
-
-    if (agfx_log_should_emit(&s->render_worker_log_count)) {
-        agfx_log(s,
-                 "[apple-gfx-ml] display_frame_ready: queue_render pending_frames=%d mmio_wait=%d\n",
-                 __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
-                 qatomic_read(&s->mmio_wait_active));
-    }
-    agfx_request_display_render(s);
-}
-
 /* Display refresh is handled by qmetal library's internal thread.
  * No timer needed in QEMU driver - we just receive present_frame callbacks.
  */
@@ -1528,7 +1511,6 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         /* Reference: newFrameEventHandler via signalCurrentFrame (apple-gfx.m:2694) */
         .new_frame_signal = qemu_new_frame_signal,
         .frame_completed = qemu_frame_completed,
-        .display_frame_ready = qemu_display_frame_ready,
     };
 
     qmu_extended_config qmu_config = {
