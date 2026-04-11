@@ -39,6 +39,7 @@
 
 /* Forward declarations from qmu_vulkan.h (C++ header, can't include directly) */
 struct qmu_vulkan_ctx;
+int qmu_vk_begin_display_frame(struct qmu_vulkan_ctx *ctx);
 int qmu_vk_request_display_frame(struct qmu_vulkan_ctx *ctx);
 void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
@@ -483,6 +484,38 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque);
 static void agfx_start_display_frame_timer(AppleGfxMLState *s);
 static void agfx_enqueue_session_job(AppleGfxMLState *s,
                                      AppleGfxMLSessionJob *job);
+static void qemu_frame_completed(void *ctx, int frame_expected);
+
+static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *vk)
+{
+    int rc;
+
+    if (!s || !vk) {
+        return;
+    }
+
+    rc = qmu_vk_begin_display_frame(vk);
+    if (rc > 0) {
+        if (agfx_log_should_emit(&s->render_worker_log_count)) {
+            agfx_log(s,
+                     "[apple-gfx-ml] kick_display_render: iosfc_async pending_frames=%d mmio_wait=%d\n",
+                     __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
+                     qatomic_read(&s->mmio_wait_active));
+        }
+        return;
+    }
+    if (rc == 0) {
+        agfx_request_display_render(s);
+        return;
+    }
+
+    if (agfx_log_should_emit(&s->render_worker_log_count)) {
+        agfx_log(s,
+                 "[apple-gfx-ml] kick_display_render: begin_display_frame failed pending_frames=%d\n",
+                 __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
+    }
+    qemu_frame_completed(s, 0);
+}
 
 typedef enum AgfxSessionJobKind {
     AGFX_SESSION_JOB_MMIO_READ,
@@ -684,7 +717,12 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
     }
 
     if (job->chain_needed && s->qmu_dev) {
-        agfx_request_display_render(s);
+        struct qmu_vulkan_ctx *vk = qmu_session_get_vulkan(s->qmu_dev);
+        if (!vk) {
+            agfx_log(s, "[apple-gfx-ml] frame_completed_bh: vk=NULL\n");
+        } else {
+            agfx_kick_display_render(s, vk);
+        }
     }
 
     g_free(job);
@@ -950,7 +988,7 @@ static void agfx_new_frame_handler_bh(void *opaque)
                  "[apple-gfx-ml] new_frame_handler_bh: queue_render pending_frames=%d\n",
                  pending);
     }
-    agfx_request_display_render(s);
+    agfx_kick_display_render(s, vk);
 }
 
 static void qemu_new_frame_signal(void *ctx)
@@ -990,6 +1028,23 @@ static void qemu_new_frame_signal(void *ctx)
     }
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             agfx_new_frame_handler_bh, s);
+}
+
+static void qemu_display_frame_ready(void *ctx)
+{
+    AppleGfxMLState *s = ctx;
+
+    if (!s || !s->qmu_dev) {
+        return;
+    }
+
+    if (agfx_log_should_emit(&s->render_worker_log_count)) {
+        agfx_log(s,
+                 "[apple-gfx-ml] display_frame_ready: queue_render pending_frames=%d mmio_wait=%d\n",
+                 __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
+                 qatomic_read(&s->mmio_wait_active));
+    }
+    agfx_request_display_render(s);
 }
 
 /* Display refresh is handled by qmetal library's internal thread.
@@ -1473,6 +1528,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         /* Reference: newFrameEventHandler via signalCurrentFrame (apple-gfx.m:2694) */
         .new_frame_signal = qemu_new_frame_signal,
         .frame_completed = qemu_frame_completed,
+        .display_frame_ready = qemu_display_frame_ready,
     };
 
     qmu_extended_config qmu_config = {
