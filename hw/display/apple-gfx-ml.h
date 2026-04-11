@@ -15,6 +15,7 @@
 
 #include "qom/object.h"
 #include "hw/pci/pci_device.h"
+#include "qemu/typedefs.h"     /* QEMUBH, QEMUTimer */
 #include "qemu/thread.h"      /* QemuThread, QemuSemaphore, QemuMutex */
 
 /* Forward declaration - defined in qmetal unified API */
@@ -118,7 +119,6 @@ struct AppleGfxMLState {
     QemuSemaphore render_sem;
     QemuMutex render_mutex;
     bool render_worker_stop;
-    int bootstrap_requests;
     int display_render_requests;
 
     QemuMutex frame_signal_mutex;
@@ -130,6 +130,7 @@ struct AppleGfxMLState {
      * Runs continuously at ~10Hz, independent of IOSFC_ENABLE. */
     QEMUTimer *display_frame_timer;
     bool display_frame_timer_active;
+    QEMUBH *bootstrap_present_bh;
 
     /* Async log sink: hot paths enqueue formatted lines, one worker serializes
      * qemu_log() writes off the producer threads. */
@@ -147,6 +148,7 @@ struct AppleGfxMLState {
     uint64_t new_frame_handler_log_count;
     uint64_t new_frame_signal_log_count;
     uint64_t render_worker_log_count;
+    uint64_t bootstrap_present_log_count;
 };
 
 /* Properties macro for device registration
