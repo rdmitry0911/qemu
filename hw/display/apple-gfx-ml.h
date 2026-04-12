@@ -22,6 +22,7 @@
 typedef struct qmu_session qmu_session;
 struct AppleGfxMLFrameCompletionJob;
 struct AppleGfxMLFramePayload;
+struct AppleGfxMLDisplayCallbackJob;
 
 #define TYPE_APPLE_GFX_ML "apple-gfx-ml"
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGfxMLState, APPLE_GFX_ML)
@@ -75,6 +76,8 @@ struct AppleGfxMLState {
     uint32_t fb_width;
     uint32_t fb_height;
     uint32_t fb_stride;
+    uint32_t fb_iosurface_pixel_format;
+    uint64_t fb_protection_requirements;
     bool new_frame_ready;       /* Frame copied to display_fb, awaiting gfx_update poll */
     bool gfx_update_requested;  /* gfx_update was called while frame was in-flight */
     int pending_frames;         /* Number of frames in flight (max 2, reference pattern) */
@@ -116,6 +119,16 @@ struct AppleGfxMLState {
     int display_render_requests;
 
     int iosfc_bootstrap_active;
+
+    /* Reference-like PGDisplay queue owner for modeChange/newFrame/cursor*
+     * callback classes. Producer threads enqueue jobs here; one serial worker
+     * delivers them in-order into the QEMU BH/main-loop plane. */
+    QemuThread display_callback_worker;
+    QemuSemaphore display_callback_sem;
+    QemuMutex display_callback_mutex;
+    bool display_callback_worker_stop;
+    struct AppleGfxMLDisplayCallbackJob *display_callback_head;
+    struct AppleGfxMLDisplayCallbackJob *display_callback_tail;
 
     /* Reference PGEFIPresentQueue: serial bootstrap present queue owning both
      * scheduleFramePresents' 100ms timer and the lightweight present source. */
