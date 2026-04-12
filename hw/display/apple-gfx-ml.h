@@ -15,7 +15,7 @@
 
 #include "qom/object.h"
 #include "hw/pci/pci_device.h"
-#include "qemu/typedefs.h"     /* QEMUBH, QEMUTimer */
+#include "qemu/typedefs.h"
 #include "qemu/thread.h"      /* QemuThread, QemuSemaphore, QemuMutex */
 
 /* Forward declaration - defined in qmetal unified API */
@@ -119,12 +119,14 @@ struct AppleGfxMLState {
     bool new_frame_source_armed;
     int iosfc_bootstrap_active;
 
-    /* Reference: scheduleFramePresents → timer → encodeCurrentFrameToCommandBuffer.
-     * This timer lives in the wrapper (display plane), not in PVG library.
-     * Runs continuously at ~10Hz, independent of IOSFC_ENABLE. */
-    QEMUTimer *display_frame_timer;
+    /* Reference PGEFIPresentQueue: serial bootstrap present queue owning both
+     * scheduleFramePresents' 100ms timer and the lightweight present source. */
+    QemuThread bootstrap_present_worker;
+    QemuMutex bootstrap_present_mutex;
+    QemuCond bootstrap_present_cond;
+    bool bootstrap_present_worker_stop;
     bool display_frame_timer_active;
-    QEMUBH *bootstrap_present_bh;
+    bool bootstrap_present_source_armed;
 
     /* Async log sink: hot paths enqueue formatted lines, one worker serializes
      * qemu_log() writes off the producer threads. */
