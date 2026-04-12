@@ -115,8 +115,6 @@ struct AppleGfxMLState {
     bool render_worker_stop;
     int display_render_requests;
 
-    QemuMutex frame_signal_mutex;
-    bool new_frame_source_armed;
     int iosfc_bootstrap_active;
 
     /* Reference PGEFIPresentQueue: serial bootstrap present queue owning both

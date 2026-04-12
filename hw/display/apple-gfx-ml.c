@@ -1150,10 +1150,6 @@ static void agfx_new_frame_handler_bh(void *opaque)
         return;
     }
 
-    qemu_mutex_lock(&s->frame_signal_mutex);
-    s->new_frame_source_armed = false;
-    qemu_mutex_unlock(&s->frame_signal_mutex);
-
     qemu_mutex_lock(&s->frame_mutex);
     queued_payloads = s->frame_payload_count;
     qemu_mutex_unlock(&s->frame_mutex);
@@ -1165,9 +1161,6 @@ static void agfx_new_frame_handler_bh(void *opaque)
                  queued_payloads,
                  qatomic_read(&s->mmio_wait_active));
     }
-
-    /* qmetal coalesces source state until the handler consumes it. */
-    qmu_vk_consume_current_frame_signal(vk);
 
     /* Reference throttle: pending_frames >= 2 → drop (apple-gfx.m:2672) */
     pending = __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST);
@@ -1202,26 +1195,23 @@ static void agfx_new_frame_handler_bh(void *opaque)
 static void qemu_new_frame_signal(void *ctx)
 {
     AppleGfxMLState *s = ctx;
+    struct qmu_vulkan_ctx *vk = NULL;
 
     if (!s) {
         return;
     }
 
-    /* Reference uses dispatch_source_merge_data on the display queue:
-     * one pending source event is enough until the handler drains it. */
-    qemu_mutex_lock(&s->frame_signal_mutex);
-    if (s->new_frame_source_armed) {
-        if (agfx_log_should_emit(&s->new_frame_signal_log_count)) {
-            agfx_log(s,
-                     "[apple-gfx-ml] new_frame_signal: merged pending_frames=%d mmio_wait=%d\n",
-                     __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
-                     qatomic_read(&s->mmio_wait_active));
-        }
-        qemu_mutex_unlock(&s->frame_signal_mutex);
-        return;
+    if (s->qmu_dev) {
+        vk = qmu_session_get_vulkan(s->qmu_dev);
     }
-    s->new_frame_source_armed = true;
-    qemu_mutex_unlock(&s->frame_signal_mutex);
+
+    /* Reference source delivery has already consumed the merged pending state
+     * before the external newFrameEventHandler runs. qmetal's direct analogue
+     * is the callback edge itself, so consume on callback delivery and let the
+     * wrapper behave like apple-gfx.m: no extra wrapper-owned merge layer. */
+    if (vk) {
+        qmu_vk_consume_current_frame_signal(vk);
+    }
 
     /* Reference: scheduleFramePresents starts once display surface is available. */
     if (!agfx_display_frame_timer_is_active(s)) {
@@ -1661,7 +1651,6 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     
     /* Initialize frame mutex for thread-safe display updates */
     qemu_mutex_init(&s->frame_mutex);
-    qemu_mutex_init(&s->frame_signal_mutex);
     qemu_mutex_init(&s->mmio_job_mutex);
     qemu_mutex_init(&s->session_mutex);
     qemu_mutex_init(&s->render_mutex);
@@ -1669,7 +1658,6 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     qemu_cond_init(&s->bootstrap_present_cond);
     qemu_sem_init(&s->render_sem, 0);
     s->mmio_wait_active = 0;
-    s->new_frame_source_armed = false;
     s->iosfc_bootstrap_active = 0;
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
@@ -1815,7 +1803,6 @@ static void agfx_exit(PCIDevice *pci_dev)
     qemu_mutex_destroy(&s->mmio_job_mutex);
     qemu_mutex_destroy(&s->session_mutex);
     qemu_mutex_destroy(&s->render_mutex);
-    qemu_mutex_destroy(&s->frame_signal_mutex);
 
     /* Destroy qmetal device (stops display thread) */
     if (s->qmu_dev) {
@@ -1854,9 +1841,6 @@ static void agfx_reset(Object *obj, ResetType type)
     qemu_mutex_lock(&s->render_mutex);
     s->display_render_requests = 0;
     qemu_mutex_unlock(&s->render_mutex);
-    qemu_mutex_lock(&s->frame_signal_mutex);
-    s->new_frame_source_armed = false;
-    qemu_mutex_unlock(&s->frame_signal_mutex);
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     s->display_frame_timer_active = false;
     s->bootstrap_present_source_armed = false;
@@ -1914,7 +1898,6 @@ static void agfx_instance_init(Object *obj)
     s->new_frame_ready = false;
     s->gfx_update_requested = false;
     s->mmio_wait_active = 0;
-    s->new_frame_source_armed = false;
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
     s->render_worker_stop = false;
