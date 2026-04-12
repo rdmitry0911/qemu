@@ -21,6 +21,7 @@
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
 struct AppleGfxMLFrameCompletionJob;
+struct AppleGfxMLFramePayload;
 
 #define TYPE_APPLE_GFX_ML "apple-gfx-ml"
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGfxMLState, APPLE_GFX_ML)
@@ -55,31 +56,20 @@ struct AppleGfxMLState {
     QEMUCursor *cursor;
     bool cursor_show;
 
-    /* Double-buffered framebuffer for thread-safe display updates.
-     * 
-     * Problem: qmetal calls present_frame from pthread, but QEMU display
-     * operations (dpy_gfx_replace_surface/dpy_gfx_update_full) must run
-     * in QEMU main loop.
-     * 
-     * Solution: Use staging buffer + BH (bottom half) scheduling.
-     * - staging_fb: receives pixels from qmetal pthread
-     * - display_fb: used by QEMU DisplaySurface
-     * - BH copies staging->display and updates QEMU display
-     */
-    uint8_t *staging_fb;        /* Receives pixels from pthread */
-    size_t staging_fb_size;
+    /* display_fb is published to the QEMU surface from main-loop BHs only.
+     * Completed frame payloads stay frame-owned until the matching completion
+     * BH copies them into display_fb, instead of going through one shared
+     * staging buffer that later callbacks can overwrite. */
     uint8_t *display_fb;        /* Used by QEMU DisplaySurface */
     size_t display_fb_size;
     
-    /* Frame parameters (protected by frame_mutex) */
+    /* Frame payload queues (protected by frame_mutex) */
     QemuMutex frame_mutex;
-    uint32_t pending_width;
-    uint32_t pending_height;
-    uint32_t pending_stride;
-    bool frame_pending;         /* New frame waiting to be displayed */
-    bool frame_claimed;         /* Pending frame is owned by a completion job */
     struct AppleGfxMLFrameCompletionJob *frame_completion_wait_head;
     struct AppleGfxMLFrameCompletionJob *frame_completion_wait_tail;
+    struct AppleGfxMLFramePayload *frame_payload_head;
+    struct AppleGfxMLFramePayload *frame_payload_tail;
+    uint32_t frame_payload_count;
 
     /* Current display parameters */
     uint32_t fb_width;

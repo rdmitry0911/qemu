@@ -45,6 +45,7 @@ void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
 typedef struct AgfxLogEntry AgfxLogEntry;
 typedef struct AppleGfxMLFrameCompletionJob AppleGfxMLFrameCompletionJob;
+typedef struct AppleGfxMLFramePayload AppleGfxMLFramePayload;
 
 /* Log throttling: show first N events, then every Mth */
 #define AGFX_LOG_INITIAL_COUNT  10
@@ -63,7 +64,145 @@ struct AppleGfxMLFrameCompletionJob {
     bool frame_staged;
     bool pending_accounted;
     bool chain_needed;
+    uint8_t *frame_pixels;
+    size_t frame_size;
+    uint32_t frame_width;
+    uint32_t frame_height;
+    uint32_t frame_stride;
 };
+
+struct AppleGfxMLFramePayload {
+    AppleGfxMLFramePayload *next;
+    uint8_t *pixels;
+    size_t size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+};
+
+static void agfx_free_frame_payload(AppleGfxMLFramePayload *payload)
+{
+    if (!payload) {
+        return;
+    }
+
+    g_free(payload->pixels);
+    g_free(payload);
+}
+
+static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
+{
+    if (!job) {
+        return;
+    }
+
+    g_free(job->frame_pixels);
+    g_free(job);
+}
+
+static AppleGfxMLFramePayload *agfx_create_frame_payload(const void *pixels,
+                                                         size_t size,
+                                                         uint32_t width,
+                                                         uint32_t height,
+                                                         uint32_t stride)
+{
+    AppleGfxMLFramePayload *payload;
+
+    if (!pixels || size == 0) {
+        return NULL;
+    }
+
+    payload = g_new0(AppleGfxMLFramePayload, 1);
+    payload->pixels = g_memdup2(pixels, size);
+    if (!payload->pixels) {
+        g_free(payload);
+        return NULL;
+    }
+
+    payload->size = size;
+    payload->width = width;
+    payload->height = height;
+    payload->stride = stride;
+    return payload;
+}
+
+static void agfx_take_frame_payload(AppleGfxMLFrameCompletionJob *job,
+                                    AppleGfxMLFramePayload *payload)
+{
+    if (!job || !payload) {
+        return;
+    }
+
+    g_free(job->frame_pixels);
+    job->frame_pixels = payload->pixels;
+    job->frame_size = payload->size;
+    job->frame_width = payload->width;
+    job->frame_height = payload->height;
+    job->frame_stride = payload->stride;
+    job->frame_staged = true;
+    g_free(payload);
+}
+
+static void agfx_enqueue_frame_payload_locked(AppleGfxMLState *s,
+                                              AppleGfxMLFramePayload *payload)
+{
+    if (!s || !payload) {
+        return;
+    }
+
+    payload->next = NULL;
+    if (s->frame_payload_tail) {
+        s->frame_payload_tail->next = payload;
+    } else {
+        s->frame_payload_head = payload;
+    }
+    s->frame_payload_tail = payload;
+    s->frame_payload_count++;
+}
+
+static AppleGfxMLFramePayload *agfx_dequeue_frame_payload_locked(AppleGfxMLState *s)
+{
+    AppleGfxMLFramePayload *payload;
+
+    if (!s) {
+        return NULL;
+    }
+
+    payload = s->frame_payload_head;
+    if (!payload) {
+        return NULL;
+    }
+
+    s->frame_payload_head = payload->next;
+    if (!s->frame_payload_head) {
+        s->frame_payload_tail = NULL;
+    }
+    payload->next = NULL;
+    if (s->frame_payload_count > 0) {
+        s->frame_payload_count--;
+    }
+    return payload;
+}
+
+static void agfx_free_queued_frame_payloads(AppleGfxMLState *s)
+{
+    AppleGfxMLFramePayload *payload;
+
+    if (!s) {
+        return;
+    }
+
+    payload = s->frame_payload_head;
+    s->frame_payload_head = NULL;
+    s->frame_payload_tail = NULL;
+    s->frame_payload_count = 0;
+
+    while (payload) {
+        AppleGfxMLFramePayload *next = payload->next;
+        agfx_free_frame_payload(payload);
+        payload = next;
+    }
+}
 
 static void agfx_log_write_direct(const char *text)
 {
@@ -98,7 +237,7 @@ static void agfx_free_waiting_frame_completion_jobs(AppleGfxMLState *s)
 
     while (job) {
         AppleGfxMLFrameCompletionJob *next = job->next;
-        g_free(job);
+        agfx_free_frame_completion_job(job);
         job = next;
     }
 }
@@ -555,28 +694,22 @@ static void agfx_display_completion_bh(void *opaque)
     g_free(job);
 }
 
-static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s)
+static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
+                                            AppleGfxMLFrameCompletionJob *job)
 {
     uint32_t width, height, stride;
+    const uint8_t *pixels;
     size_t size;
 
-    if (!s) {
+    if (!s || !job || !job->frame_pixels || job->frame_size == 0) {
         return false;
     }
 
-    /* Get pending frame parameters under lock */
-    qemu_mutex_lock(&s->frame_mutex);
-    if (!s->frame_pending) {
-        qemu_mutex_unlock(&s->frame_mutex);
-        return false;
-    }
-
-    width = s->pending_width;
-    height = s->pending_height;
-    stride = s->pending_stride;
-    size = (size_t)height * stride;
-    s->frame_pending = false;
-    s->frame_claimed = false;
+    width = job->frame_width;
+    height = job->frame_height;
+    stride = job->frame_stride;
+    size = job->frame_size;
+    pixels = job->frame_pixels;
 
     /* Reallocate display buffer if frame size increased */
     if (size > s->display_fb_size) {
@@ -585,11 +718,10 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s)
         agfx_log(s, "[apple-gfx-ml] display_fb reallocated: %zu bytes\n", size);
     }
 
-    /* Copy from staging to display buffer */
-    if (s->staging_fb && s->display_fb) {
-        memcpy(s->display_fb, s->staging_fb, size);
+    /* Copy from the frame-owned payload to the display buffer. */
+    if (pixels && s->display_fb) {
+        memcpy(s->display_fb, pixels, size);
     }
-    qemu_mutex_unlock(&s->frame_mutex);
 
     /* Update frame counter and log */
     s->frame_count++;
@@ -632,6 +764,7 @@ static void qemu_present_frame(void *ctx, const void *pixels,
 {
     AppleGfxMLState *s = ctx;
     size_t size = (size_t)height * stride;
+    AppleGfxMLFramePayload *payload;
     AppleGfxMLFrameCompletionJob *wait_job = NULL;
 
     /* Log from pthread (before scheduling BH) */
@@ -641,23 +774,15 @@ static void qemu_present_frame(void *ctx, const void *pixels,
                  (unsigned long)pc, width, height, stride);
     }
     
-    /* Reallocate staging buffer if needed */
-    qemu_mutex_lock(&s->frame_mutex);
-    if (!s->staging_fb || s->staging_fb_size < size) {
-        g_free(s->staging_fb);
-        s->staging_fb = g_malloc(size);
-        s->staging_fb_size = size;
+    payload = agfx_create_frame_payload(pixels, size, width, height, stride);
+    if (!payload) {
+        agfx_log(s,
+                 "[apple-gfx-ml] present_frame: payload allocation failed %ux%u stride=%u\n",
+                 width, height, stride);
+        return;
     }
-    
-    /* Copy pixels to staging buffer */
-    memcpy(s->staging_fb, pixels, size);
-    
-    /* Store frame parameters */
-    s->pending_width = width;
-    s->pending_height = height;
-    s->pending_stride = stride;
-    s->frame_pending = true;
-    s->frame_claimed = false;
+
+    qemu_mutex_lock(&s->frame_mutex);
     wait_job = s->frame_completion_wait_head;
     if (wait_job) {
         s->frame_completion_wait_head = wait_job->next;
@@ -665,13 +790,20 @@ static void qemu_present_frame(void *ctx, const void *pixels,
             s->frame_completion_wait_tail = NULL;
         }
         wait_job->next = NULL;
-        wait_job->frame_staged = true;
-        s->frame_claimed = true;
+        agfx_take_frame_payload(wait_job, payload);
+        payload = NULL;
+    } else {
+        agfx_enqueue_frame_payload_locked(s, payload);
+        payload = NULL;
     }
     qemu_mutex_unlock(&s->frame_mutex);
+
+    if (payload) {
+        agfx_free_frame_payload(payload);
+    }
     
-    /* Keep this producer staging-only. If completion arrived first, wake that
-     * same job now that its framebuffer payload is available. */
+    /* If completion arrived first, wake that same job once its frame-owned
+     * payload has been attached. */
     if (wait_job) {
         aio_bh_schedule_oneshot(qemu_get_aio_context(),
                                 apple_gfx_ml_frame_completed_bh, wait_job);
@@ -681,32 +813,31 @@ static void qemu_present_frame(void *ctx, const void *pixels,
 static bool apple_gfx_ml_defer_until_staged_frame(AppleGfxMLState *s,
                                                   AppleGfxMLFrameCompletionJob *job)
 {
+    AppleGfxMLFramePayload *payload;
+
     if (!s || !job || job->frame_staged) {
         return false;
     }
 
     qemu_mutex_lock(&s->frame_mutex);
-    if (s->frame_pending && !s->frame_claimed) {
-        s->frame_claimed = true;
-        job->frame_staged = true;
+    payload = agfx_dequeue_frame_payload_locked(s);
+    if (payload) {
+        agfx_take_frame_payload(job, payload);
         qemu_mutex_unlock(&s->frame_mutex);
         return false;
     }
-    if (!s->frame_pending || s->frame_claimed) {
-        job->next = NULL;
-        job->frame_staged = false;
-        if (s->frame_completion_wait_tail) {
-            s->frame_completion_wait_tail->next = job;
-        } else {
-            s->frame_completion_wait_head = job;
-        }
-        s->frame_completion_wait_tail = job;
-        qemu_mutex_unlock(&s->frame_mutex);
-        return true;
+
+    job->next = NULL;
+    job->frame_staged = false;
+    if (s->frame_completion_wait_tail) {
+        s->frame_completion_wait_tail->next = job;
+    } else {
+        s->frame_completion_wait_head = job;
     }
+    s->frame_completion_wait_tail = job;
     qemu_mutex_unlock(&s->frame_mutex);
 
-    return false;
+    return true;
 }
 
 static void apple_gfx_ml_frame_completed_bh(void *opaque)
@@ -716,7 +847,7 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
     bool frame_applied;
 
     if (!job || !s) {
-        g_free(job);
+        agfx_free_frame_completion_job(job);
         return;
     }
 
@@ -733,7 +864,7 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
         job->pending_accounted = true;
     }
 
-    frame_applied = job->frame_expected ? apple_gfx_ml_apply_staged_frame(s) : false;
+    frame_applied = job->frame_expected ? apple_gfx_ml_apply_staged_frame(s, job) : false;
 
     if (agfx_log_should_emit(&s->frame_completed_log_count)) {
         agfx_log(s,
@@ -752,7 +883,7 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
         }
     }
 
-    g_free(job);
+    agfx_free_frame_completion_job(job);
 }
 
 static void qemu_frame_completed(void *ctx, int frame_expected)
@@ -962,6 +1093,7 @@ static void agfx_new_frame_handler_bh(void *opaque)
     AppleGfxMLState *s = opaque;
     struct qmu_vulkan_ctx *vk;
     int pending;
+    uint32_t queued_payloads = 0;
 
     if (!s || !s->qmu_dev) {
         return;
@@ -977,11 +1109,15 @@ static void agfx_new_frame_handler_bh(void *opaque)
     s->new_frame_source_armed = false;
     qemu_mutex_unlock(&s->frame_signal_mutex);
 
+    qemu_mutex_lock(&s->frame_mutex);
+    queued_payloads = s->frame_payload_count;
+    qemu_mutex_unlock(&s->frame_mutex);
+
     if (agfx_log_should_emit(&s->new_frame_handler_log_count)) {
         agfx_log(s,
-                 "[apple-gfx-ml] new_frame_handler_bh: pending_frames=%d frame_pending=%d mmio_wait=%d\n",
+                 "[apple-gfx-ml] new_frame_handler_bh: pending_frames=%d queued_payloads=%u mmio_wait=%d\n",
                  __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
-                 s->frame_pending ? 1 : 0,
+                 queued_payloads,
                  qatomic_read(&s->mmio_wait_active));
     }
 
@@ -1433,7 +1569,7 @@ static void agfx_gfx_update(void *opaque)
     } else if (pending_frames > 0) {
         /* Reference apple_gfx_fb_update_display defers while render work is
          * still in flight (pending_frames > 0), not only while a completed
-         * CPU-side staging copy is waiting in frame_pending. */
+         * frame payload is already queued on the wrapper side. */
         s->gfx_update_requested = true;
     } else {
         /* Path 3: Idle — signal done to keep polling alive */
@@ -1506,10 +1642,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->render_worker_stop = false;
     s->display_render_requests = 0;
     
-    /* Allocate double-buffered framebuffers */
+    /* Allocate display buffer published to the QEMU surface. */
     initial_fb_size = (size_t)s->display_height * s->display_width * 4;
-    s->staging_fb = g_malloc0(initial_fb_size);
-    s->staging_fb_size = initial_fb_size;
     s->display_fb = g_malloc0(initial_fb_size);
     s->display_fb_size = initial_fb_size;
     
@@ -1666,10 +1800,9 @@ static void agfx_exit(PCIDevice *pci_dev)
     /* Cleanup framebuffers and mutex */
     qemu_mutex_lock(&s->frame_mutex);
     agfx_free_waiting_frame_completion_jobs(s);
+    agfx_free_queued_frame_payloads(s);
     qemu_mutex_unlock(&s->frame_mutex);
     qemu_mutex_destroy(&s->frame_mutex);
-    g_free(s->staging_fb);
-    s->staging_fb = NULL;
     g_free(s->display_fb);
     s->display_fb = NULL;
     if (s->cursor) {
@@ -1697,9 +1830,8 @@ static void agfx_reset(Object *obj, ResetType type)
     s->new_frame_source_armed = false;
     qemu_mutex_unlock(&s->frame_signal_mutex);
     qemu_mutex_lock(&s->frame_mutex);
-    s->frame_pending = false;
-    s->frame_claimed = false;
     agfx_free_waiting_frame_completion_jobs(s);
+    agfx_free_queued_frame_payloads(s);
     qemu_mutex_unlock(&s->frame_mutex);
     s->cursor_show = true;
     
@@ -1747,8 +1879,6 @@ static void agfx_instance_init(Object *obj)
     s->vsync_enabled = true;
     
     /* Initialize frame state */
-    s->frame_pending = false;
-    s->frame_claimed = false;
     s->new_frame_ready = false;
     s->gfx_update_requested = false;
     s->mmio_wait_active = 0;
@@ -1761,7 +1891,9 @@ static void agfx_instance_init(Object *obj)
     s->pending_frames = 0;
     s->frame_completion_wait_head = NULL;
     s->frame_completion_wait_tail = NULL;
-    s->staging_fb = NULL;
+    s->frame_payload_head = NULL;
+    s->frame_payload_tail = NULL;
+    s->frame_payload_count = 0;
     s->display_fb = NULL;
     s->cursor = NULL;
     s->cursor_show = true;
