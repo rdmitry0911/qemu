@@ -125,6 +125,7 @@ struct AppleGfxMLState {
     bool bootstrap_present_worker_stop;
     bool display_frame_timer_active;
     bool bootstrap_present_source_armed;
+    int64_t bootstrap_present_next_fire_us;
 
     /* Async log sink: hot paths enqueue formatted lines, one worker serializes
      * qemu_log() writes off the producer threads. */

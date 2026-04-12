@@ -620,6 +620,7 @@ static void qemu_raise_irq(void *ctx, uint32_t vector)
 
 static void agfx_request_display_render(AppleGfxMLState *s);
 static void agfx_request_bootstrap_tick(AppleGfxMLState *s);
+static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s);
 static void apple_gfx_ml_frame_completed_bh(void *opaque);
 static void agfx_start_display_frame_timer(AppleGfxMLState *s);
 static void agfx_enqueue_session_job(AppleGfxMLState *s,
@@ -1063,11 +1064,16 @@ static void agfx_request_bootstrap_tick(AppleGfxMLState *s)
      * present source on PGEFIPresentQueue. It must not wait behind the heavy
      * encode/readback render worker. */
     qemu_mutex_lock(&s->bootstrap_present_mutex);
+    agfx_merge_bootstrap_present_source_locked(s);
+    qemu_mutex_unlock(&s->bootstrap_present_mutex);
+}
+
+static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s)
+{
     if (!s->bootstrap_present_source_armed) {
         s->bootstrap_present_source_armed = true;
         qemu_cond_signal(&s->bootstrap_present_cond);
     }
-    qemu_mutex_unlock(&s->bootstrap_present_mutex);
 }
 
 static void agfx_bootstrap_present_on_queue(AppleGfxMLState *s)
@@ -1089,9 +1095,14 @@ static void agfx_bootstrap_present_on_queue(AppleGfxMLState *s)
 static void *agfx_bootstrap_present_thread(void *opaque)
 {
     AppleGfxMLState *s = opaque;
+    const int64_t interval_us =
+        (int64_t)AGFX_DISPLAY_FRAME_INTERVAL_MS * 1000;
 
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     while (!s->bootstrap_present_worker_stop) {
+        int64_t now_us;
+        int64_t wait_ms;
+
         if (s->bootstrap_present_source_armed) {
             s->bootstrap_present_source_armed = false;
             qemu_mutex_unlock(&s->bootstrap_present_mutex);
@@ -1106,13 +1117,34 @@ static void *agfx_bootstrap_present_thread(void *opaque)
             continue;
         }
 
-        if (!qemu_cond_timedwait(&s->bootstrap_present_cond,
-                                 &s->bootstrap_present_mutex,
-                                 AGFX_DISPLAY_FRAME_INTERVAL_MS) &&
-            s->display_frame_timer_active &&
-            qatomic_read(&s->iosfc_bootstrap_active)) {
-            s->bootstrap_present_source_armed = true;
+        now_us = g_get_monotonic_time();
+        if (s->bootstrap_present_next_fire_us != 0 &&
+            now_us >= s->bootstrap_present_next_fire_us) {
+            do {
+                s->bootstrap_present_next_fire_us += interval_us;
+            } while (s->bootstrap_present_next_fire_us <= now_us);
+
+            if (qatomic_read(&s->iosfc_bootstrap_active)) {
+                /* Reference timer source only merges the lightweight present
+                 * source on PGEFIPresentQueue; the present source handler
+                 * performs qmu_iosfc_present_tick() later on the same queue. */
+                agfx_merge_bootstrap_present_source_locked(s);
+            }
+            continue;
         }
+
+        wait_ms = AGFX_DISPLAY_FRAME_INTERVAL_MS;
+        if (s->bootstrap_present_next_fire_us != 0) {
+            int64_t delta_us = s->bootstrap_present_next_fire_us - now_us;
+            if (delta_us <= 0) {
+                wait_ms = 0;
+            } else {
+                wait_ms = (delta_us + 999) / 1000;
+            }
+        }
+        qemu_cond_timedwait(&s->bootstrap_present_cond,
+                            &s->bootstrap_present_mutex,
+                            wait_ms);
     }
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
 
@@ -1550,14 +1582,14 @@ static void agfx_start_display_frame_timer(AppleGfxMLState *s)
 
     /* Reference scheduleFramePresents uses dispatch_source_set_timer with
      * start = dispatch_walltime(NULL, 0), so the first fire is immediate
-     * instead of being delayed by one full interval. */
+     * instead of being delayed by one full interval. The timer event then
+     * merges the lightweight present source; it does not run present work
+     * directly. */
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     if (!s->display_frame_timer_active) {
         s->display_frame_timer_active = true;
+        s->bootstrap_present_next_fire_us = g_get_monotonic_time();
         started = true;
-    }
-    if (!s->bootstrap_present_source_armed) {
-        s->bootstrap_present_source_armed = true;
         qemu_cond_signal(&s->bootstrap_present_cond);
     }
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
@@ -1666,6 +1698,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->bootstrap_present_worker_stop = false;
     s->display_frame_timer_active = false;
     s->bootstrap_present_source_armed = false;
+    s->bootstrap_present_next_fire_us = 0;
     
     /* Allocate display buffer published to the QEMU surface. */
     initial_fb_size = (size_t)s->display_height * s->display_width * 4;
@@ -1776,6 +1809,7 @@ static void agfx_exit(PCIDevice *pci_dev)
     s->bootstrap_present_worker_stop = true;
     s->display_frame_timer_active = false;
     s->bootstrap_present_source_armed = false;
+    s->bootstrap_present_next_fire_us = 0;
     qemu_cond_signal(&s->bootstrap_present_cond);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
     qemu_thread_join(&s->bootstrap_present_worker);
@@ -1844,6 +1878,7 @@ static void agfx_reset(Object *obj, ResetType type)
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     s->display_frame_timer_active = false;
     s->bootstrap_present_source_armed = false;
+    s->bootstrap_present_next_fire_us = 0;
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
     qemu_mutex_lock(&s->frame_mutex);
     agfx_free_waiting_frame_completion_jobs(s);
@@ -1905,6 +1940,7 @@ static void agfx_instance_init(Object *obj)
     s->bootstrap_present_worker_stop = false;
     s->display_frame_timer_active = false;
     s->bootstrap_present_source_armed = false;
+    s->bootstrap_present_next_fire_us = 0;
     s->pending_frames = 0;
     s->frame_completion_wait_head = NULL;
     s->frame_completion_wait_tail = NULL;
