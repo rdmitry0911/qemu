@@ -900,18 +900,8 @@ static void agfx_enqueue_display_callback_job(AppleGfxMLState *s,
 
 static void agfx_deliver_new_frame_signal(AppleGfxMLState *s)
 {
-    struct qmu_vulkan_ctx *vk = NULL;
-
     if (!s) {
         return;
-    }
-
-    if (s->qmu_dev) {
-        vk = qmu_session_get_vulkan(s->qmu_dev);
-    }
-
-    if (vk) {
-        qmu_vk_consume_current_frame_signal(vk);
     }
 
     if (agfx_log_should_emit(&s->new_frame_signal_log_count)) {
@@ -1419,6 +1409,13 @@ static void agfx_new_frame_handler_bh(void *opaque)
         agfx_log(s, "[apple-gfx-ml] new_frame_handler_bh: vk=NULL\n");
         return;
     }
+
+    /* Keep qmetal's merged new-frame source pending until the reference-owned
+     * newFrameEventHandler analogue actually runs. Clearing it earlier on the
+     * callback-drain edge lets Transaction3/presentFrame re-arm a second
+     * signal while this BH is only scheduled, which is not dispatch-source
+     * shaped and creates run-dependent extra drops/chain-only paths. */
+    qmu_vk_consume_current_frame_signal(vk);
 
     if (agfx_log_should_emit(&s->new_frame_handler_log_count)) {
         agfx_log(s,
