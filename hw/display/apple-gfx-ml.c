@@ -1706,13 +1706,19 @@ static void *agfx_mmio_worker_thread(void *opaque)
             aio_wait_kick();
             break;
         case AGFX_SESSION_JOB_MMIO_WRITE:
-            /* session_mutex serializes MMIO writes with other wrapper-side
-             * session mutations, including the wrapper-owned async display
-             * render worker. */
-            qemu_mutex_lock(&s->session_mutex);
+            /* Do not hold session_mutex across qmu_mmio_write():
+             * FIFO/KICK handling can synchronously call qemu_write_memory(),
+             * which waits for a main-loop BH to run under BQL. The display BH
+             * may concurrently call agfx_kick_display_render() under that same
+             * BQL edge and take session_mutex first. Holding session_mutex here
+             * creates a hard inversion:
+             *   mmio worker:  session_mutex -> wait main loop/BQL
+             *   display BH:   BQL -> wait session_mutex
+             * qmu_mmio_write() already owns its internal mmio dispatch/serialize
+             * domain, so wrapper-side session serialization must stay limited to
+             * the capture/submit owner-render path itself. */
             qmu_mmio_write(job->state->qmu_dev,
                            (uint32_t)job->offset, job->value, job->size);
-            qemu_mutex_unlock(&s->session_mutex);
             qatomic_set(&job->completed, true);
             aio_wait_kick();
             break;

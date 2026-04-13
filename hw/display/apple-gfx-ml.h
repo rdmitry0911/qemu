@@ -111,7 +111,7 @@ struct AppleGfxMLState {
     struct AppleGfxMLSessionJob *session_job_head;
     struct AppleGfxMLSessionJob *session_job_tail;
     QemuMutex mmio_job_mutex;  /* Protects MMIO session job queue */
-    QemuMutex session_mutex;   /* Serializes qmetal session mutation across workers */
+    QemuMutex session_mutex;   /* Serializes wrapper-owned owner-render capture/submit */
     int mmio_wait_active;      /* Main thread is inside AIO_WAIT_WHILE for MMIO */
 
     int iosfc_bootstrap_active;
