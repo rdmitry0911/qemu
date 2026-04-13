@@ -86,6 +86,7 @@ typedef enum AgfxDisplayCallbackKind {
     AGFX_DISPLAY_CALLBACK_MODE_CHANGE,
     AGFX_DISPLAY_CALLBACK_NEW_FRAME,
     AGFX_DISPLAY_CALLBACK_CURSOR_GLYPH,
+    AGFX_DISPLAY_CALLBACK_CURSOR_MOVE,
     AGFX_DISPLAY_CALLBACK_CURSOR_SHOW,
 } AgfxDisplayCallbackKind;
 
@@ -110,6 +111,11 @@ struct AppleGfxMLDisplayCallbackJob {
             uint32_t hot_y;
             uint32_t sum;
         } cursor_glyph;
+        struct {
+            uint32_t display_id;
+            uint32_t x;
+            uint32_t y;
+        } cursor_move;
         struct {
             uint32_t display_id;
             bool visible;
@@ -693,6 +699,7 @@ static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s);
 static void apple_gfx_ml_frame_completed_bh(void *opaque);
 static void apple_gfx_ml_mode_change_bh(void *opaque);
 static void apple_gfx_ml_cursor_glyph_bh(void *opaque);
+static void apple_gfx_ml_cursor_move_bh(void *opaque);
 static void apple_gfx_ml_cursor_show_bh(void *opaque);
 static void agfx_new_frame_handler_bh(void *opaque);
 static void agfx_start_display_frame_timer(AppleGfxMLState *s);
@@ -1042,6 +1049,13 @@ typedef struct AppleGfxMLCursorShowJob {
     bool visible;
 } AppleGfxMLCursorShowJob;
 
+typedef struct AppleGfxMLCursorMoveJob {
+    AppleGfxMLState *state;
+    uint32_t display_id;
+    uint32_t x;
+    uint32_t y;
+} AppleGfxMLCursorMoveJob;
+
 static void agfx_enqueue_display_callback_job(AppleGfxMLState *s,
                                               AppleGfxMLDisplayCallbackJob *job)
 {
@@ -1151,6 +1165,17 @@ static void *agfx_display_callback_thread(void *opaque)
                                     apple_gfx_ml_cursor_glyph_bh, bh_job);
             break;
         }
+        case AGFX_DISPLAY_CALLBACK_CURSOR_MOVE: {
+            AppleGfxMLCursorMoveJob *bh_job = g_new0(AppleGfxMLCursorMoveJob, 1);
+
+            bh_job->state = s;
+            bh_job->display_id = job->u.cursor_move.display_id;
+            bh_job->x = job->u.cursor_move.x;
+            bh_job->y = job->u.cursor_move.y;
+            aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                    apple_gfx_ml_cursor_move_bh, bh_job);
+            break;
+        }
         case AGFX_DISPLAY_CALLBACK_CURSOR_SHOW: {
             AppleGfxMLCursorShowJob *bh_job = g_new0(AppleGfxMLCursorShowJob, 1);
 
@@ -1174,7 +1199,7 @@ static void apple_gfx_ml_update_cursor(AppleGfxMLState *s)
     if (!s->con) {
         return;
     }
-    dpy_mouse_set(s->con, 0, 0, s->cursor_show);
+    dpy_mouse_set(s->con, s->cursor_x, s->cursor_y, s->cursor_show);
 }
 
 static void apple_gfx_ml_cursor_glyph_bh(void *opaque)
@@ -1240,6 +1265,19 @@ static void apple_gfx_ml_cursor_show_bh(void *opaque)
     g_free(job);
 }
 
+static void apple_gfx_ml_cursor_move_bh(void *opaque)
+{
+    AppleGfxMLCursorMoveJob *job = opaque;
+    AppleGfxMLState *s = job->state;
+
+    s->cursor_x = job->x;
+    s->cursor_y = job->y;
+    agfx_log(s, "[apple-gfx-ml] cursor_move: display=%u pos=%u,%u\n",
+             job->display_id, job->x, job->y);
+    apple_gfx_ml_update_cursor(s);
+    g_free(job);
+}
+
 static void qemu_cursor_glyph(void *ctx,
                               const void *pixels,
                               uint64_t mapped_length,
@@ -1289,6 +1327,27 @@ static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
     job->kind = AGFX_DISPLAY_CALLBACK_CURSOR_SHOW;
     job->u.cursor_show.display_id = display_id;
     job->u.cursor_show.visible = visible != 0;
+    agfx_enqueue_display_callback_job(s, job);
+}
+
+static void qemu_cursor_move(void *ctx,
+                             uint32_t display_id,
+                             uint32_t x,
+                             uint32_t y)
+{
+    AppleGfxMLState *s = ctx;
+    AppleGfxMLDisplayCallbackJob *job;
+
+    if (!s) {
+        return;
+    }
+
+    job = g_new0(AppleGfxMLDisplayCallbackJob, 1);
+    job->state = s;
+    job->kind = AGFX_DISPLAY_CALLBACK_CURSOR_MOVE;
+    job->u.cursor_move.display_id = display_id;
+    job->u.cursor_move.x = x;
+    job->u.cursor_move.y = y;
     agfx_enqueue_display_callback_job(s, job);
 }
 
@@ -1972,6 +2031,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .raise_irq = qemu_raise_irq,
         .present_frame = qemu_present_frame,
         .cursor_glyph = qemu_cursor_glyph,
+        .cursor_move = qemu_cursor_move,
         .cursor_show = qemu_cursor_show,
         .mode_change = qemu_mode_change,
         .read_vram = qemu_read_vram,
@@ -2154,6 +2214,8 @@ static void agfx_reset(Object *obj, ResetType type)
     qemu_mutex_unlock(&s->frame_mutex);
     agfx_free_queued_display_callback_jobs(s);
     s->cursor_show = true;
+    s->cursor_x = 0;
+    s->cursor_y = 0;
     
     /* qmetal handles its own reset via MMIO writes from guest */
 }
@@ -2221,6 +2283,8 @@ static void agfx_instance_init(Object *obj)
     s->display_fb = NULL;
     s->cursor = NULL;
     s->cursor_show = true;
+    s->cursor_x = 0;
+    s->cursor_y = 0;
     s->log_writer_started = false;
     s->log_writer_stop = false;
     s->log_head = NULL;

@@ -56,6 +56,8 @@ struct AppleGfxMLState {
     QemuConsole *con;
     QEMUCursor *cursor;
     bool cursor_show;
+    uint32_t cursor_x;
+    uint32_t cursor_y;
 
     /* display_fb is published to the QEMU surface from main-loop BHs only.
      * Completed frame payloads stay frame-owned until the matching completion
