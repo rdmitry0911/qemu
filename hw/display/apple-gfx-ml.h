@@ -24,6 +24,15 @@ struct AppleGfxMLFrameCompletionJob;
 struct AppleGfxMLFramePayload;
 struct AppleGfxMLDisplayCallbackJob;
 
+typedef struct AgfxBootstrapPresentSource {
+    bool pending;
+} AgfxBootstrapPresentSource;
+
+typedef struct AgfxBootstrapPresentTimer {
+    bool active;
+    int64_t next_fire_us;
+} AgfxBootstrapPresentTimer;
+
 #define TYPE_APPLE_GFX_ML "apple-gfx-ml"
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGfxMLState, APPLE_GFX_ML)
 
@@ -133,14 +142,14 @@ struct AppleGfxMLState {
     struct AppleGfxMLDisplayCallbackJob *display_callback_tail;
 
     /* Reference PGEFIPresentQueue: serial bootstrap present queue owning both
-     * scheduleFramePresents' 100ms timer and the lightweight present source. */
+     * scheduleFramePresents' 100ms timer source and the mergeable present
+     * source. */
     QemuThread bootstrap_present_worker;
     QemuMutex bootstrap_present_mutex;
     QemuCond bootstrap_present_cond;
     bool bootstrap_present_worker_stop;
-    bool display_frame_timer_active;
-    bool bootstrap_present_source_armed;
-    int64_t bootstrap_present_next_fire_us;
+    AgfxBootstrapPresentTimer bootstrap_present_timer;
+    AgfxBootstrapPresentSource bootstrap_present_source;
 
     /* Async log sink: hot paths enqueue formatted lines, one worker serializes
      * qemu_log() writes off the producer threads. */
