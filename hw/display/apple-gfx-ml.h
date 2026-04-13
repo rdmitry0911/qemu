@@ -125,6 +125,15 @@ struct AppleGfxMLState {
     struct AppleGfxMLDisplayCallbackJob *display_callback_head;
     struct AppleGfxMLDisplayCallbackJob *display_callback_tail;
 
+    /* Reference apple_gfx_render_new_frame dispatches actual owner render work
+     * off the BH/BQL edge onto a background queue after capturing the exact
+     * current frame. Mirror that with one wrapper-owned serial render worker. */
+    QemuThread render_worker;
+    QemuSemaphore render_sem;
+    QemuMutex render_mutex;
+    bool render_worker_stop;
+    bool render_request_queued;
+
     /* Reference PGEFIPresentQueue: serial bootstrap present queue owning both
      * scheduleFramePresents' 100ms timer source and the mergeable present
      * source. */
