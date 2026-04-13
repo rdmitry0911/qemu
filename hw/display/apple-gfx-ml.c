@@ -819,6 +819,8 @@ typedef struct AppleGfxMLModeChangeJob {
     uint32_t height;
     uint32_t iosurface_pixel_format;
     uint64_t protection_requirements;
+    bool wait_for_completion;
+    QemuEvent completion;
 } AppleGfxMLModeChangeJob;
 
 static void apple_gfx_ml_mode_change_bh(void *opaque)
@@ -826,8 +828,15 @@ static void apple_gfx_ml_mode_change_bh(void *opaque)
     AppleGfxMLModeChangeJob *job = opaque;
     AppleGfxMLState *s = job ? job->state : NULL;
 
-    if (!job || !s) {
-        g_free(job);
+    if (!job) {
+        return;
+    }
+    if (!s) {
+        if (job->wait_for_completion) {
+            qemu_event_set(&job->completion);
+        } else {
+            g_free(job);
+        }
         return;
     }
 
@@ -842,7 +851,11 @@ static void apple_gfx_ml_mode_change_bh(void *opaque)
                               job->height,
                               job->iosurface_pixel_format,
                               job->protection_requirements);
-    g_free(job);
+    if (job->wait_for_completion) {
+        qemu_event_set(&job->completion);
+    } else {
+        g_free(job);
+    }
 }
 
 static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
@@ -1132,15 +1145,23 @@ static void *agfx_display_callback_thread(void *opaque)
 
         switch (job->kind) {
         case AGFX_DISPLAY_CALLBACK_MODE_CHANGE: {
-            AppleGfxMLModeChangeJob *bh_job = g_new0(AppleGfxMLModeChangeJob, 1);
+            AppleGfxMLModeChangeJob bh_job = {
+                .state = s,
+                .width = job->u.mode_change.width,
+                .height = job->u.mode_change.height,
+                .iosurface_pixel_format = job->u.mode_change.iosurface_pixel_format,
+                .protection_requirements = job->u.mode_change.protection_requirements,
+                .wait_for_completion = true,
+            };
 
-            bh_job->state = s;
-            bh_job->width = job->u.mode_change.width;
-            bh_job->height = job->u.mode_change.height;
-            bh_job->iosurface_pixel_format = job->u.mode_change.iosurface_pixel_format;
-            bh_job->protection_requirements = job->u.mode_change.protection_requirements;
+            /* Reference modeChangeHandler runs on the display queue itself.
+             * Round-trip through the main loop here so later callback jobs are
+             * not delivered until agfx_publish_display_mode() has completed. */
+            qemu_event_init(&bh_job.completion, false);
             aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                                    apple_gfx_ml_mode_change_bh, bh_job);
+                                    apple_gfx_ml_mode_change_bh, &bh_job);
+            qemu_event_wait(&bh_job.completion);
+            qemu_event_destroy(&bh_job.completion);
             break;
         }
         case AGFX_DISPLAY_CALLBACK_NEW_FRAME:
