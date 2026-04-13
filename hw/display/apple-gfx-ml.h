@@ -21,7 +21,6 @@
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
 struct AppleGfxMLFrameCompletionJob;
-struct AppleGfxMLFramePayload;
 struct AppleGfxMLDisplayCallbackJob;
 
 typedef struct AgfxBootstrapPresentSource {
@@ -75,14 +74,6 @@ struct AppleGfxMLState {
     uint8_t *display_fb;        /* Used by QEMU DisplaySurface */
     size_t display_fb_size;
     
-    /* Frame payload queues (protected by frame_mutex) */
-    QemuMutex frame_mutex;
-    struct AppleGfxMLFrameCompletionJob *frame_completion_wait_head;
-    struct AppleGfxMLFrameCompletionJob *frame_completion_wait_tail;
-    struct AppleGfxMLFramePayload *frame_payload_head;
-    struct AppleGfxMLFramePayload *frame_payload_tail;
-    uint32_t frame_payload_count;
-
     /* Current display parameters */
     uint32_t fb_width;
     uint32_t fb_height;
