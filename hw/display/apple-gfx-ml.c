@@ -39,7 +39,6 @@
 
 /* Forward declarations from qmu_vulkan.h (C++ header, can't include directly) */
 struct qmu_vulkan_ctx;
-int qmu_vk_begin_display_frame(struct qmu_vulkan_ctx *ctx);
 int qmu_vk_request_display_frame(struct qmu_vulkan_ctx *ctx);
 void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
@@ -693,7 +692,6 @@ static void qemu_raise_irq(void *ctx, uint32_t vector)
  * This matches Apple's approach with newFrameEventHandler + BH.
  * ============================================================ */
 
-static void agfx_request_display_render(AppleGfxMLState *s);
 static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s);
 static bool agfx_take_bootstrap_present_source_locked(AppleGfxMLState *s);
 static void apple_gfx_ml_frame_completed_bh(void *opaque);
@@ -720,24 +718,21 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
         return;
     }
 
-    rc = qmu_vk_begin_display_frame(vk);
+    rc = qmu_vk_request_display_frame(vk);
     if (rc > 0) {
         if (agfx_log_should_emit(&s->render_worker_log_count)) {
             agfx_log(s,
-                     "[apple-gfx-ml] kick_display_render: iosfc_async pending_frames=%d mmio_wait=%d\n",
+                     "[apple-gfx-ml] kick_display_render: request_display_frame pending_frames=%d mmio_wait=%d\n",
                      __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
                      qatomic_read(&s->mmio_wait_active));
         }
         return;
     }
-    if (rc == 0) {
-        agfx_request_display_render(s);
-        return;
-    }
 
     if (agfx_log_should_emit(&s->render_worker_log_count)) {
         agfx_log(s,
-                 "[apple-gfx-ml] kick_display_render: begin_display_frame failed pending_frames=%d\n",
+                 "[apple-gfx-ml] kick_display_render: request_display_frame rc=%d pending_frames=%d\n",
+                 rc,
                  __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
     }
     qemu_frame_completed(s, 0);
@@ -1393,18 +1388,6 @@ static void qemu_mode_change(void *ctx,
     agfx_enqueue_display_callback_job(s, job);
 }
 
-static void agfx_request_display_render(AppleGfxMLState *s)
-{
-    if (!s || !s->qmu_dev) {
-        return;
-    }
-
-    qemu_mutex_lock(&s->render_mutex);
-    s->display_render_requests++;
-    qemu_mutex_unlock(&s->render_mutex);
-    qemu_sem_post(&s->render_sem);
-}
-
 static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s)
 {
     if (!s->bootstrap_present_source.pending) {
@@ -1791,8 +1774,9 @@ static void *agfx_mmio_worker_thread(void *opaque)
             aio_wait_kick();
             break;
         case AGFX_SESSION_JOB_MMIO_WRITE:
-            /* session_mutex serializes MMIO writes with render_worker
-             * (both access shared session state including active_cmd_buffer). */
+            /* session_mutex serializes MMIO writes with other wrapper-side
+             * session mutations while qmetal owns display rendering on its
+             * internal worker. */
             qemu_mutex_lock(&s->session_mutex);
             qmu_mmio_write(job->state->qmu_dev,
                            (uint32_t)job->offset, job->value, job->size);
@@ -1806,59 +1790,6 @@ static void *agfx_mmio_worker_thread(void *opaque)
             g_free(job);
         }
     }
-    return NULL;
-}
-
-static void *agfx_render_worker_thread(void *opaque)
-{
-    AppleGfxMLState *s = opaque;
-
-    while (true) {
-        int display_count = 0;
-        struct qmu_vulkan_ctx *vk = NULL;
-
-        qemu_sem_wait(&s->render_sem);
-
-        if (qatomic_read(&s->render_worker_stop)) {
-            break;
-        }
-
-        /* Reference newFrameEventHandler owns the heavy encode path. Bootstrap
-         * IOSFC present publication is handled by the lightweight present BH. */
-        qemu_mutex_lock(&s->render_mutex);
-        if (s->display_render_requests > 0) {
-            display_count = 1;
-            s->display_render_requests--;
-        }
-        qemu_mutex_unlock(&s->render_mutex);
-
-        if (display_count <= 0 || !s->qmu_dev) {
-            continue;
-        }
-
-        vk = qmu_session_get_vulkan(s->qmu_dev);
-        if (!vk) {
-            agfx_log(s, "[apple-gfx-ml] render_worker: vk=NULL\n");
-            continue;
-        }
-
-        if (agfx_log_should_emit(&s->render_worker_log_count)) {
-            agfx_log(s,
-                     "[apple-gfx-ml] render_worker: request_display_frame x%d mmio_wait=%d pending_frames=%d\n",
-                     display_count,
-                     qatomic_read(&s->mmio_wait_active),
-                     __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
-        }
-        if (qmu_vk_request_display_frame(vk) <= 0) {
-            if (agfx_log_should_emit(&s->render_worker_log_count)) {
-                agfx_log(s,
-                         "[apple-gfx-ml] render_worker: request_display_frame retired without callback pending_frames=%d\n",
-                         __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
-            }
-            qemu_frame_completed(s, 0);
-        }
-    }
-
     return NULL;
 }
 
@@ -2032,18 +1963,14 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     qemu_mutex_init(&s->frame_mutex);
     qemu_mutex_init(&s->mmio_job_mutex);
     qemu_mutex_init(&s->session_mutex);
-    qemu_mutex_init(&s->render_mutex);
     qemu_mutex_init(&s->display_callback_mutex);
     qemu_mutex_init(&s->bootstrap_present_mutex);
     qemu_cond_init(&s->bootstrap_present_cond);
     qemu_sem_init(&s->display_callback_sem, 0);
-    qemu_sem_init(&s->render_sem, 0);
     s->mmio_wait_active = 0;
     s->iosfc_bootstrap_active = 0;
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
-    s->render_worker_stop = false;
-    s->display_render_requests = 0;
     s->display_callback_worker_stop = false;
     s->display_callback_head = NULL;
     s->display_callback_tail = NULL;
@@ -2126,8 +2053,6 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
                         agfx_mmio_worker_thread, s, QEMU_THREAD_JOINABLE);
     qemu_thread_create(&s->display_callback_worker, "agfx-display-cb",
                        agfx_display_callback_thread, s, QEMU_THREAD_JOINABLE);
-    qemu_thread_create(&s->render_worker, "agfx-render",
-                       agfx_render_worker_thread, s, QEMU_THREAD_JOINABLE);
     qemu_thread_create(&s->bootstrap_present_worker, "agfx-present",
                        agfx_bootstrap_present_thread, s, QEMU_THREAD_JOINABLE);
 
@@ -2168,10 +2093,6 @@ static void agfx_exit(PCIDevice *pci_dev)
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
     qemu_thread_join(&s->bootstrap_present_worker);
 
-    qatomic_set(&s->render_worker_stop, true);
-    qemu_sem_post(&s->render_sem);
-    qemu_thread_join(&s->render_worker);
-
     qemu_mutex_lock(&s->mmio_job_mutex);
     job = s->session_job_head;
     s->session_job_head = NULL;
@@ -2201,8 +2122,6 @@ static void agfx_exit(PCIDevice *pci_dev)
     agfx_free_queued_display_callback_jobs(s);
     qemu_sem_destroy(&s->display_callback_sem);
     qemu_mutex_destroy(&s->display_callback_mutex);
-    qemu_sem_destroy(&s->render_sem);
-    qemu_mutex_destroy(&s->render_mutex);
     qemu_cond_destroy(&s->bootstrap_present_cond);
     qemu_mutex_destroy(&s->bootstrap_present_mutex);
     qmu_log_set_callback(NULL, NULL);
@@ -2234,9 +2153,6 @@ static void agfx_reset(Object *obj, ResetType type)
     s->gfx_update_requested = false;
     s->pending_frames = 0;
     s->mmio_wait_active = 0;
-    qemu_mutex_lock(&s->render_mutex);
-    s->display_render_requests = 0;
-    qemu_mutex_unlock(&s->render_mutex);
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     agfx_cancel_frame_presents_locked(s);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
@@ -2298,8 +2214,6 @@ static void agfx_instance_init(Object *obj)
     s->mmio_wait_active = 0;
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
-    s->render_worker_stop = false;
-    s->display_render_requests = 0;
     s->bootstrap_present_worker_stop = false;
     s->bootstrap_present_timer.active = false;
     s->bootstrap_present_timer.next_fire_us = 0;

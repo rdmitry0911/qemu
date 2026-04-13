@@ -122,13 +122,6 @@ struct AppleGfxMLState {
     QemuMutex session_mutex;   /* Serializes qmetal session mutation across workers */
     int mmio_wait_active;      /* Main thread is inside AIO_WAIT_WHILE for MMIO */
 
-    /* Reference-like background render queue separate from MMIO dispatch_async path. */
-    QemuThread render_worker;
-    QemuSemaphore render_sem;
-    QemuMutex render_mutex;
-    bool render_worker_stop;
-    int display_render_requests;
-
     int iosfc_bootstrap_active;
 
     /* Reference-like PGDisplay queue owner for modeChange/newFrame/cursor*
