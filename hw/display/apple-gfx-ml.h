@@ -22,6 +22,7 @@
 typedef struct qmu_session qmu_session;
 struct AppleGfxMLFrameCompletionJob;
 struct AppleGfxMLDisplayCallbackJob;
+struct AgfxBootstrapPresentCommand;
 
 typedef struct AgfxBootstrapPresentSource {
     bool pending;
@@ -131,6 +132,8 @@ struct AppleGfxMLState {
     QemuMutex bootstrap_present_mutex;
     QemuCond bootstrap_present_cond;
     bool bootstrap_present_worker_stop;
+    struct AgfxBootstrapPresentCommand *bootstrap_present_cmd_head;
+    struct AgfxBootstrapPresentCommand *bootstrap_present_cmd_tail;
     AgfxBootstrapPresentTimer bootstrap_present_timer;
     AgfxBootstrapPresentSource bootstrap_present_source;
 

@@ -555,6 +555,8 @@ static void qemu_raise_irq(void *ctx, uint32_t vector)
 
 static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s);
 static bool agfx_take_bootstrap_present_source_locked(AppleGfxMLState *s);
+static struct AgfxBootstrapPresentCommand *
+agfx_take_bootstrap_present_command_locked(AppleGfxMLState *s);
 static void apple_gfx_ml_frame_completed_bh(void *opaque);
 static void apple_gfx_ml_cursor_glyph_bh(void *opaque);
 static void apple_gfx_ml_cursor_move_bh(void *opaque);
@@ -564,6 +566,7 @@ static void agfx_schedule_frame_presents(AppleGfxMLState *s);
 static void agfx_schedule_frame_presents_locked(AppleGfxMLState *s, bool *started);
 static void agfx_cancel_frame_presents(AppleGfxMLState *s);
 static void agfx_cancel_frame_presents_locked(AppleGfxMLState *s);
+static void agfx_free_bootstrap_present_commands_locked(AppleGfxMLState *s);
 static void agfx_enqueue_session_job(AppleGfxMLState *s,
                                      AppleGfxMLSessionJob *job);
 static void agfx_enqueue_display_callback_job(AppleGfxMLState *s,
@@ -623,6 +626,16 @@ typedef struct AgfxCompletionJob {
     void (*fn)(void *);
     void *ctx;
 } AgfxCompletionJob;
+
+typedef enum AgfxBootstrapPresentCommandKind {
+    AGFX_BOOTSTRAP_PRESENT_CMD_SCHEDULE,
+    AGFX_BOOTSTRAP_PRESENT_CMD_CANCEL,
+} AgfxBootstrapPresentCommandKind;
+
+typedef struct AgfxBootstrapPresentCommand {
+    struct AgfxBootstrapPresentCommand *next;
+    AgfxBootstrapPresentCommandKind kind;
+} AgfxBootstrapPresentCommand;
 
 static void agfx_display_completion_bh(void *opaque)
 {
@@ -1174,6 +1187,42 @@ static bool agfx_take_bootstrap_present_source_locked(AppleGfxMLState *s)
     return true;
 }
 
+static AgfxBootstrapPresentCommand *
+agfx_take_bootstrap_present_command_locked(AppleGfxMLState *s)
+{
+    AgfxBootstrapPresentCommand *cmd;
+
+    if (!s || !s->bootstrap_present_cmd_head) {
+        return NULL;
+    }
+
+    cmd = s->bootstrap_present_cmd_head;
+    s->bootstrap_present_cmd_head = cmd->next;
+    if (!s->bootstrap_present_cmd_head) {
+        s->bootstrap_present_cmd_tail = NULL;
+    }
+    cmd->next = NULL;
+    return cmd;
+}
+
+static void agfx_free_bootstrap_present_commands_locked(AppleGfxMLState *s)
+{
+    AgfxBootstrapPresentCommand *cmd;
+
+    if (!s) {
+        return;
+    }
+
+    cmd = s->bootstrap_present_cmd_head;
+    s->bootstrap_present_cmd_head = NULL;
+    s->bootstrap_present_cmd_tail = NULL;
+    while (cmd) {
+        AgfxBootstrapPresentCommand *next = cmd->next;
+        g_free(cmd);
+        cmd = next;
+    }
+}
+
 static void agfx_schedule_frame_presents_locked(AppleGfxMLState *s, bool *started)
 {
     if (!s) {
@@ -1195,21 +1244,26 @@ static void agfx_schedule_frame_presents_locked(AppleGfxMLState *s, bool *starte
 
 static void agfx_schedule_frame_presents(AppleGfxMLState *s)
 {
-    bool started = false;
+    AgfxBootstrapPresentCommand *cmd;
 
     if (!s) {
         return;
     }
 
+    /* Reference scheduleFramePresents runs on PGEFIPresentQueue itself.
+     * Queue one control command instead of mutating timer/source state from
+     * the MMIO caller thread. */
+    cmd = g_new0(AgfxBootstrapPresentCommand, 1);
+    cmd->kind = AGFX_BOOTSTRAP_PRESENT_CMD_SCHEDULE;
     qemu_mutex_lock(&s->bootstrap_present_mutex);
-    agfx_schedule_frame_presents_locked(s, &started);
-    qemu_mutex_unlock(&s->bootstrap_present_mutex);
-
-    if (started) {
-        agfx_log(s,
-                 "[apple-gfx-ml] display frame timer started (%dms interval, present queue)\n",
-                 AGFX_DISPLAY_FRAME_INTERVAL_MS);
+    if (s->bootstrap_present_cmd_tail) {
+        s->bootstrap_present_cmd_tail->next = cmd;
+    } else {
+        s->bootstrap_present_cmd_head = cmd;
     }
+    s->bootstrap_present_cmd_tail = cmd;
+    qemu_cond_signal(&s->bootstrap_present_cond);
+    qemu_mutex_unlock(&s->bootstrap_present_mutex);
 }
 
 static void agfx_cancel_frame_presents_locked(AppleGfxMLState *s)
@@ -1225,12 +1279,23 @@ static void agfx_cancel_frame_presents_locked(AppleGfxMLState *s)
 
 static void agfx_cancel_frame_presents(AppleGfxMLState *s)
 {
+    AgfxBootstrapPresentCommand *cmd;
+
     if (!s) {
         return;
     }
 
+    /* Reference cancelFramePresents is also queue-owned. Keep cancellation
+     * ordered against any already queued schedule/merge work. */
+    cmd = g_new0(AgfxBootstrapPresentCommand, 1);
+    cmd->kind = AGFX_BOOTSTRAP_PRESENT_CMD_CANCEL;
     qemu_mutex_lock(&s->bootstrap_present_mutex);
-    agfx_cancel_frame_presents_locked(s);
+    if (s->bootstrap_present_cmd_tail) {
+        s->bootstrap_present_cmd_tail->next = cmd;
+    } else {
+        s->bootstrap_present_cmd_head = cmd;
+    }
+    s->bootstrap_present_cmd_tail = cmd;
     qemu_cond_signal(&s->bootstrap_present_cond);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
 }
@@ -1259,8 +1324,35 @@ static void *agfx_bootstrap_present_thread(void *opaque)
 
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     while (!s->bootstrap_present_worker_stop) {
+        AgfxBootstrapPresentCommand *cmd;
         int64_t now_us;
         int64_t wait_ms;
+
+        cmd = agfx_take_bootstrap_present_command_locked(s);
+        if (cmd) {
+            /* The serial present worker is the wrapper analogue of
+             * PGEFIPresentQueue. It alone owns timer/source state mutation. */
+            switch (cmd->kind) {
+            case AGFX_BOOTSTRAP_PRESENT_CMD_SCHEDULE: {
+                bool started = false;
+
+                qatomic_set(&s->iosfc_bootstrap_active, 1);
+                agfx_schedule_frame_presents_locked(s, &started);
+                if (started) {
+                    agfx_log(s,
+                             "[apple-gfx-ml] display frame timer started (%dms interval, present queue)\n",
+                             AGFX_DISPLAY_FRAME_INTERVAL_MS);
+                }
+                break;
+            }
+            case AGFX_BOOTSTRAP_PRESENT_CMD_CANCEL:
+                qatomic_set(&s->iosfc_bootstrap_active, 0);
+                agfx_cancel_frame_presents_locked(s);
+                break;
+            }
+            g_free(cmd);
+            continue;
+        }
 
         if (agfx_take_bootstrap_present_source_locked(s)) {
             qemu_mutex_unlock(&s->bootstrap_present_mutex);
@@ -1600,11 +1692,9 @@ static void agfx_mmio_write(void *opaque, hwaddr offset,
      * immediate first fire, later MAP_ADDR commits merge one pending tick into
      * the already-armed source. */
     if (offset == PVG_REG_IOSFC_MAP_ADDR && val != 0) {
-        qatomic_set(&s->iosfc_bootstrap_active, 1);
         agfx_schedule_frame_presents(s);
     } else if ((offset == PVG_REG_IOSFC_ENABLE && val == 0) ||
                offset == PVG_REG_IOSFC_UNMAP) {
-        qatomic_set(&s->iosfc_bootstrap_active, 0);
         agfx_cancel_frame_presents(s);
     }
 
@@ -1734,6 +1824,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->display_callback_head = NULL;
     s->display_callback_tail = NULL;
     s->bootstrap_present_worker_stop = false;
+    s->bootstrap_present_cmd_head = NULL;
+    s->bootstrap_present_cmd_tail = NULL;
     s->bootstrap_present_timer.active = false;
     s->bootstrap_present_timer.next_fire_us = 0;
     s->bootstrap_present_source.pending = false;
@@ -1845,6 +1937,7 @@ static void agfx_exit(PCIDevice *pci_dev)
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     s->bootstrap_present_worker_stop = true;
     agfx_cancel_frame_presents_locked(s);
+    agfx_free_bootstrap_present_commands_locked(s);
     qemu_cond_signal(&s->bootstrap_present_cond);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
     qemu_thread_join(&s->bootstrap_present_worker);
@@ -1900,7 +1993,9 @@ static void agfx_reset(Object *obj, ResetType type)
     s->mmio_wait_active = 0;
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     agfx_cancel_frame_presents_locked(s);
+    agfx_free_bootstrap_present_commands_locked(s);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
+    qatomic_set(&s->iosfc_bootstrap_active, 0);
     agfx_free_queued_display_callback_jobs(s);
     s->cursor_show = true;
     s->cursor_x = 0;
@@ -1956,6 +2051,8 @@ static void agfx_instance_init(Object *obj)
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
     s->bootstrap_present_worker_stop = false;
+    s->bootstrap_present_cmd_head = NULL;
+    s->bootstrap_present_cmd_tail = NULL;
     s->bootstrap_present_timer.active = false;
     s->bootstrap_present_timer.next_fire_us = 0;
     s->bootstrap_present_source.pending = false;
