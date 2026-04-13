@@ -115,13 +115,12 @@ struct AppleGfxMLState {
 
     int iosfc_bootstrap_active;
 
-    /* Reference-like PGDisplay queue owner for modeChange/newFrame/cursor*
-     * callback classes. Producer threads enqueue jobs here; one serial worker
-     * delivers them in-order into the QEMU BH/main-loop plane. */
-    QemuThread display_callback_worker;
-    QemuSemaphore display_callback_sem;
+    /* PGDisplay callback graph is queue-owned in reference. Producers enqueue
+     * jobs here; one main-loop drain BH serially consumes them in FIFO order,
+     * keeping the callback boundary on the QEMU display/main-loop plane rather
+     * than on an extra wrapper-owned worker thread. */
     QemuMutex display_callback_mutex;
-    bool display_callback_worker_stop;
+    bool display_callback_bh_scheduled;
     struct AppleGfxMLDisplayCallbackJob *display_callback_head;
     struct AppleGfxMLDisplayCallbackJob *display_callback_tail;
 
