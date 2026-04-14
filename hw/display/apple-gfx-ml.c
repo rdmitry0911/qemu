@@ -483,7 +483,6 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque);
 static void apple_gfx_ml_cursor_glyph_bh(void *opaque);
 static void apple_gfx_ml_cursor_move_bh(void *opaque);
 static void apple_gfx_ml_cursor_show_bh(void *opaque);
-static void apple_gfx_ml_mode_change_bh(void *opaque);
 static void agfx_new_frame_handler_bh(void *opaque);
 static void agfx_schedule_frame_presents(AppleGfxMLState *s);
 static void agfx_schedule_frame_presents_locked(AppleGfxMLState *s, bool *started);
@@ -867,15 +866,6 @@ typedef struct AppleGfxMLCursorMoveJob {
     uint32_t y;
 } AppleGfxMLCursorMoveJob;
 
-typedef struct AppleGfxMLModeChangeJob {
-    AppleGfxMLState *state;
-    uint32_t width;
-    uint32_t height;
-    uint32_t iosurface_pixel_format;
-    uint64_t protection_requirements;
-    QemuEvent *completion;
-} AppleGfxMLModeChangeJob;
-
 static void apple_gfx_ml_update_cursor(AppleGfxMLState *s)
 {
     if (!s->con) {
@@ -986,30 +976,6 @@ static void apple_gfx_ml_cursor_move_bh(void *opaque)
     g_free(job);
 }
 
-static void apple_gfx_ml_mode_change_bh(void *opaque)
-{
-    AppleGfxMLModeChangeJob *job = opaque;
-    AppleGfxMLState *s = job ? job->state : NULL;
-
-    if (!job || !s) {
-        if (job && job->completion) {
-            qemu_event_set(job->completion);
-        }
-        g_free(job);
-        return;
-    }
-
-    apple_gfx_ml_apply_mode_change(s,
-                                   job->width,
-                                   job->height,
-                                   job->iosurface_pixel_format,
-                                   job->protection_requirements);
-    if (job->completion) {
-        qemu_event_set(job->completion);
-    }
-    g_free(job);
-}
-
 static void qemu_cursor_glyph(void *ctx,
                               const void *pixels,
                               uint64_t mapped_length,
@@ -1090,29 +1056,16 @@ static void qemu_mode_change(void *ctx,
                              uint64_t protection_requirements)
 {
     AppleGfxMLState *s = ctx;
-    AppleGfxMLModeChangeJob *job;
 
     if (!s || width == 0 || height == 0) {
         return;
     }
 
-    job = g_new0(AppleGfxMLModeChangeJob, 1);
-    job->state = s;
-    {
-        QemuEvent completion;
-
-        qemu_event_init(&completion, false);
-        job->completion = &completion;
-        job->width = width;
-        job->height = height;
-        job->iosurface_pixel_format = iosurface_pixel_format;
-        job->protection_requirements = protection_requirements;
-        aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                                apple_gfx_ml_mode_change_bh, job);
-        qemu_event_wait(&completion);
-        qemu_event_destroy(&completion);
-        return;
-    }
+    apple_gfx_ml_apply_mode_change(s,
+                                   width,
+                                   height,
+                                   iosurface_pixel_format,
+                                   protection_requirements);
 }
 
 static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s)
