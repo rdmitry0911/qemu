@@ -498,7 +498,6 @@ static void qemu_render_frame_complete(void *ctx,
 static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *vk)
 {
     int rc;
-    bool need_wake = false;
 
     if (!s || !vk) {
         return;
@@ -512,10 +511,7 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
     qemu_mutex_unlock(&s->session_mutex);
     if (rc > 0) {
         qemu_mutex_lock(&s->render_mutex);
-        if (!s->render_request_queued) {
-            s->render_request_queued = true;
-            need_wake = true;
-        }
+        s->render_request_count++;
         qemu_mutex_unlock(&s->render_mutex);
         if (agfx_log_should_emit(&s->render_worker_log_count)) {
             agfx_log(s,
@@ -523,9 +519,7 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
                      __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
                      qatomic_read(&s->mmio_wait_active));
         }
-        if (need_wake) {
-            qemu_sem_post(&s->render_sem);
-        }
+        qemu_sem_post(&s->render_sem);
         return;
     }
 
@@ -552,11 +546,14 @@ static void *agfx_render_worker_thread(void *opaque)
         qemu_sem_wait(&s->render_sem);
 
         qemu_mutex_lock(&s->render_mutex);
-        if (s->render_request_queued) {
-            s->render_request_queued = false;
+        if (s->render_request_count > 0) {
+            s->render_request_count--;
         } else if (s->render_worker_stop) {
             qemu_mutex_unlock(&s->render_mutex);
             break;
+        } else {
+            qemu_mutex_unlock(&s->render_mutex);
+            continue;
         }
         qemu_mutex_unlock(&s->render_mutex);
 
@@ -1737,7 +1734,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
     s->render_worker_stop = false;
-    s->render_request_queued = false;
+    s->render_request_count = 0;
     s->bootstrap_present_worker_stop = false;
     s->bootstrap_present_cmd_head = NULL;
     s->bootstrap_present_cmd_tail = NULL;
@@ -1854,7 +1851,7 @@ static void agfx_exit(PCIDevice *pci_dev)
 
     qemu_mutex_lock(&s->render_mutex);
     s->render_worker_stop = true;
-    s->render_request_queued = false;
+    s->render_request_count = 0;
     qemu_mutex_unlock(&s->render_mutex);
     qemu_sem_post(&s->render_sem);
     qemu_thread_join(&s->render_worker);
@@ -1917,7 +1914,7 @@ static void agfx_reset(Object *obj, ResetType type)
     s->pending_frames = 0;
     s->mmio_wait_active = 0;
     qemu_mutex_lock(&s->render_mutex);
-    s->render_request_queued = false;
+    s->render_request_count = 0;
     qemu_mutex_unlock(&s->render_mutex);
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     agfx_cancel_frame_presents_locked(s);
@@ -2003,7 +2000,7 @@ static void agfx_instance_init(Object *obj)
     s->render_worker_log_count = 0;
     s->bootstrap_present_log_count = 0;
     s->render_worker_stop = false;
-    s->render_request_queued = false;
+    s->render_request_count = 0;
 }
 
 static const TypeInfo agfx_type_info = {

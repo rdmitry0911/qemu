@@ -122,7 +122,7 @@ struct AppleGfxMLState {
     QemuSemaphore render_sem;
     QemuMutex render_mutex;
     bool render_worker_stop;
-    bool render_request_queued;
+    uint32_t render_request_count;
 
     /* Reference PGEFIPresentQueue: serial bootstrap present queue owning both
      * scheduleFramePresents' 100ms timer source and the mergeable present
