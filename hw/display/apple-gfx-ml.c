@@ -24,6 +24,7 @@
 #include "qemu/aio-wait.h"
 #include "qemu/thread.h"    /* QemuEvent for DMA BH synchronization */
 #include "qemu/cutils.h"
+#include "block/thread-pool.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
@@ -79,6 +80,10 @@ static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
     g_free(job->frame_pixels);
     g_free(job);
 }
+
+typedef struct AgfxRenderSubmitJob {
+    AppleGfxMLState *state;
+} AgfxRenderSubmitJob;
 
 static void agfx_log_write_direct(const char *text)
 {
@@ -489,15 +494,16 @@ static void agfx_schedule_frame_presents_locked(AppleGfxMLState *s, bool *starte
 static void agfx_cancel_frame_presents(AppleGfxMLState *s);
 static void agfx_cancel_frame_presents_locked(AppleGfxMLState *s);
 static void agfx_free_bootstrap_present_commands_locked(AppleGfxMLState *s);
-static void *agfx_render_worker_thread(void *opaque);
 static void agfx_enqueue_session_job(AppleGfxMLState *s,
                                      AppleGfxMLSessionJob *job);
 static void qemu_render_frame_complete(void *ctx,
                                        const qmu_render_frame_completion *completion);
+static int agfx_render_submit_job(void *opaque);
 
 static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *vk)
 {
     int rc;
+    AgfxRenderSubmitJob *job;
 
     if (!s || !vk) {
         return;
@@ -510,16 +516,18 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
     rc = qmu_vk_capture_display_frame_request(vk);
     qemu_mutex_unlock(&s->session_mutex);
     if (rc > 0) {
-        qemu_mutex_lock(&s->render_mutex);
-        s->render_request_count++;
-        qemu_mutex_unlock(&s->render_mutex);
         if (agfx_log_should_emit(&s->render_worker_log_count)) {
             agfx_log(s,
                      "[apple-gfx-ml] kick_display_render: captured_display_request pending_frames=%d mmio_wait=%d\n",
                      __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
                      qatomic_read(&s->mmio_wait_active));
         }
-        qemu_sem_post(&s->render_sem);
+        job = g_new0(AgfxRenderSubmitJob, 1);
+        job->state = s;
+        thread_pool_submit_immediate(s->render_pool,
+                                     agfx_render_submit_job,
+                                     job,
+                                     g_free);
         return;
     }
 
@@ -535,70 +543,50 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
     }
 }
 
-static void *agfx_render_worker_thread(void *opaque)
+static int agfx_render_submit_job(void *opaque)
 {
-    AppleGfxMLState *s = opaque;
+    AgfxRenderSubmitJob *job = opaque;
+    AppleGfxMLState *s = job ? job->state : NULL;
+    struct qmu_vulkan_ctx *vk;
+    int rc;
 
-    while (true) {
-        struct qmu_vulkan_ctx *vk;
-        int rc;
-
-        qemu_sem_wait(&s->render_sem);
-
-        qemu_mutex_lock(&s->render_mutex);
-        if (s->render_request_count > 0) {
-            s->render_request_count--;
-        } else if (s->render_worker_stop) {
-            qemu_mutex_unlock(&s->render_mutex);
-            break;
-        } else {
-            qemu_mutex_unlock(&s->render_mutex);
-            continue;
-        }
-        qemu_mutex_unlock(&s->render_mutex);
-
-        if (s->render_worker_stop) {
-            break;
-        }
-
-        if (!s->qmu_dev) {
-            continue;
-        }
-
-        vk = qmu_session_get_vulkan(s->qmu_dev);
-        if (!vk) {
-            qmu_render_frame_completion completion = {};
-            qemu_render_frame_complete(s, &completion);
-            continue;
-        }
-
-        qemu_mutex_lock(&s->session_mutex);
-        rc = qmu_vk_submit_captured_display_frame(vk);
-        qemu_mutex_unlock(&s->session_mutex);
-
-        if (rc > 0) {
-            if (agfx_log_should_emit(&s->render_worker_log_count)) {
-                agfx_log(s,
-                         "[apple-gfx-ml] render_worker: submit_captured_display_frame pending_frames=%d mmio_wait=%d\n",
-                         __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
-                         qatomic_read(&s->mmio_wait_active));
-            }
-            continue;
-        }
-
-        if (agfx_log_should_emit(&s->render_worker_log_count)) {
-            agfx_log(s,
-                     "[apple-gfx-ml] render_worker: submit_captured_display_frame rc=%d pending_frames=%d\n",
-                     rc,
-                     __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
-        }
-        {
-            qmu_render_frame_completion completion = {};
-            qemu_render_frame_complete(s, &completion);
-        }
+    if (!s || !s->qmu_dev) {
+        return 0;
     }
 
-    return NULL;
+    vk = qmu_session_get_vulkan(s->qmu_dev);
+    if (!vk) {
+        qmu_render_frame_completion completion = {};
+        qemu_render_frame_complete(s, &completion);
+        return 0;
+    }
+
+    qemu_mutex_lock(&s->session_mutex);
+    rc = qmu_vk_submit_captured_display_frame(vk);
+    qemu_mutex_unlock(&s->session_mutex);
+
+    if (rc > 0) {
+        if (agfx_log_should_emit(&s->render_worker_log_count)) {
+            agfx_log(s,
+                     "[apple-gfx-ml] render_worker: submit_captured_display_frame pending_frames=%d mmio_wait=%d\n",
+                     __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
+                     qatomic_read(&s->mmio_wait_active));
+        }
+        return 0;
+    }
+
+    if (agfx_log_should_emit(&s->render_worker_log_count)) {
+        agfx_log(s,
+                 "[apple-gfx-ml] render_worker: submit_captured_display_frame rc=%d pending_frames=%d\n",
+                 rc,
+                 __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
+    }
+    {
+        qmu_render_frame_completion completion = {};
+        qemu_render_frame_complete(s, &completion);
+    }
+
+    return 0;
 }
 
 typedef enum AgfxSessionJobKind {
@@ -1726,15 +1714,13 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     
     qemu_mutex_init(&s->mmio_job_mutex);
     qemu_mutex_init(&s->session_mutex);
-    qemu_mutex_init(&s->render_mutex);
     qemu_mutex_init(&s->bootstrap_present_mutex);
     qemu_cond_init(&s->bootstrap_present_cond);
     s->mmio_wait_active = 0;
     s->iosfc_bootstrap_active = 0;
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
-    s->render_worker_stop = false;
-    s->render_request_count = 0;
+    s->render_pool = NULL;
     s->bootstrap_present_worker_stop = false;
     s->bootstrap_present_cmd_head = NULL;
     s->bootstrap_present_cmd_tail = NULL;
@@ -1810,12 +1796,10 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Start wrapper-owned serial worker threads. */
     qemu_sem_init(&s->mmio_sem, 0);
-    qemu_sem_init(&s->render_sem, 0);
     s->mmio_worker_stop = false;
     qemu_thread_create(&s->mmio_worker, "agfx-io",
                         agfx_mmio_worker_thread, s, QEMU_THREAD_JOINABLE);
-    qemu_thread_create(&s->render_worker, "agfx-render",
-                       agfx_render_worker_thread, s, QEMU_THREAD_JOINABLE);
+    s->render_pool = thread_pool_new();
     qemu_thread_create(&s->bootstrap_present_worker, "agfx-present",
                        agfx_bootstrap_present_thread, s, QEMU_THREAD_JOINABLE);
 
@@ -1849,13 +1833,10 @@ static void agfx_exit(PCIDevice *pci_dev)
     qemu_thread_join(&s->mmio_worker);
     qemu_sem_destroy(&s->mmio_sem);
 
-    qemu_mutex_lock(&s->render_mutex);
-    s->render_worker_stop = true;
-    s->render_request_count = 0;
-    qemu_mutex_unlock(&s->render_mutex);
-    qemu_sem_post(&s->render_sem);
-    qemu_thread_join(&s->render_worker);
-    qemu_sem_destroy(&s->render_sem);
+    if (s->render_pool) {
+        thread_pool_free(s->render_pool);
+        s->render_pool = NULL;
+    }
 
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     s->bootstrap_present_worker_stop = true;
@@ -1880,7 +1861,6 @@ static void agfx_exit(PCIDevice *pci_dev)
 
     qemu_mutex_destroy(&s->mmio_job_mutex);
     qemu_mutex_destroy(&s->session_mutex);
-    qemu_mutex_destroy(&s->render_mutex);
 
     /* Destroy qmetal device (stops display thread) */
     if (s->qmu_dev) {
@@ -1913,9 +1893,6 @@ static void agfx_reset(Object *obj, ResetType type)
     s->gfx_update_requested = false;
     s->pending_frames = 0;
     s->mmio_wait_active = 0;
-    qemu_mutex_lock(&s->render_mutex);
-    s->render_request_count = 0;
-    qemu_mutex_unlock(&s->render_mutex);
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     agfx_cancel_frame_presents_locked(s);
     agfx_free_bootstrap_present_commands_locked(s);
@@ -1999,8 +1976,7 @@ static void agfx_instance_init(Object *obj)
     s->new_frame_signal_log_count = 0;
     s->render_worker_log_count = 0;
     s->bootstrap_present_log_count = 0;
-    s->render_worker_stop = false;
-    s->render_request_count = 0;
+    s->render_pool = NULL;
 }
 
 static const TypeInfo agfx_type_info = {

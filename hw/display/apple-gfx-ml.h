@@ -22,6 +22,7 @@
 typedef struct qmu_session qmu_session;
 struct AppleGfxMLFrameCompletionJob;
 struct AgfxBootstrapPresentCommand;
+typedef struct ThreadPool ThreadPool;
 
 typedef struct AgfxBootstrapPresentSource {
     bool pending;
@@ -115,14 +116,10 @@ struct AppleGfxMLState {
 
     int iosfc_bootstrap_active;
 
-    /* Reference apple_gfx_render_new_frame dispatches actual owner render work
-     * off the BH/BQL edge onto a background queue after capturing the exact
-     * current frame. Mirror that with one wrapper-owned serial render worker. */
-    QemuThread render_worker;
-    QemuSemaphore render_sem;
-    QemuMutex render_mutex;
-    bool render_worker_stop;
-    uint32_t render_request_count;
+    /* Reference apple_gfx_render_new_frame dispatches one async owner-render
+     * block per captured frame onto the background queue. Mirror that with one
+     * wrapper-owned thread pool instead of a serial render worker plane. */
+    ThreadPool *render_pool;
 
     /* Reference PGEFIPresentQueue: serial bootstrap present queue owning both
      * scheduleFramePresents' 100ms timer source and the mergeable present
