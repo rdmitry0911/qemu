@@ -21,7 +21,6 @@
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
 struct AppleGfxMLFrameCompletionJob;
-struct AppleGfxMLDisplayCallbackJob;
 struct AgfxBootstrapPresentCommand;
 
 typedef struct AgfxBootstrapPresentSource {
@@ -115,15 +114,6 @@ struct AppleGfxMLState {
     int mmio_wait_active;      /* Main thread is inside AIO_WAIT_WHILE for MMIO */
 
     int iosfc_bootstrap_active;
-
-    /* PGDisplay callback graph is queue-owned in reference. Producers enqueue
-     * jobs here; one main-loop drain BH serially consumes them in FIFO order,
-     * keeping the callback boundary on the QEMU display/main-loop plane rather
-     * than on an extra wrapper-owned worker thread. */
-    QemuMutex display_callback_mutex;
-    bool display_callback_bh_scheduled;
-    struct AppleGfxMLDisplayCallbackJob *display_callback_head;
-    struct AppleGfxMLDisplayCallbackJob *display_callback_tail;
 
     /* Reference apple_gfx_render_new_frame dispatches actual owner render work
      * off the BH/BQL edge onto a background queue after capturing the exact
