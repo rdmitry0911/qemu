@@ -700,16 +700,6 @@ static void apple_gfx_ml_apply_mode_change(AppleGfxMLState *s,
              iosurface_pixel_format,
              protection_requirements);
 
-    /* Live Transaction3 takeover edge: bootstrap iosfc_present_tick does not
-     * emit mode_change, but the live presentSurface path does. Once this edge
-     * appears, keeping the bootstrap producer alive leaks a second
-     * signalCurrentFrame producer into the live path. */
-    if (qatomic_read(&s->iosfc_bootstrap_active)) {
-        agfx_log(s,
-                 "[apple-gfx-ml] mode_change: cancel bootstrap presents on live takeover\n");
-        agfx_cancel_frame_presents(s);
-    }
-
     agfx_publish_display_mode(s,
                               width,
                               height,
@@ -1076,6 +1066,21 @@ static void qemu_mode_change(void *ctx,
                                    height,
                                    iosurface_pixel_format,
                                    protection_requirements);
+}
+
+static void qemu_display_live_takeover(void *ctx)
+{
+    AppleGfxMLState *s = ctx;
+
+    if (!s) {
+        return;
+    }
+
+    if (qatomic_read(&s->iosfc_bootstrap_active)) {
+        agfx_log(s,
+                 "[apple-gfx-ml] display_live_takeover: cancel bootstrap presents\n");
+        agfx_cancel_frame_presents(s);
+    }
 }
 
 static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s)
@@ -1793,6 +1798,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .cursor_move = qemu_cursor_move,
         .cursor_show = qemu_cursor_show,
         .mode_change = qemu_mode_change,
+        .display_live_takeover = qemu_display_live_takeover,
         .read_vram = qemu_read_vram,
         /* IOSurface mapper — 1:1 reference PGIOSurfaceHostDevice.
          * For PCI: iosfc_raise_irq wires to same qemu_raise_irq (one IRQ line,
