@@ -699,6 +699,17 @@ static void apple_gfx_ml_apply_mode_change(AppleGfxMLState *s,
              height,
              iosurface_pixel_format,
              protection_requirements);
+
+    /* Live Transaction3 takeover edge: bootstrap iosfc_present_tick does not
+     * emit mode_change, but the live presentSurface path does. Once this edge
+     * appears, keeping the bootstrap producer alive leaks a second
+     * signalCurrentFrame producer into the live path. */
+    if (qatomic_read(&s->iosfc_bootstrap_active)) {
+        agfx_log(s,
+                 "[apple-gfx-ml] mode_change: cancel bootstrap presents on live takeover\n");
+        agfx_cancel_frame_presents(s);
+    }
+
     agfx_publish_display_mode(s,
                               width,
                               height,
