@@ -33,6 +33,12 @@ typedef struct AgfxBootstrapPresentTimer {
     int64_t next_fire_us;
 } AgfxBootstrapPresentTimer;
 
+typedef struct AgfxCompletionJob {
+    struct AgfxCompletionJob *next;
+    void (*fn)(void *);
+    void *ctx;
+} AgfxCompletionJob;
+
 #define TYPE_APPLE_GFX_ML "apple-gfx-ml"
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGfxMLState, APPLE_GFX_ML)
 
@@ -113,6 +119,16 @@ struct AppleGfxMLState {
     QemuMutex mmio_job_mutex;  /* Protects MMIO session job queue */
     QemuMutex session_mutex;   /* Serializes wrapper-owned owner-render capture/submit */
     int mmio_wait_active;      /* Main thread is inside AIO_WAIT_WHILE for MMIO */
+
+    /* Reference PGDisplayDescriptor.queue is one serial host queue for display
+     * callbacks. schedule_display_completion is the wrapper-side analogue of
+     * that queue boundary, so keep its jobs in one FIFO main-loop drain instead
+     * of independent oneshot BH deliveries. */
+    QemuMutex completion_mutex;
+    AgfxCompletionJob *completion_head;
+    AgfxCompletionJob *completion_tail;
+    bool completion_bh_scheduled;
+    QEMUBH *completion_bh;
 
     int iosfc_bootstrap_active;
 
