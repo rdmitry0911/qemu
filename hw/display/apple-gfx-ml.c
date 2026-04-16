@@ -1366,14 +1366,6 @@ static void agfx_new_frame_handler_bh(void *opaque)
         return;
     }
 
-    /* Keep qmetal's merged new-frame source pending until the reference-owned
-     * newFrameEventHandler analogue actually runs. Clearing it earlier, before
-     * the direct BH consumer executes, lets Transaction3/presentFrame re-arm a
-     * second signal while this BH is only scheduled, which is not
-     * dispatch-source shaped and creates run-dependent extra drops/chain-only
-     * paths. */
-    qmu_vk_consume_current_frame_signal(vk);
-
     if (agfx_log_should_emit(&s->new_frame_handler_log_count)) {
         agfx_log(s,
                  "[apple-gfx-ml] new_frame_handler_bh: pending_frames=%d mmio_wait=%d\n",
@@ -1414,9 +1406,24 @@ static void agfx_new_frame_handler_bh(void *opaque)
 static void qemu_new_frame_signal(void *ctx)
 {
     AppleGfxMLState *s = ctx;
+    struct qmu_vulkan_ctx *vk = NULL;
 
     if (!s) {
         return;
+    }
+
+    if (s->qmu_dev) {
+        vk = qmu_session_get_vulkan(s->qmu_dev);
+    }
+
+    /* Reference dispatch_get_main_queue/newFrameEventHandler consumes the
+     * mergeable signal when the callback itself runs, before the later BH
+     * consumer. That exact edge existed briefly in 414f8bc358 and was later
+     * moved to the BH edge by 974b600cdb; fresh VIS087 reruns show the BH-edge
+     * lifetime still leaves a non-reference merge window and reopens
+     * run-dependent extra new_frame_signal/new_frame_handler paths. */
+    if (vk) {
+        qmu_vk_consume_current_frame_signal(vk);
     }
 
     if (agfx_log_should_emit(&s->new_frame_signal_log_count)) {
