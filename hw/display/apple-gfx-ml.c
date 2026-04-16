@@ -498,6 +498,7 @@ static void agfx_enqueue_session_job(AppleGfxMLState *s,
                                      AppleGfxMLSessionJob *job);
 static void qemu_render_frame_complete(void *ctx,
                                        const qmu_render_frame_completion *completion);
+static void qemu_frame_completed(void *ctx, int frame_expected);
 static int agfx_render_submit_job(void *opaque);
 
 static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *vk)
@@ -538,8 +539,7 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
                  __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
     }
     {
-        qmu_render_frame_completion completion = {};
-        qemu_render_frame_complete(s, &completion);
+        qemu_frame_completed(s, 0);
     }
 }
 
@@ -556,8 +556,7 @@ static int agfx_render_submit_job(void *opaque)
 
     vk = qmu_session_get_vulkan(s->qmu_dev);
     if (!vk) {
-        qmu_render_frame_completion completion = {};
-        qemu_render_frame_complete(s, &completion);
+        qemu_frame_completed(s, 0);
         return 0;
     }
 
@@ -581,10 +580,7 @@ static int agfx_render_submit_job(void *opaque)
                  rc,
                  __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
     }
-    {
-        qmu_render_frame_completion completion = {};
-        qemu_render_frame_complete(s, &completion);
-    }
+    qemu_frame_completed(s, 0);
 
     return 0;
 }
@@ -797,8 +793,8 @@ static void qemu_render_frame_complete(void *ctx,
                                        const qmu_render_frame_completion *completion)
 {
     AppleGfxMLState *s = ctx;
-    AppleGfxMLFrameCompletionJob *job;
     size_t size = 0;
+    uint8_t *pixels_copy = NULL;
 
     if (!s || !completion) {
         return;
@@ -816,27 +812,63 @@ static void qemu_render_frame_complete(void *ctx,
         }
     }
 
-    job = g_new0(AppleGfxMLFrameCompletionJob, 1);
-    job->state = s;
-    job->frame_expected =
-        completion->frame_expected != 0 && completion->pixels != NULL;
-    if (job->frame_expected) {
+    if (completion->frame_expected && completion->pixels) {
         size = (size_t)completion->height * completion->stride;
-        job->frame_pixels = g_memdup2(completion->pixels, size);
-        if (!job->frame_pixels) {
+        pixels_copy = g_memdup2(completion->pixels, size);
+        if (!pixels_copy) {
             agfx_log(s,
                      "[apple-gfx-ml] render_frame_complete: payload allocation failed %ux%u stride=%u\n",
                      completion->width,
                      completion->height,
                      completion->stride);
-            g_free(job);
             return;
         }
-        job->frame_size = size;
-        job->frame_width = completion->width;
-        job->frame_height = completion->height;
-        job->frame_stride = completion->stride;
     }
+
+    qemu_mutex_lock(&s->frame_completion_mutex);
+    g_free(s->completion_frame_pixels);
+    s->completion_frame_pixels = pixels_copy;
+    s->completion_frame_size = pixels_copy ? size : 0;
+    s->completion_frame_width = pixels_copy ? completion->width : 0;
+    s->completion_frame_height = pixels_copy ? completion->height : 0;
+    s->completion_frame_stride = pixels_copy ? completion->stride : 0;
+    s->completion_frame_valid = pixels_copy != NULL;
+    qemu_mutex_unlock(&s->frame_completion_mutex);
+}
+
+static void qemu_frame_completed(void *ctx, int frame_expected)
+{
+    AppleGfxMLState *s = ctx;
+    AppleGfxMLFrameCompletionJob *job;
+
+    if (!s) {
+        return;
+    }
+
+    job = g_new0(AppleGfxMLFrameCompletionJob, 1);
+    job->state = s;
+    job->frame_expected = frame_expected != 0;
+
+    qemu_mutex_lock(&s->frame_completion_mutex);
+    if (job->frame_expected && s->completion_frame_valid &&
+        s->completion_frame_pixels) {
+        job->frame_pixels = s->completion_frame_pixels;
+        job->frame_size = s->completion_frame_size;
+        job->frame_width = s->completion_frame_width;
+        job->frame_height = s->completion_frame_height;
+        job->frame_stride = s->completion_frame_stride;
+    } else {
+        job->frame_expected = false;
+        g_free(s->completion_frame_pixels);
+    }
+    s->completion_frame_pixels = NULL;
+    s->completion_frame_size = 0;
+    s->completion_frame_width = 0;
+    s->completion_frame_height = 0;
+    s->completion_frame_stride = 0;
+    s->completion_frame_valid = false;
+    qemu_mutex_unlock(&s->frame_completion_mutex);
+
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_frame_completed_bh, job);
 }
@@ -1762,6 +1794,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     qemu_mutex_init(&s->mmio_job_mutex);
     qemu_mutex_init(&s->session_mutex);
     qemu_mutex_init(&s->completion_mutex);
+    qemu_mutex_init(&s->frame_completion_mutex);
     qemu_mutex_init(&s->bootstrap_present_mutex);
     qemu_cond_init(&s->bootstrap_present_cond);
     s->mmio_wait_active = 0;
@@ -1773,6 +1806,12 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->completion_bh_scheduled = false;
     s->completion_bh = aio_bh_new(qemu_get_aio_context(),
                                   agfx_display_completion_bh, s);
+    s->completion_frame_pixels = NULL;
+    s->completion_frame_size = 0;
+    s->completion_frame_width = 0;
+    s->completion_frame_height = 0;
+    s->completion_frame_stride = 0;
+    s->completion_frame_valid = false;
     s->render_pool = NULL;
     s->bootstrap_present_worker_stop = false;
     s->bootstrap_present_cmd_head = NULL;
@@ -1812,6 +1851,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .write_memory_mainloop = qemu_write_memory_mainloop,
         /* Reference: newFrameEventHandler via signalCurrentFrame (apple-gfx.m:2694) */
         .new_frame_signal = qemu_new_frame_signal,
+        .frame_completed = qemu_frame_completed,
         .render_frame_complete = qemu_render_frame_complete,
     };
 
@@ -1935,6 +1975,16 @@ static void agfx_exit(PCIDevice *pci_dev)
         g_free(completion_job);
         completion_job = next;
     }
+    qemu_mutex_lock(&s->frame_completion_mutex);
+    g_free(s->completion_frame_pixels);
+    s->completion_frame_pixels = NULL;
+    s->completion_frame_size = 0;
+    s->completion_frame_width = 0;
+    s->completion_frame_height = 0;
+    s->completion_frame_stride = 0;
+    s->completion_frame_valid = false;
+    qemu_mutex_unlock(&s->frame_completion_mutex);
+    qemu_mutex_destroy(&s->frame_completion_mutex);
     qemu_mutex_destroy(&s->completion_mutex);
     qemu_mutex_destroy(&s->mmio_job_mutex);
     qemu_mutex_destroy(&s->session_mutex);
@@ -1973,6 +2023,15 @@ static void agfx_reset(Object *obj, ResetType type)
     s->completion_tail = NULL;
     s->completion_bh_scheduled = false;
     qemu_mutex_unlock(&s->completion_mutex);
+    qemu_mutex_lock(&s->frame_completion_mutex);
+    g_free(s->completion_frame_pixels);
+    s->completion_frame_pixels = NULL;
+    s->completion_frame_size = 0;
+    s->completion_frame_width = 0;
+    s->completion_frame_height = 0;
+    s->completion_frame_stride = 0;
+    s->completion_frame_valid = false;
+    qemu_mutex_unlock(&s->frame_completion_mutex);
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     agfx_cancel_frame_presents_locked(s);
     agfx_free_bootstrap_present_commands_locked(s);
@@ -2035,6 +2094,12 @@ static void agfx_instance_init(Object *obj)
     s->completion_tail = NULL;
     s->completion_bh_scheduled = false;
     s->completion_bh = NULL;
+    s->completion_frame_pixels = NULL;
+    s->completion_frame_size = 0;
+    s->completion_frame_width = 0;
+    s->completion_frame_height = 0;
+    s->completion_frame_stride = 0;
+    s->completion_frame_valid = false;
     s->bootstrap_present_worker_stop = false;
     s->bootstrap_present_cmd_head = NULL;
     s->bootstrap_present_cmd_tail = NULL;

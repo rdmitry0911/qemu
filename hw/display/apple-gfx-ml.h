@@ -130,6 +130,17 @@ struct AppleGfxMLState {
     bool completion_bh_scheduled;
     QEMUBH *completion_bh;
 
+    /* Staged owner-completion payload. qmetal now delivers payload first and
+     * the exact completion token second; the wrapper consumes that as one
+     * reference-shaped completion BH. */
+    QemuMutex frame_completion_mutex;
+    uint8_t *completion_frame_pixels;
+    size_t completion_frame_size;
+    uint32_t completion_frame_width;
+    uint32_t completion_frame_height;
+    uint32_t completion_frame_stride;
+    bool completion_frame_valid;
+
     int iosfc_bootstrap_active;
 
     /* Reference apple_gfx_render_new_frame dispatches one async owner-render
