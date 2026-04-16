@@ -720,6 +720,15 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
     size = job->frame_size;
     pixels = job->frame_pixels;
 
+    /* Reference apple_gfx_render_frame_completed_bh applies the rendered
+     * texture only if mode has not changed since render start. Keep the same
+     * guard on the wrapper completion edge instead of always publishing the
+     * staged frame payload. */
+    if (s->rendering_frame_width != s->fb_width ||
+        s->rendering_frame_height != s->fb_height) {
+        return false;
+    }
+
     agfx_publish_display_mode(s, width, height, s->fb_iosurface_pixel_format,
                               s->fb_protection_requirements);
 
@@ -1400,6 +1409,8 @@ static void agfx_new_frame_handler_bh(void *opaque)
                  "[apple-gfx-ml] new_frame_handler_bh: queue_render pending_frames=%d\n",
                  pending);
     }
+    s->rendering_frame_width = s->fb_width;
+    s->rendering_frame_height = s->fb_height;
     agfx_kick_display_render(s, vk);
 }
 
@@ -1911,6 +1922,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->fb_width = s->display_width;
     s->fb_height = s->display_height;
     s->fb_stride = s->display_width * 4;
+    s->rendering_frame_width = s->fb_width;
+    s->rendering_frame_height = s->fb_height;
     
     /* Create initial display surface using display_fb */
     DisplaySurface *surface = qemu_create_displaysurface_from(
@@ -2021,6 +2034,8 @@ static void agfx_reset(Object *obj, ResetType type)
     s->gfx_update_requested = false;
     s->pending_frames = 0;
     s->mmio_wait_active = 0;
+    s->rendering_frame_width = 0;
+    s->rendering_frame_height = 0;
     qemu_mutex_lock(&s->completion_mutex);
     while (s->completion_head) {
         AgfxCompletionJob *job = s->completion_head;
@@ -2114,6 +2129,8 @@ static void agfx_instance_init(Object *obj)
     s->bootstrap_present_timer.next_fire_us = 0;
     s->bootstrap_present_source.pending = false;
     s->pending_frames = 0;
+    s->rendering_frame_width = 0;
+    s->rendering_frame_height = 0;
     s->fb_iosurface_pixel_format = 0x42475241u;
     s->fb_protection_requirements = 0;
     s->display_fb = NULL;

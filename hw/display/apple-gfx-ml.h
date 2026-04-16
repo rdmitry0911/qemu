@@ -85,6 +85,8 @@ struct AppleGfxMLState {
     uint32_t fb_width;
     uint32_t fb_height;
     uint32_t fb_stride;
+    uint32_t rendering_frame_width;
+    uint32_t rendering_frame_height;
     uint32_t fb_iosurface_pixel_format;
     uint64_t fb_protection_requirements;
     bool new_frame_ready;       /* Frame copied to display_fb, awaiting gfx_update poll */
