@@ -21,7 +21,6 @@
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
 struct AppleGfxMLFrameCompletionJob;
-struct AppleGfxMLFramePayload;
 struct AgfxBootstrapPresentCommand;
 typedef struct ThreadPool ThreadPool;
 
@@ -132,17 +131,6 @@ struct AppleGfxMLState {
     AgfxCompletionJob *completion_tail;
     bool completion_bh_scheduled;
     QEMUBH *completion_bh;
-
-    /* qmetal currently delivers owner payload and exact completion token as
-     * two callbacks. Keep submit identity by queuing payload objects FIFO and
-     * matching them to completion jobs, instead of storing one mutable global
-     * payload slot that a later submit can overwrite before its token arrives. */
-    QemuMutex frame_completion_mutex;
-    struct AppleGfxMLFrameCompletionJob *frame_completion_wait_head;
-    struct AppleGfxMLFrameCompletionJob *frame_completion_wait_tail;
-    struct AppleGfxMLFramePayload *frame_payload_head;
-    struct AppleGfxMLFramePayload *frame_payload_tail;
-    uint32_t frame_payload_count;
 
     int iosfc_bootstrap_active;
 
