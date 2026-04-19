@@ -71,6 +71,7 @@ struct AppleGfxMLState {
     QemuConsole *con;
     QEMUCursor *cursor;
     bool cursor_show;
+    uint32_t cursor_display_id;
     uint32_t cursor_x;
     uint32_t cursor_y;
 

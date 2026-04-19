@@ -883,14 +883,20 @@ typedef struct AppleGfxMLCursorShowJob {
 typedef struct AppleGfxMLCursorMoveJob {
     AppleGfxMLState *state;
     uint32_t display_id;
-    uint32_t x;
-    uint32_t y;
 } AppleGfxMLCursorMoveJob;
 
-static void apple_gfx_ml_update_cursor(AppleGfxMLState *s)
+static void apple_gfx_ml_update_cursor(AppleGfxMLState *s, uint32_t display_id)
 {
+    uint32_t packed = 0xffffffffu;
+
     if (!s->con) {
         return;
+    }
+
+    if (s->qmu_dev &&
+        qmu_get_display_cursor_position(s->qmu_dev, display_id, &packed) == QMU_OK) {
+        s->cursor_x = packed & 0xffffu;
+        s->cursor_y = (packed >> 16) & 0xffffu;
     }
     dpy_mouse_set(s->con, s->cursor_x, s->cursor_y, s->cursor_show);
 }
@@ -953,7 +959,7 @@ static void apple_gfx_ml_cursor_glyph_bh(void *opaque)
 
     if (s->con) {
         dpy_cursor_define(s->con, s->cursor);
-        apple_gfx_ml_update_cursor(s);
+        apple_gfx_ml_update_cursor(s, s->cursor_display_id);
     }
     g_free(job->pixels);
     g_free(job);
@@ -970,10 +976,11 @@ static void apple_gfx_ml_cursor_show_bh(void *opaque)
     }
 
     s->cursor_show = job->visible;
+    s->cursor_display_id = job->display_id;
     agfx_log(s, "[apple-gfx-ml] cursor_show: display=%u visible=%d\n",
              job->display_id,
              job->visible ? 1 : 0);
-    apple_gfx_ml_update_cursor(s);
+    apple_gfx_ml_update_cursor(s, job->display_id);
     g_free(job);
 }
 
@@ -987,13 +994,10 @@ static void apple_gfx_ml_cursor_move_bh(void *opaque)
         return;
     }
 
-    s->cursor_x = job->x;
-    s->cursor_y = job->y;
-    agfx_log(s, "[apple-gfx-ml] cursor_move: display=%u pos=%u,%u\n",
-             job->display_id,
-             job->x,
-             job->y);
-    apple_gfx_ml_update_cursor(s);
+    s->cursor_display_id = job->display_id;
+    agfx_log(s, "[apple-gfx-ml] cursor_move: display=%u\n",
+             job->display_id);
+    apple_gfx_ml_update_cursor(s, job->display_id);
     g_free(job);
 }
 
@@ -1050,9 +1054,7 @@ static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
 }
 
 static void qemu_cursor_move(void *ctx,
-                             uint32_t display_id,
-                             uint32_t x,
-                             uint32_t y)
+                             uint32_t display_id)
 {
     AppleGfxMLState *s = ctx;
     AppleGfxMLCursorMoveJob *job;
@@ -1064,8 +1066,6 @@ static void qemu_cursor_move(void *ctx,
     job = g_new0(AppleGfxMLCursorMoveJob, 1);
     job->state = s;
     job->display_id = display_id;
-    job->x = x;
-    job->y = y;
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_cursor_move_bh, job);
 }
@@ -2014,6 +2014,7 @@ static void agfx_reset(Object *obj, ResetType type)
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
     qatomic_set(&s->iosfc_bootstrap_active, 0);
     s->cursor_show = true;
+    s->cursor_display_id = 0;
     s->cursor_x = 0;
     s->cursor_y = 0;
     
@@ -2084,6 +2085,7 @@ static void agfx_instance_init(Object *obj)
     s->display_fb = NULL;
     s->cursor = NULL;
     s->cursor_show = true;
+    s->cursor_display_id = 0;
     s->cursor_x = 0;
     s->cursor_y = 0;
     s->log_writer_started = false;
