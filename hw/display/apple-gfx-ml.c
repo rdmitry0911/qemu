@@ -64,11 +64,6 @@ struct AppleGfxMLFrameCompletionJob {
     AppleGfxMLState *state;
     bool frame_expected;
     bool chain_needed;
-    uint8_t *frame_pixels;
-    size_t frame_size;
-    uint32_t frame_width;
-    uint32_t frame_height;
-    uint32_t frame_stride;
 };
 
 static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
@@ -77,7 +72,6 @@ static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
         return;
     }
 
-    g_free(job->frame_pixels);
     g_free(job);
 }
 
@@ -683,39 +677,67 @@ static void apple_gfx_ml_apply_mode_change(AppleGfxMLState *s,
 static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                                             AppleGfxMLFrameCompletionJob *job)
 {
-    uint32_t width, height, stride;
-    const uint8_t *pixels;
-    size_t size;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t stride = 0;
+    int frame_available = 0;
+    qmu_status rc;
 
-    if (!s || !job || !job->frame_pixels || job->frame_size == 0) {
+    if (!s || !job || !s->qmu_dev) {
         return false;
     }
 
-    width = job->frame_width;
-    height = job->frame_height;
-    stride = job->frame_stride;
-    size = job->frame_size;
-    pixels = job->frame_pixels;
-
     /* Reference apple_gfx_render_frame_completed_bh applies the rendered
      * texture only if mode has not changed since render start. Keep the same
-     * guard on the wrapper completion edge instead of always publishing the
-     * staged frame payload. */
+     * guard on the wrapper completion edge, but consume the completed frame
+     * through a late-read from qmetal's shared mutable latest-frame state
+     * instead of through one immutable per-submit payload snapshot. */
     if (s->rendering_frame_width != s->fb_width ||
         s->rendering_frame_height != s->fb_height) {
+        return false;
+    }
+
+    rc = qmu_get_latest_display_frame(s->qmu_dev,
+                                      NULL,
+                                      0,
+                                      &width,
+                                      &height,
+                                      &stride,
+                                      &frame_available);
+    if (rc != QMU_OK || !frame_available || width == 0 || height == 0 ||
+        stride == 0) {
         return false;
     }
 
     agfx_publish_display_mode(s, width, height, s->fb_iosurface_pixel_format,
                               s->fb_protection_requirements);
 
-    /* Copy from the frame-owned payload to the display buffer. */
-    if (pixels && s->display_fb) {
-        memcpy(s->display_fb, pixels, size);
+    rc = qmu_get_latest_display_frame(s->qmu_dev,
+                                      s->display_fb,
+                                      s->display_fb_size,
+                                      &width,
+                                      &height,
+                                      &stride,
+                                      &frame_available);
+    if (rc != QMU_OK || !frame_available) {
+        return false;
     }
 
-    /* Update frame counter and log */
+    /* Update frame counter and log. This is the wrapper analogue of reference
+     * frame_completed_bh copying from the shared display texture into the
+     * visible surface on the BH edge. */
     s->frame_count++;
+    {
+        uint64_t pc = qatomic_fetch_inc(&s->present_count) + 1;
+        if (pc <= AGFX_LOG_INITIAL_COUNT || (pc % AGFX_LOG_INTERVAL) == 0) {
+            agfx_log(s,
+                     "[apple-gfx-ml] present_frame #%lu: %ux%u stride=%u (owner late-read)\n",
+                     (unsigned long)pc,
+                     width,
+                     height,
+                     stride);
+        }
+    }
     if (s->frame_count <= AGFX_LOG_INITIAL_COUNT || (s->frame_count % AGFX_LOG_INTERVAL) == 0) {
         agfx_log(s, "[apple-gfx-ml] frame_completed_bh: present #%lu %ux%u stride=%u\n",
                  (unsigned long)s->frame_count, width, height, stride);
@@ -780,45 +802,14 @@ static void qemu_render_frame_complete(void *ctx,
 {
     AppleGfxMLState *s = ctx;
     AppleGfxMLFrameCompletionJob *job;
-    size_t size = 0;
 
     if (!s || !completion) {
         return;
     }
 
-    if (completion->frame_expected && completion->pixels) {
-        uint64_t pc = qatomic_fetch_inc(&s->present_count) + 1;
-        if (pc <= AGFX_LOG_INITIAL_COUNT || (pc % AGFX_LOG_INTERVAL) == 0) {
-            agfx_log(s,
-                     "[apple-gfx-ml] present_frame #%lu: %ux%u stride=%u (owner completion)\n",
-                     (unsigned long)pc,
-                     completion->width,
-                     completion->height,
-                     completion->stride);
-        }
-    }
-
     job = g_new0(AppleGfxMLFrameCompletionJob, 1);
     job->state = s;
-    job->frame_expected =
-        completion->frame_expected != 0 && completion->pixels != NULL;
-    if (job->frame_expected) {
-        size = (size_t)completion->height * completion->stride;
-        job->frame_pixels = g_memdup2(completion->pixels, size);
-        if (!job->frame_pixels) {
-            agfx_log(s,
-                     "[apple-gfx-ml] render_frame_complete: payload allocation failed %ux%u stride=%u\n",
-                     completion->width,
-                     completion->height,
-                     completion->stride);
-            g_free(job);
-            return;
-        }
-        job->frame_size = size;
-        job->frame_width = completion->width;
-        job->frame_height = completion->height;
-        job->frame_stride = completion->stride;
-    }
+    job->frame_expected = completion->frame_expected != 0;
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_frame_completed_bh, job);
 }

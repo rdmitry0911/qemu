@@ -75,9 +75,10 @@ struct AppleGfxMLState {
     uint32_t cursor_y;
 
     /* display_fb is published to the QEMU surface from main-loop BHs only.
-     * Completed frame payloads stay frame-owned until the matching completion
-     * BH copies them into display_fb, instead of going through one shared
-     * staging buffer that later callbacks can overwrite. */
+     * Owner completion BH late-reads the latest mutable frame state from
+     * qmetal on the BH edge, mirroring reference frame_completed_bh reading
+     * from one shared display texture object instead of consuming immutable
+     * per-submit frame payload snapshots. */
     uint8_t *display_fb;        /* Used by QEMU DisplaySurface */
     size_t display_fb_size;
     
