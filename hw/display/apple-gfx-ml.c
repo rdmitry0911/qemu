@@ -613,37 +613,14 @@ typedef struct AgfxBootstrapPresentCommand {
 
 static void agfx_display_completion_bh(void *opaque)
 {
-    AppleGfxMLState *s = opaque;
+    AgfxCompletionJob *job = opaque;
 
-    if (!s) {
+    if (!job) {
         return;
     }
 
-    while (true) {
-        AgfxCompletionJob *job;
-
-        qemu_mutex_lock(&s->completion_mutex);
-        job = s->completion_head;
-        if (job) {
-            s->completion_head = job->next;
-            if (!s->completion_head) {
-                s->completion_tail = NULL;
-            }
-        } else {
-            s->completion_bh_scheduled = false;
-        }
-        qemu_mutex_unlock(&s->completion_mutex);
-
-        if (!job) {
-            break;
-        }
-
-        /* Reference PGDisplayDescriptor.queue is serial. Drain every queued
-         * host display callback in FIFO order on the main loop instead of
-         * letting independent oneshot BHs race each other. */
-        job->fn(job->ctx);
-        g_free(job);
-    }
+    job->fn(job->ctx);
+    g_free(job);
 }
 
 static void agfx_publish_display_mode(AppleGfxMLState *s,
@@ -1445,36 +1422,19 @@ static void qemu_schedule_display_completion(void *ctx,
 {
     AppleGfxMLState *s = ctx;
     AgfxCompletionJob *job;
-    bool schedule_bh = false;
 
     if (!s || !fn) {
         return;
     }
 
     job = g_new0(AgfxCompletionJob, 1);
-    job->next = NULL;
     job->fn = fn;
     job->ctx = comp_ctx;
 
     agfx_log(s, "[apple-gfx-ml] schedule_display_completion: enqueue mmio_wait=%d\n",
              qatomic_read(&s->mmio_wait_active));
-
-    qemu_mutex_lock(&s->completion_mutex);
-    if (s->completion_tail) {
-        s->completion_tail->next = job;
-    } else {
-        s->completion_head = job;
-    }
-    s->completion_tail = job;
-    if (!s->completion_bh_scheduled) {
-        s->completion_bh_scheduled = true;
-        schedule_bh = true;
-    }
-    qemu_mutex_unlock(&s->completion_mutex);
-
-    if (schedule_bh) {
-        qemu_bh_schedule(s->completion_bh);
-    }
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            agfx_display_completion_bh, job);
 }
 
 /* 1:1 reference apple_gfx_mmio_map_surface_memory (apple-gfx-mmio.m:145-158).
@@ -1791,18 +1751,12 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     
     qemu_mutex_init(&s->mmio_job_mutex);
     qemu_mutex_init(&s->session_mutex);
-    qemu_mutex_init(&s->completion_mutex);
     qemu_mutex_init(&s->bootstrap_present_mutex);
     qemu_cond_init(&s->bootstrap_present_cond);
     s->mmio_wait_active = 0;
     s->iosfc_bootstrap_active = 0;
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
-    s->completion_head = NULL;
-    s->completion_tail = NULL;
-    s->completion_bh_scheduled = false;
-    s->completion_bh = aio_bh_new(qemu_get_aio_context(),
-                                  agfx_display_completion_bh, s);
     s->render_pool = NULL;
     s->bootstrap_present_worker_stop = false;
     s->bootstrap_present_cmd_head = NULL;
@@ -1911,7 +1865,6 @@ static void agfx_exit(PCIDevice *pci_dev)
 {
     AppleGfxMLState *s = APPLE_GFX_ML(pci_dev);
     AppleGfxMLSessionJob *job;
-    AgfxCompletionJob *completion_job;
 
     agfx_log(s, "[apple-gfx-ml] Device exit\n");
 
@@ -1953,22 +1906,6 @@ static void agfx_exit(PCIDevice *pci_dev)
         s->qmu_dev = NULL;
     }
 
-    if (s->completion_bh) {
-        qemu_bh_delete(s->completion_bh);
-        s->completion_bh = NULL;
-    }
-    qemu_mutex_lock(&s->completion_mutex);
-    completion_job = s->completion_head;
-    s->completion_head = NULL;
-    s->completion_tail = NULL;
-    s->completion_bh_scheduled = false;
-    qemu_mutex_unlock(&s->completion_mutex);
-    while (completion_job) {
-        AgfxCompletionJob *next = completion_job->next;
-        g_free(completion_job);
-        completion_job = next;
-    }
-    qemu_mutex_destroy(&s->completion_mutex);
     qemu_mutex_destroy(&s->mmio_job_mutex);
     qemu_mutex_destroy(&s->session_mutex);
     qemu_cond_destroy(&s->bootstrap_present_cond);
@@ -1999,15 +1936,6 @@ static void agfx_reset(Object *obj, ResetType type)
     s->mmio_wait_active = 0;
     s->rendering_frame_width = 0;
     s->rendering_frame_height = 0;
-    qemu_mutex_lock(&s->completion_mutex);
-    while (s->completion_head) {
-        AgfxCompletionJob *job = s->completion_head;
-        s->completion_head = job->next;
-        g_free(job);
-    }
-    s->completion_tail = NULL;
-    s->completion_bh_scheduled = false;
-    qemu_mutex_unlock(&s->completion_mutex);
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     agfx_cancel_frame_presents_locked(s);
     agfx_free_bootstrap_present_commands_locked(s);
@@ -2067,10 +1995,6 @@ static void agfx_instance_init(Object *obj)
     s->mmio_wait_active = 0;
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
-    s->completion_head = NULL;
-    s->completion_tail = NULL;
-    s->completion_bh_scheduled = false;
-    s->completion_bh = NULL;
     s->bootstrap_present_worker_stop = false;
     s->bootstrap_present_cmd_head = NULL;
     s->bootstrap_present_cmd_tail = NULL;
