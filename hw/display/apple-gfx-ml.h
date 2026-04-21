@@ -71,8 +71,8 @@ struct AppleGfxMLState {
     QEMUCursor *cursor;
     bool cursor_show;
     uint32_t cursor_display_id;
-    uint32_t cursor_x;
-    uint32_t cursor_y;
+    int32_t cursor_x;
+    int32_t cursor_y;
 
     /* display_fb is published to the QEMU surface from main-loop BHs only.
      * Owner completion BH late-reads the latest mutable frame state from

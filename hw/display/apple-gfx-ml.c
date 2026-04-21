@@ -863,8 +863,8 @@ static void apple_gfx_ml_update_cursor(AppleGfxMLState *s, uint32_t display_id)
 
     if (s->qmu_dev &&
         qmu_get_display_cursor_position(s->qmu_dev, display_id, &packed) == QMU_OK) {
-        s->cursor_x = packed & 0xffffu;
-        s->cursor_y = (packed >> 16) & 0xffffu;
+        s->cursor_x = (int16_t)(packed & 0xffffu);
+        s->cursor_y = (int16_t)((packed >> 16) & 0xffffu);
     }
     dpy_mouse_set(s->con, s->cursor_x, s->cursor_y, s->cursor_show);
 }
