@@ -64,6 +64,10 @@ struct AppleGfxMLFrameCompletionJob {
     AppleGfxMLState *state;
     bool frame_expected;
     bool chain_needed;
+    uint8_t *pixels;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
 };
 
 static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
@@ -72,6 +76,7 @@ static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
         return;
     }
 
+    g_free(job->pixels);
     g_free(job);
 }
 
@@ -680,58 +685,48 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t stride = 0;
-    int frame_available = 0;
-    qmu_status rc;
+    size_t frame_size = 0;
 
     if (!s || !job || !s->qmu_dev) {
         return false;
     }
 
     /* Reference apple_gfx_render_frame_completed_bh applies the rendered
-     * texture only if mode has not changed since render start. Keep the same
-     * guard on the wrapper completion edge, but consume the completed frame
-     * through a late-read from qmetal's shared mutable latest-frame state
-     * instead of through one immutable per-submit payload snapshot. */
+     * texture that belongs to the completed command buffer. qmetal delivers
+     * that immutable per-submit payload to this callback; copy it into the
+     * visible QEMU surface on the BH edge instead of late-reading a mutable
+     * global latest-frame slot that may already hold another completion. */
     if (s->rendering_frame_width != s->fb_width ||
         s->rendering_frame_height != s->fb_height) {
         return false;
     }
 
-    rc = qmu_get_latest_display_frame(s->qmu_dev,
-                                      NULL,
-                                      0,
-                                      &width,
-                                      &height,
-                                      &stride,
-                                      &frame_available);
-    if (rc != QMU_OK || !frame_available || width == 0 || height == 0 ||
-        stride == 0) {
+    if (!job->pixels || job->width == 0 || job->height == 0 || job->stride == 0) {
         return false;
     }
+
+    width = job->width;
+    height = job->height;
+    stride = job->stride;
+    frame_size = (size_t)height * stride;
 
     agfx_publish_display_mode(s, width, height, s->fb_iosurface_pixel_format,
                               s->fb_protection_requirements);
 
-    rc = qmu_get_latest_display_frame(s->qmu_dev,
-                                      s->display_fb,
-                                      s->display_fb_size,
-                                      &width,
-                                      &height,
-                                      &stride,
-                                      &frame_available);
-    if (rc != QMU_OK || !frame_available) {
+    if (frame_size > s->display_fb_size) {
         return false;
     }
+    memcpy(s->display_fb, job->pixels, frame_size);
 
     /* Update frame counter and log. This is the wrapper analogue of reference
-     * frame_completed_bh copying from the shared display texture into the
+     * frame_completed_bh copying from the completed display texture into the
      * visible surface on the BH edge. */
     s->frame_count++;
     {
         uint64_t pc = qatomic_fetch_inc(&s->present_count) + 1;
         if (pc <= AGFX_LOG_INITIAL_COUNT || (pc % AGFX_LOG_INTERVAL) == 0) {
             agfx_log(s,
-                     "[apple-gfx-ml] present_frame #%lu: %ux%u stride=%u (owner late-read)\n",
+                     "[apple-gfx-ml] present_frame #%lu: %ux%u stride=%u (owner payload)\n",
                      (unsigned long)pc,
                      width,
                      height,
@@ -810,6 +805,15 @@ static void qemu_render_frame_complete(void *ctx,
     job = g_new0(AppleGfxMLFrameCompletionJob, 1);
     job->state = s;
     job->frame_expected = completion->frame_expected != 0;
+    if (job->frame_expected && completion->pixels &&
+        completion->width != 0 && completion->height != 0 &&
+        completion->stride != 0) {
+        const size_t frame_size = (size_t)completion->height * completion->stride;
+        job->pixels = g_memdup2(completion->pixels, frame_size);
+        job->width = completion->width;
+        job->height = completion->height;
+        job->stride = completion->stride;
+    }
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             apple_gfx_ml_frame_completed_bh, job);
 }
