@@ -39,6 +39,40 @@ static void append_bool_property(Aml *properties, const char *name)
     aml_append(properties, property);
 }
 
+static Aml *build_apple_device_properties_dsm(Aml *properties)
+{
+    Aml *method;
+    Aml *ifctx;
+    uint8_t supported_funcs[1] = { 0x03 };
+
+    method = aml_method("_DSM", 4, AML_SERIALIZED);
+
+    ifctx = aml_if(aml_equal(aml_arg(2), aml_int(0)));
+    aml_append(ifctx, aml_return(aml_buffer(sizeof(supported_funcs),
+                                            supported_funcs)));
+    aml_append(method, ifctx);
+    aml_append(method, aml_return(properties));
+
+    return method;
+}
+
+static void append_apple_bool_property(Aml *properties, const char *name)
+{
+    aml_append(properties, aml_string("%s", name));
+    aml_append(properties, aml_int(1));
+}
+
+static void build_thunderbolt_root_port_dsm(Aml *scope)
+{
+    Aml *properties;
+
+    properties = aml_package(4);
+    append_apple_bool_property(properties, "PCI-Thunderbolt");
+    append_apple_bool_property(properties, "pci-supports-link-change");
+
+    aml_append(scope, build_apple_device_properties_dsm(properties));
+}
+
 static void build_thunderbolt_root_port_dsd(Aml *scope)
 {
     Aml *properties;
@@ -53,6 +87,7 @@ static void build_thunderbolt_root_port_dsd(Aml *scope)
 static void build_thunderbolt_root_port_aml(AcpiDevAmlIf *adev, Aml *scope)
 {
     build_thunderbolt_root_port_dsd(scope);
+    build_thunderbolt_root_port_dsm(scope);
     build_pci_bridge_aml(adev, scope);
 }
 

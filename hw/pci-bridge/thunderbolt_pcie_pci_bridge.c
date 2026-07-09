@@ -2,7 +2,9 @@
  * Thunderbolt PCI Express to PCI Bridge
  *
  * This is the regular generic PCIe-to-PCI bridge with ACPI device properties
- * that make Apple IOPCIFamily classify downstream PCI devices as tunnelled.
+ * that make Apple IOPCIFamily classify the bridge as a Thunderbolt tunnel
+ * endpoint. Downstream PCI devices are described normally so existing macOS
+ * drivers that are not IOPCITunnelCompatible can still bind to them.
  *
  * Copyright (C) 2026
  *
@@ -42,14 +44,71 @@ static void append_bool_property(Aml *properties, const char *name)
     aml_append(properties, property);
 }
 
+static void append_int_property(Aml *properties, const char *name, uint64_t val)
+{
+    Aml *property = aml_package(2);
+
+    aml_append(property, aml_string("%s", name));
+    aml_append(property, aml_int(val));
+    aml_append(properties, property);
+}
+
+static Aml *build_apple_device_properties_dsm(Aml *properties)
+{
+    Aml *method;
+    Aml *ifctx;
+    uint8_t supported_funcs[1] = { 0x03 };
+
+    method = aml_method("_DSM", 4, AML_SERIALIZED);
+
+    ifctx = aml_if(aml_equal(aml_arg(2), aml_int(0)));
+    aml_append(ifctx, aml_return(aml_buffer(sizeof(supported_funcs),
+                                            supported_funcs)));
+    aml_append(method, ifctx);
+    aml_append(method, aml_return(properties));
+
+    return method;
+}
+
+static void append_apple_bool_property(Aml *properties, const char *name)
+{
+    aml_append(properties, aml_string("%s", name));
+    aml_append(properties, aml_int(1));
+}
+
+static void append_apple_int_property(Aml *properties, const char *name,
+                                      uint64_t val)
+{
+    aml_append(properties, aml_string("%s", name));
+    aml_append(properties, aml_int(val));
+}
+
+static void build_tunnelled_device_dsm(Aml *scope)
+{
+    Aml *properties = aml_package(6);
+
+    append_apple_bool_property(properties, "IOPCITunnelled");
+    append_apple_bool_property(properties, "pci-supports-link-change");
+    append_apple_int_property(properties, "PCIHotplugCapable", 0);
+
+    aml_append(scope, build_apple_device_properties_dsm(properties));
+}
+
 static void build_tunnelled_device_dsd(Aml *scope)
 {
-    Aml *properties = aml_package(2);
+    Aml *properties = aml_package(3);
 
     append_bool_property(properties, "IOPCITunnelled");
     append_bool_property(properties, "pci-supports-link-change");
+    append_int_property(properties, "PCIHotplugCapable", 0);
 
     aml_append(scope, build_device_properties_dsd(properties));
+}
+
+static void build_tunnelled_device_acpi_properties(Aml *scope)
+{
+    build_tunnelled_device_dsd(scope);
+    build_tunnelled_device_dsm(scope);
 }
 
 static Aml *build_pci_static_endpoint_dsm(PCIDevice *pdev)
@@ -100,7 +159,6 @@ static void build_tunnelled_pci_bus_devices(Aml *parent_scope, PCIBus *bus)
         aml_append(dev, aml_name_decl("_ADR", aml_int(adr)));
 
         call_dev_aml_func(DEVICE(pdev), dev);
-        build_tunnelled_device_dsd(dev);
 
         if (pdev->acpi_index &&
             !object_property_get_bool(OBJECT(pdev), "hotpluggable",
@@ -117,7 +175,7 @@ static void build_thunderbolt_pcie_pci_bridge_aml(AcpiDevAmlIf *adev,
 {
     PCIBridge *br = PCI_BRIDGE(adev);
 
-    build_tunnelled_device_dsd(scope);
+    build_tunnelled_device_acpi_properties(scope);
 
     if (!DEVICE(br)->hotplugged) {
         PCIBus *sec_bus = pci_bridge_get_sec_bus(br);
