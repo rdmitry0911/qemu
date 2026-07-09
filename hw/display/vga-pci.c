@@ -410,6 +410,29 @@ static const TypeInfo vga_info = {
     .class_init    = vga_class_init,
 };
 
+static void thunderbolt_vga_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->realize = pci_std_vga_realize;
+    k->romfile = "vgabios-stdvga.bin";
+    k->class_id = PCI_CLASS_DISPLAY_VGA;
+    device_class_set_props(dc, vga_pci_properties);
+    dc->desc = "Thunderbolt hotpluggable VGA";
+    dc->hotpluggable = true;
+
+    /* Expose framebuffer byteorder via QOM */
+    object_class_property_add_bool(klass, "big-endian-framebuffer",
+                                   vga_get_big_endian_fb, vga_set_big_endian_fb);
+}
+
+static const TypeInfo thunderbolt_vga_info = {
+    .name          = "thunderbolt-vga",
+    .parent        = TYPE_PCI_VGA,
+    .class_init    = thunderbolt_vga_class_init,
+};
+
 static const TypeInfo secondary_info = {
     .name          = "secondary-vga",
     .parent        = TYPE_PCI_VGA,
@@ -421,6 +444,7 @@ static void vga_register_types(void)
 {
     type_register_static(&vga_pci_type_info);
     type_register_static(&vga_info);
+    type_register_static(&thunderbolt_vga_info);
     type_register_static(&secondary_info);
 }
 

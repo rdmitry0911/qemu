@@ -9,12 +9,52 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
 
 static void pci_multihead(void)
 {
     QTestState *qts;
 
     qts = qtest_init("-vga none -device VGA -device secondary-vga");
+    qtest_quit(qts);
+}
+
+static void thunderbolt_vga_hotplug(void)
+{
+    QTestState *qts;
+    QDict *rsp;
+    QDict *err;
+
+    qts = qtest_init("-machine q35 -display none -nodefaults -vga none "
+                     "-device VGA,id=bootvga,bus=pcie.0,addr=0x02 "
+                     "-device thunderbolt-root-port,id=tbrp0,bus=pcie.0,"
+                     "chassis=1,slot=1,addr=0x05");
+
+    rsp = qtest_qmp(qts, "{ 'execute': 'device_add', "
+                          "'arguments': {"
+                          "'driver': 'VGA',"
+                          "'id': 'badstd',"
+                          "'bus': 'tbrp0',"
+                          "'addr': '0x01'"
+                          "} }");
+    g_assert(qdict_haskey(rsp, "error"));
+    err = qdict_get_qdict(rsp, "error");
+    g_assert_cmpstr(qdict_get_str(err, "desc"), ==,
+                    "Device 'VGA' does not support hotplugging");
+    qobject_unref(rsp);
+
+    rsp = qtest_qmp(qts, "{ 'execute': 'device_add', "
+                          "'arguments': {"
+                          "'driver': 'thunderbolt-vga',"
+                          "'id': 'tbvga0',"
+                          "'bus': 'tbrp0',"
+                          "'addr': '0x00',"
+                          "'vgamem_mb': 64"
+                          "} }");
+    g_assert(qdict_haskey(rsp, "return"));
+    g_assert(!qdict_haskey(rsp, "error"));
+    qobject_unref(rsp);
+
     qtest_quit(qts);
 }
 
@@ -31,6 +71,7 @@ int main(int argc, char **argv)
     static const char *devices[] = {
         "cirrus-vga",
         "VGA",
+        "thunderbolt-vga",
         "secondary-vga",
         "virtio-gpu-pci",
         "virtio-vga"
@@ -48,6 +89,13 @@ int main(int argc, char **argv)
 
     if (qtest_has_device("secondary-vga")) {
         qtest_add_func("/display/pci/multihead", pci_multihead);
+    }
+
+    if (qtest_has_machine("q35") &&
+        qtest_has_device("thunderbolt-root-port") &&
+        qtest_has_device("thunderbolt-vga")) {
+        qtest_add_func("/display/pci/thunderbolt-vga-hotplug",
+                       thunderbolt_vga_hotplug);
     }
 
     return g_test_run();
