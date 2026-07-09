@@ -376,6 +376,8 @@ typedef struct GraphicHwOps {
 QemuConsole *graphic_console_init(DeviceState *dev, uint32_t head,
                                   const GraphicHwOps *ops,
                                   void *opaque);
+typedef void (*GraphicConsoleInitHook)(QemuConsole *con);
+void graphic_console_add_init_hook(GraphicConsoleInitHook hook);
 void graphic_console_set_hwops(QemuConsole *con,
                                const GraphicHwOps *hw_ops,
                                void *opaque);
@@ -413,6 +415,7 @@ void qemu_console_set_window_id(QemuConsole *con, int window_id);
 
 void qemu_console_resize(QemuConsole *con, int width, int height);
 DisplaySurface *qemu_console_surface(QemuConsole *con);
+DisplaySurface *qemu_console_surface_for_screendump(QemuConsole *con);
 void coroutine_fn qemu_console_co_wait_update(QemuConsole *con);
 int qemu_invalidate_text_consoles(void);
 

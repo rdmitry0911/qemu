@@ -174,12 +174,16 @@ static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
             timer_free(gl->print_stats);
         }
         timer_free(gl->fence_poll);
+        virgl_renderer_force_ctx_0();
+        virtio_gpu_virgl_reset_scanout(g);
+        virgl_renderer_force_ctx_0();
         virgl_renderer_cleanup(NULL);
     }
 
     gl->renderer_state = RS_START;
 
-    g_array_unref(g->capset_ids);
+    g_clear_pointer(&g->capset_ids, g_array_unref);
+    virtio_gpu_device_unrealize(qdev);
 }
 
 static void virtio_gpu_gl_class_init(ObjectClass *klass, const void *data)
@@ -209,9 +213,25 @@ static const TypeInfo virtio_gpu_gl_info = {
 module_obj(TYPE_VIRTIO_GPU_GL);
 module_kconfig(VIRTIO_GPU);
 
+static void thunderbolt_virtio_gpu_gl_class_init(ObjectClass *klass,
+                                                 const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->hotpluggable = true;
+}
+
+static const TypeInfo thunderbolt_virtio_gpu_gl_info = {
+    .name = TYPE_THUNDERBOLT_VIRTIO_GPU_GL,
+    .parent = TYPE_VIRTIO_GPU_GL,
+    .class_init = thunderbolt_virtio_gpu_gl_class_init,
+};
+module_obj(TYPE_THUNDERBOLT_VIRTIO_GPU_GL);
+
 static void virtio_register_types(void)
 {
     type_register_static(&virtio_gpu_gl_info);
+    type_register_static(&thunderbolt_virtio_gpu_gl_info);
 }
 
 type_init(virtio_register_types)

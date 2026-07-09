@@ -362,7 +362,7 @@ qmp_screendump(const char *filename, const char *device,
      * further graphic update are possible until it is released.  Take
      * an image ref before that.
      */
-    surface = qemu_console_surface(con);
+    surface = qemu_console_surface_for_screendump(con);
     if (!surface) {
         error_setg(errp, "no surface");
         return;

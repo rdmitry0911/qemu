@@ -872,6 +872,8 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
 }
 #endif
 
+static void virtio_gpu_virgl_release_current(VirtIOGPU *g);
+
 void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
                                       struct virtio_gpu_ctrl_command *cmd)
 {
@@ -960,16 +962,19 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
     }
 
     if (cmd_suspended || cmd->finished) {
+        virtio_gpu_virgl_release_current(g);
         return;
     }
     if (cmd->error) {
         fprintf(stderr, "%s: ctrl 0x%x, error 0x%x\n", __func__,
                 cmd->cmd_hdr.type, cmd->error);
         virtio_gpu_ctrl_response_nodata(g, cmd, cmd->error);
+        virtio_gpu_virgl_release_current(g);
         return;
     }
     if (!(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
         virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
+        virtio_gpu_virgl_release_current(g);
         return;
     }
 
@@ -980,10 +985,12 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
                                             VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
                                             cmd->cmd_hdr.ring_idx,
                                             cmd->cmd_hdr.fence_id);
+        virtio_gpu_virgl_release_current(g);
         return;
     }
 #endif
     virgl_renderer_create_fence(cmd->cmd_hdr.fence_id, cmd->cmd_hdr.type);
+    virtio_gpu_virgl_release_current(g);
 }
 
 static void virgl_write_fence(void *opaque, uint32_t fence)
@@ -1071,6 +1078,17 @@ static int virgl_make_context_current(void *opaque, int scanout_idx,
                                    qctx);
 }
 
+static void virtio_gpu_virgl_release_current(VirtIOGPU *g)
+{
+    QemuConsole *con = g->parent_obj.scanout[0].con;
+
+    if (!con) {
+        return;
+    }
+
+    dpy_gl_ctx_make_current(con, NULL);
+}
+
 static struct virgl_renderer_callbacks virtio_gpu_3d_cbs = {
 #if VIRGL_VERSION_MAJOR >= 1
     .version             = 3,
@@ -1113,6 +1131,7 @@ static void virtio_gpu_fence_poll(void *opaque)
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
 
     virgl_renderer_poll();
+    virtio_gpu_virgl_release_current(g);
     virtio_gpu_process_cmdq(g);
     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
         timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);

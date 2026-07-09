@@ -1020,8 +1020,12 @@ static uint16_t pcie_find_capability_list(PCIDevice *dev, uint32_t cap_id,
     for (next = PCI_CONFIG_SPACE_SIZE; next;
          prev = next, next = PCI_EXT_CAP_NEXT(header)) {
 
-        assert(next >= PCI_CONFIG_SPACE_SIZE);
-        assert(next <= PCIE_CONFIG_SPACE_SIZE - 8);
+        if (next < PCI_CONFIG_SPACE_SIZE ||
+            next > PCIE_CONFIG_SPACE_SIZE - 8 ||
+            (next & (PCI_EXT_CAP_ALIGN - 1))) {
+            next = 0;
+            break;
+        }
 
         header = pci_get_long(dev->config + next);
         if (PCI_EXT_CAP_ID(header) == cap_id) {

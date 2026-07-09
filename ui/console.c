@@ -1176,6 +1176,25 @@ void graphic_console_set_hwops(QemuConsole *con,
     con->hw = opaque;
 }
 
+static GList *graphic_console_init_hooks;
+
+void graphic_console_add_init_hook(GraphicConsoleInitHook hook)
+{
+    graphic_console_init_hooks = g_list_prepend(graphic_console_init_hooks,
+                                                (gpointer)hook);
+}
+
+static void graphic_console_run_init_hooks(QemuConsole *con)
+{
+    GList *l;
+
+    for (l = graphic_console_init_hooks; l; l = l->next) {
+        GraphicConsoleInitHook hook = (GraphicConsoleInitHook)l->data;
+
+        hook(con);
+    }
+}
+
 QemuConsole *graphic_console_init(DeviceState *dev, uint32_t head,
                                   const GraphicHwOps *hw_ops,
                                   void *opaque)
@@ -1207,6 +1226,7 @@ QemuConsole *graphic_console_init(DeviceState *dev, uint32_t head,
     dpy_gfx_replace_surface(s, surface);
     s->gl_unblock_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
                                        graphic_hw_gl_unblock_timer, s);
+    graphic_console_run_init_hooks(s);
     return s;
 }
 
@@ -1490,6 +1510,24 @@ DisplaySurface *qemu_console_surface(QemuConsole *console)
     switch (console->scanout.kind) {
     case SCANOUT_SURFACE:
         return console->surface;
+    default:
+        return NULL;
+    }
+}
+
+DisplaySurface *qemu_console_surface_for_screendump(QemuConsole *console)
+{
+    switch (console->scanout.kind) {
+    case SCANOUT_SURFACE:
+        return console->surface;
+    case SCANOUT_TEXTURE:
+    case SCANOUT_DMABUF:
+        if (console->surface &&
+            surface_is_allocated(console->surface) &&
+            !surface_is_placeholder(console->surface)) {
+            return console->surface;
+        }
+        return NULL;
     default:
         return NULL;
     }
