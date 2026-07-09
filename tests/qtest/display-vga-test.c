@@ -11,6 +11,20 @@
 #include "libqtest.h"
 #include "qobject/qdict.h"
 
+static void assert_qom_uint(QTestState *qts, const char *path,
+                            const char *property, uint64_t expected)
+{
+    QDict *rsp;
+
+    rsp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': {"
+                          "'path': %s,"
+                          "'property': %s"
+                          "} }", path, property);
+    g_assert(qdict_haskey(rsp, "return"));
+    g_assert_cmpuint(qdict_get_uint(rsp, "return"), ==, expected);
+    qobject_unref(rsp);
+}
+
 static void pci_multihead(void)
 {
     QTestState *qts;
@@ -48,12 +62,18 @@ static void thunderbolt_vga_hotplug(void)
                           "'driver': 'thunderbolt-vga',"
                           "'id': 'tbvga0',"
                           "'bus': 'tbrp0',"
-                          "'addr': '0x00',"
-                          "'vgamem_mb': 64"
+                          "'addr': '0x00'"
                           "} }");
     g_assert(qdict_haskey(rsp, "return"));
     g_assert(!qdict_haskey(rsp, "error"));
     qobject_unref(rsp);
+
+    assert_qom_uint(qts, "/machine/peripheral/tbvga0", "vgamem_mb", 4);
+    assert_qom_uint(qts, "/machine/peripheral/tbvga0", "xres", 1280);
+    assert_qom_uint(qts, "/machine/peripheral/tbvga0", "yres", 800);
+    assert_qom_uint(qts, "/machine/peripheral/tbvga0", "xmax", 1280);
+    assert_qom_uint(qts, "/machine/peripheral/tbvga0", "ymax", 800);
+    assert_qom_uint(qts, "/machine/peripheral/tbvga0", "refresh_rate", 60000);
 
     qtest_quit(qts);
 }
