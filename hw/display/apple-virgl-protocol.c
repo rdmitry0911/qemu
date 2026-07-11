@@ -57,6 +57,51 @@ static bool apple_virgl_protocol_validate_exec3(const uint8_t *payload,
     return true;
 }
 
+static bool apple_virgl_protocol_validate_object_list(
+    const AppleVirglSubmitMappingV1 *mappings,
+    uint32_t mapping_count,
+    const uint8_t *payload,
+    uint32_t payload_bytes,
+    Error **errp)
+{
+    uint32_t heap_pfn;
+    uint32_t heap_length;
+    uint64_t heap_va;
+
+    if (payload_bytes != 12) {
+        error_setg(errp,
+                   "apple-virgl SET_OBJECT_LIST payload must be 12 bytes");
+        return false;
+    }
+    if (ldl_le_p(payload) == 0) {
+        error_setg(errp, "apple-virgl SET_OBJECT_LIST task ID is zero");
+        return false;
+    }
+    if (mapping_count != 1) {
+        error_setg(errp,
+                   "apple-virgl SET_OBJECT_LIST requires exactly one mapping");
+        return false;
+    }
+
+    heap_pfn = ldl_le_p(payload + 4);
+    heap_length = ldl_le_p(payload + 8);
+    heap_va = (uint64_t)heap_pfn << 12;
+    if (heap_pfn == 0 || heap_length == 0 || (heap_length & 0xfff) != 0) {
+        error_setg(errp,
+                   "apple-virgl SET_OBJECT_LIST heap range is invalid");
+        return false;
+    }
+    if (le64_to_cpu(mappings[0].gpu_va) != heap_va ||
+        le64_to_cpu(mappings[0].length) != heap_length ||
+        le32_to_cpu(mappings[0].backing_offset) != 0 ||
+        le32_to_cpu(mappings[0].apple_resource_id) != 0) {
+        error_setg(errp,
+                   "apple-virgl SET_OBJECT_LIST mapping does not match its heap");
+        return false;
+    }
+    return true;
+}
+
 bool apple_virgl_protocol_decode_submit(const void *bytes,
                                         size_t size,
                                         AppleVirglSubmitView *view,
@@ -65,6 +110,7 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     const AppleVirglSubmitHeaderV1 *header = bytes;
     uint32_t mapping_count;
     uint32_t payload_bytes;
+    uint16_t opcode;
     uint64_t mapping_bytes;
     uint64_t expected;
     const uint8_t *payload;
@@ -89,7 +135,9 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         error_setg(errp, "apple-virgl submit version is unsupported");
         return false;
     }
-    if (le16_to_cpu(header->opcode) != APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3) {
+    opcode = le16_to_cpu(header->opcode);
+    if (opcode != APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3 &&
+        opcode != APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST) {
         error_setg(errp, "apple-virgl submit opcode is unsupported");
         return false;
     }
@@ -131,8 +179,21 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     }
 
     payload = (const uint8_t *)bytes + sizeof(*header) + mapping_bytes;
-    if (!apple_virgl_protocol_validate_exec3(payload, payload_bytes, errp)) {
-        return false;
+    switch (opcode) {
+    case APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3:
+        if (!apple_virgl_protocol_validate_exec3(payload, payload_bytes,
+                                                  errp)) {
+            return false;
+        }
+        break;
+    case APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST:
+        if (!apple_virgl_protocol_validate_object_list(
+                mappings, mapping_count, payload, payload_bytes, errp)) {
+            return false;
+        }
+        break;
+    default:
+        g_assert_not_reached();
     }
 
     view->header = header;

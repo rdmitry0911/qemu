@@ -19,6 +19,7 @@
 #include "qmu/qmetal_unified.h"
 
 #define APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3 0x2b
+#define APPLE_VIRGL_QMU_ROOT_SET_OBJECT_LIST 0x33
 
 typedef struct AppleVirglResourceState {
     uint32_t resource_id;
@@ -542,6 +543,8 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     uint32_t index;
     qmu_status status;
     uint64_t submit;
+    uint16_t opcode;
+    uint32_t root_opcode;
 
     if (!bridge || !bridge->session || context_id == 0 ||
         !apple_virgl_protocol_decode_submit(bytes, size, &view, &local_err)) {
@@ -553,6 +556,17 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     if (ldl_le_p(view.payload) != context_id) {
         error_report("apple-virgl submit task/context mismatch: %u/%u",
                      ldl_le_p(view.payload), context_id);
+        return -1;
+    }
+    opcode = le16_to_cpu(view.header->opcode);
+    switch (opcode) {
+    case APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3:
+        root_opcode = APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3;
+        break;
+    case APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST:
+        root_opcode = APPLE_VIRGL_QMU_ROOT_SET_OBJECT_LIST;
+        break;
+    default:
         return -1;
     }
 
@@ -636,12 +650,12 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     if (submit <= 64) {
         fprintf(stderr,
                 "apple-virgl-qemu: submit=%" PRIu64
-                " context=%u mappings=%u payload=%u hash=0x%08x\n",
-                submit, context_id, view.mapping_count, view.payload_bytes,
+                " context=%u opcode=%u mappings=%u payload=%u hash=0x%08x\n",
+                submit, context_id, opcode, view.mapping_count,
+                view.payload_bytes,
                 apple_virgl_fnv1a(view.payload, view.payload_bytes));
     }
-    status = qmu_submit_root_fifo(bridge->session,
-                                  APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3,
+    status = qmu_submit_root_fifo(bridge->session, root_opcode,
                                   view.payload, view.payload_bytes);
     return status == QMU_OK ? 0 : -1;
 }

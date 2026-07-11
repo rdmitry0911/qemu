@@ -19,6 +19,14 @@ typedef struct QEMU_PACKED OneMappingSubmit {
     uint64_t command_length;
 } OneMappingSubmit;
 
+typedef struct QEMU_PACKED ObjectListSubmit {
+    AppleVirglSubmitHeaderV1 header;
+    AppleVirglSubmitMappingV1 mapping;
+    uint32_t task_id;
+    uint32_t heap_pfn;
+    uint32_t heap_length;
+} ObjectListSubmit;
+
 static OneMappingSubmit valid_submit(void)
 {
     OneMappingSubmit submit = {
@@ -42,6 +50,29 @@ static OneMappingSubmit valid_submit(void)
         .command_count = cpu_to_le32(1),
         .command_gpu_va = cpu_to_le64(0x4000),
         .command_length = cpu_to_le64(600),
+    };
+
+    return submit;
+}
+
+static ObjectListSubmit valid_object_list_submit(void)
+{
+    ObjectListSubmit submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .opcode = cpu_to_le16(APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST),
+            .mapping_count = cpu_to_le32(1),
+            .payload_bytes = cpu_to_le32(12),
+        },
+        .mapping = {
+            .gpu_va = cpu_to_le64(0x12345000),
+            .length = cpu_to_le64(0x100000),
+            .backing_resource_id = cpu_to_le32(23),
+        },
+        .task_id = cpu_to_le32(3),
+        .heap_pfn = cpu_to_le32(0x12345),
+        .heap_length = cpu_to_le32(0x100000),
     };
 
     return submit;
@@ -141,6 +172,56 @@ static void test_mapping_backing_resource_id(void)
     assert_rejected(&submit, sizeof(submit));
 }
 
+static void test_valid_object_list(void)
+{
+    ObjectListSubmit submit = valid_object_list_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(le16_to_cpu(view.header->opcode), ==,
+                     APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST);
+    g_assert_cmpuint(view.mapping_count, ==, 1);
+}
+
+static void test_object_list_size(void)
+{
+    ObjectListSubmit submit = valid_object_list_submit();
+    submit.header.payload_bytes = cpu_to_le32(8);
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_object_list_task(void)
+{
+    ObjectListSubmit submit = valid_object_list_submit();
+    submit.task_id = 0;
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_object_list_heap_alignment(void)
+{
+    ObjectListSubmit submit = valid_object_list_submit();
+    submit.heap_length = cpu_to_le32(0x100001);
+    submit.mapping.length = cpu_to_le64(0x100001);
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_object_list_mapping(void)
+{
+    ObjectListSubmit submit = valid_object_list_submit();
+    submit.mapping.gpu_va = cpu_to_le64(0x12346000);
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_object_list_mapping_count(void)
+{
+    ObjectListSubmit submit = valid_object_list_submit();
+    submit.header.mapping_count = 0;
+    assert_rejected(&submit, sizeof(submit));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -158,5 +239,17 @@ int main(int argc, char **argv)
                     test_transport_only_mapping);
     g_test_add_func("/apple-virgl/protocol/mapping-backing-resource-id",
                     test_mapping_backing_resource_id);
+    g_test_add_func("/apple-virgl/protocol/object-list-valid",
+                    test_valid_object_list);
+    g_test_add_func("/apple-virgl/protocol/object-list-size",
+                    test_object_list_size);
+    g_test_add_func("/apple-virgl/protocol/object-list-task",
+                    test_object_list_task);
+    g_test_add_func("/apple-virgl/protocol/object-list-heap-alignment",
+                    test_object_list_heap_alignment);
+    g_test_add_func("/apple-virgl/protocol/object-list-mapping",
+                    test_object_list_mapping);
+    g_test_add_func("/apple-virgl/protocol/object-list-mapping-count",
+                    test_object_list_mapping_count);
     return g_test_run();
 }
