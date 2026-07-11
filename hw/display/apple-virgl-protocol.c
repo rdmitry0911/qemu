@@ -229,9 +229,9 @@ static bool apple_virgl_protocol_validate_compute_info(
                    "apple-virgl GET_COMPUTE_INFO payload must be 24 bytes");
         return false;
     }
-    if (mapping_count != 2) {
+    if (mapping_count < 1 || mapping_count > 2) {
         error_setg(errp,
-                   "apple-virgl GET_COMPUTE_INFO requires exactly two mappings");
+                   "apple-virgl GET_COMPUTE_INFO requires one or two mappings");
         return false;
     }
     if (ldl_le_p(payload) == 0 || ldl_le_p(payload + 4) == 0 ||
@@ -264,9 +264,9 @@ static bool apple_virgl_protocol_validate_compute_info(
             ++containing_mappings;
         }
     }
-    if (containing_mappings != 1) {
+    if (containing_mappings == 0) {
         error_setg(errp,
-                   "apple-virgl GET_COMPUTE_INFO reply range must belong to exactly one mapping");
+                   "apple-virgl GET_COMPUTE_INFO reply range is not mapped");
         return false;
     }
     return true;
