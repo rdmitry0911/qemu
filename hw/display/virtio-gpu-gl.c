@@ -19,6 +19,7 @@
 #include "system/system.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
+#include "hw/virtio/apple-virgl-bridge.h"
 #include "hw/virtio/virtio-gpu-bswap.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
 #include "hw/core/qdev-properties.h"
@@ -106,6 +107,7 @@ static void virtio_gpu_gl_reset(VirtIODevice *vdev)
     VirtIOGPU *g = VIRTIO_GPU(vdev);
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(vdev);
 
+    apple_virgl_bridge_reset(gl->apple_virgl_bridge);
     virtio_gpu_reset(vdev);
 
     /*
@@ -176,6 +178,8 @@ static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
         timer_free(gl->fence_poll);
         virgl_renderer_force_ctx_0();
         virtio_gpu_virgl_reset_scanout(g);
+        g_clear_pointer(&gl->apple_virgl_bridge,
+                        apple_virgl_bridge_free);
         virgl_renderer_force_ctx_0();
         virgl_renderer_cleanup(NULL);
     }

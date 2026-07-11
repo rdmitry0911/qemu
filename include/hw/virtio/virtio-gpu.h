@@ -247,6 +247,7 @@ struct VirtIOGPUGL {
     struct VirtIOGPU parent_obj;
 
     RenderState renderer_state;
+    struct AppleVirglBridge *apple_virgl_bridge;
 
     QEMUTimer *fence_poll;
     QEMUTimer *print_stats;

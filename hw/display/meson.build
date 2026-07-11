@@ -149,8 +149,15 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
 
   if virgl.found() and opengl.found()
     virtio_gpu_gl_ss = ss.source_set()
+    virtio_gpu_gl_sources = files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c')
+    virtio_gpu_gl_deps = [pixman, virgl]
+    if host_os == 'linux'
+      virtio_gpu_gl_sources += files('apple-virgl-protocol.c',
+                                     'apple-virgl-bridge.c')
+      virtio_gpu_gl_deps += mlapi_dep
+    endif
     virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl, opengl],
-                         if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c'), pixman, virgl])
+                         if_true: [virtio_gpu_gl_sources, virtio_gpu_gl_deps])
     hw_display_modules += {'virtio-gpu-gl': virtio_gpu_gl_ss}
   endif
 

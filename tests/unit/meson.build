@@ -48,6 +48,9 @@ tests = {
   'test-qapi-util': [],
   'test-interval-tree': [],
   'test-fifo': [],
+  'test-apple-virgl-protocol': [
+    meson.project_source_root() / 'hw/display/apple-virgl-protocol.c'
+  ],
 }
 
 if have_system or have_tools

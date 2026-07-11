@@ -17,6 +17,8 @@
 #include "trace.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
+#include "hw/virtio/apple-virgl-bridge.h"
+#include "hw/virtio/apple-virgl-protocol.h"
 #include "hw/virtio/virtio-gpu-bswap.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
 
@@ -27,7 +29,20 @@
 struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
     MemoryRegion *mr;
+    bool apple_virgl;
+    uint64_t apple_virgl_size;
 };
+
+static AppleVirglBridge *virtio_gpu_apple_virgl_bridge(VirtIOGPU *g,
+                                                       bool create)
+{
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+
+    if (create && !gl->apple_virgl_bridge) {
+        gl->apple_virgl_bridge = apple_virgl_bridge_new(g);
+    }
+    return gl->apple_virgl_bridge;
+}
 
 static struct virtio_gpu_virgl_resource *
 virtio_gpu_virgl_find_resource(VirtIOGPU *g, uint32_t resource_id)
@@ -40,6 +55,124 @@ virtio_gpu_virgl_find_resource(VirtIOGPU *g, uint32_t resource_id)
     }
 
     return container_of(res, struct virtio_gpu_virgl_resource, base);
+}
+
+static bool virtio_gpu_virgl_read_command(
+    struct virtio_gpu_ctrl_command *cmd, void *command, size_t size)
+{
+    return iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num,
+                      0, command, size) == size;
+}
+
+static bool virtio_gpu_virgl_is_apple_command(
+    VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
+{
+    AppleVirglBridge *bridge = virtio_gpu_apple_virgl_bridge(g, false);
+    struct virtio_gpu_virgl_resource *res;
+
+    switch (cmd->cmd_hdr.type) {
+    case VIRTIO_GPU_CMD_CTX_CREATE: {
+        struct virtio_gpu_ctx_create cc;
+
+        return virtio_gpu_virgl_read_command(cmd, &cc, sizeof(cc)) &&
+            (cc.context_init & VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK) ==
+                VIRTIO_GPU_CAPSET_APPLE_VIRGL;
+    }
+    case VIRTIO_GPU_CMD_CTX_DESTROY:
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
+    case VIRTIO_GPU_CMD_SUBMIT_3D:
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D:
+    case VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D:
+        return bridge &&
+            apple_virgl_bridge_has_context(bridge, cmd->cmd_hdr.ctx_id);
+    case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
+    case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE: {
+        struct virtio_gpu_ctx_resource cr;
+
+        if (!virtio_gpu_virgl_read_command(cmd, &cr, sizeof(cr))) {
+            return false;
+        }
+        res = virtio_gpu_virgl_find_resource(g, cr.resource_id);
+        return (bridge && apple_virgl_bridge_has_context(
+                    bridge, cr.hdr.ctx_id)) || (res && res->apple_virgl);
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
+        struct virtio_gpu_resource_unref unref;
+
+        if (!virtio_gpu_virgl_read_command(cmd, &unref, sizeof(unref))) {
+            return false;
+        }
+        res = virtio_gpu_virgl_find_resource(g, unref.resource_id);
+        return res && res->apple_virgl;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: {
+        struct virtio_gpu_resource_attach_backing attach;
+
+        if (!virtio_gpu_virgl_read_command(cmd, &attach, sizeof(attach))) {
+            return false;
+        }
+        res = virtio_gpu_virgl_find_resource(g, attach.resource_id);
+        return res && res->apple_virgl;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: {
+        struct virtio_gpu_resource_detach_backing detach;
+
+        if (!virtio_gpu_virgl_read_command(cmd, &detach, sizeof(detach))) {
+            return false;
+        }
+        res = virtio_gpu_virgl_find_resource(g, detach.resource_id);
+        return res && res->apple_virgl;
+    }
+    case VIRTIO_GPU_CMD_RESOURCE_FLUSH: {
+        struct virtio_gpu_resource_flush flush;
+
+        if (!virtio_gpu_virgl_read_command(cmd, &flush, sizeof(flush))) {
+            return false;
+        }
+        res = virtio_gpu_virgl_find_resource(g, flush.resource_id);
+        return res && res->apple_virgl;
+    }
+    case VIRTIO_GPU_CMD_SET_SCANOUT: {
+        struct virtio_gpu_set_scanout scanout;
+
+        if (!virtio_gpu_virgl_read_command(cmd, &scanout, sizeof(scanout))) {
+            return false;
+        }
+        res = virtio_gpu_virgl_find_resource(g, scanout.resource_id);
+        return res && res->apple_virgl;
+    }
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: {
+        struct virtio_gpu_transfer_to_host_2d transfer;
+
+        if (!virtio_gpu_virgl_read_command(cmd, &transfer,
+                                           sizeof(transfer))) {
+            return false;
+        }
+        res = virtio_gpu_virgl_find_resource(g, transfer.resource_id);
+        return res && res->apple_virgl;
+    }
+    case VIRTIO_GPU_CMD_GET_CAPSET: {
+        struct virtio_gpu_get_capset capset;
+
+        return virtio_gpu_virgl_read_command(cmd, &capset, sizeof(capset)) &&
+            capset.capset_id == VIRTIO_GPU_CAPSET_APPLE_VIRGL;
+    }
+    case VIRTIO_GPU_CMD_GET_CAPSET_INFO: {
+        struct virtio_gpu_get_capset_info info;
+
+        return virtio_gpu_virgl_read_command(cmd, &info, sizeof(info)) &&
+            info.capset_index < g->capset_ids->len &&
+            g_array_index(g->capset_ids, uint32_t, info.capset_index) ==
+                VIRTIO_GPU_CAPSET_APPLE_VIRGL;
+    }
+#if VIRGL_VERSION_MAJOR >= 1
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
+        return bridge &&
+            apple_virgl_bridge_has_context(bridge, cmd->cmd_hdr.ctx_id);
+#endif
+    default:
+        return false;
+    }
 }
 
 #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
@@ -247,6 +380,7 @@ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
     struct virtio_gpu_resource_create_3d c3d;
     struct virgl_renderer_resource_create_args args;
     struct virtio_gpu_virgl_resource *res;
+    AppleVirglBridge *bridge;
 
     VIRTIO_GPU_FILL_CMD(c3d);
     trace_virtio_gpu_cmd_res_create_3d(c3d.resource_id, c3d.format,
@@ -264,6 +398,37 @@ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
                       __func__, c3d.resource_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+        return;
+    }
+
+    bridge = virtio_gpu_apple_virgl_bridge(g, false);
+    if (bridge && apple_virgl_bridge_has_context(bridge, c3d.hdr.ctx_id)) {
+        if ((c3d.hdr.flags & VIRTIO_GPU_FLAG_FENCE) ||
+            c3d.target != 0 || c3d.format != 0 || c3d.bind != 0 ||
+            c3d.width == 0 || c3d.height != 1 || c3d.depth != 1 ||
+            c3d.array_size != 1 || c3d.last_level != 0 ||
+            c3d.nr_samples != 0 || c3d.flags != 0 || c3d.padding != 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: invalid apple-virgl byte resource %u\n",
+                          __func__, c3d.resource_id);
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+
+        res = g_new0(struct virtio_gpu_virgl_resource, 1);
+        res->base.width = c3d.width;
+        res->base.height = 1;
+        res->base.resource_id = c3d.resource_id;
+        res->base.dmabuf_fd = -1;
+        res->apple_virgl = true;
+        res->apple_virgl_size = c3d.width;
+        if (apple_virgl_bridge_resource_create(bridge, c3d.resource_id,
+                                               c3d.width) != 0) {
+            g_free(res);
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            return;
+        }
+        QTAILQ_INSERT_HEAD(&g->reslist, &res->base, next);
         return;
     }
 
@@ -309,6 +474,23 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
         return;
     }
 
+    if (res->apple_virgl) {
+        AppleVirglBridge *bridge =
+            virtio_gpu_apple_virgl_bridge(g, false);
+
+        if (!bridge || (unref.hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+        apple_virgl_bridge_resource_destroy(bridge, unref.resource_id);
+        if (res->base.iov) {
+            virtio_gpu_cleanup_mapping(g, &res->base);
+        }
+        QTAILQ_REMOVE(&g->reslist, &res->base, next);
+        g_free(res);
+        return;
+    }
+
 #if VIRGL_VERSION_MAJOR >= 1
     if (virtio_gpu_virgl_unmap_resource_blob(g, res, cmd_suspended)) {
         cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -336,10 +518,28 @@ static void virgl_cmd_context_create(VirtIOGPU *g,
                                      struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_ctx_create cc;
+    AppleVirglBridge *bridge;
 
     VIRTIO_GPU_FILL_CMD(cc);
     trace_virtio_gpu_cmd_ctx_create(cc.hdr.ctx_id,
                                     cc.debug_name);
+
+    if ((cc.context_init & VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK) ==
+        VIRTIO_GPU_CAPSET_APPLE_VIRGL) {
+        if (cc.context_init != VIRTIO_GPU_CAPSET_APPLE_VIRGL ||
+            cc.hdr.ctx_id == 0 || cc.nlen > sizeof(cc.debug_name) ||
+            (cc.hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+        bridge = virtio_gpu_apple_virgl_bridge(g, true);
+        if (!bridge ||
+            apple_virgl_bridge_context_create(bridge, cc.hdr.ctx_id,
+                                              cc.debug_name, cc.nlen) != 0) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        }
+        return;
+    }
 
     if (cc.context_init) {
         if (!virtio_gpu_context_init_enabled(g->parent_obj.conf)) {
@@ -365,9 +565,22 @@ static void virgl_cmd_context_destroy(VirtIOGPU *g,
                                       struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_ctx_destroy cd;
+    AppleVirglBridge *bridge;
 
     VIRTIO_GPU_FILL_CMD(cd);
     trace_virtio_gpu_cmd_ctx_destroy(cd.hdr.ctx_id);
+
+    bridge = virtio_gpu_apple_virgl_bridge(g, false);
+    if (bridge && apple_virgl_bridge_has_context(bridge, cd.hdr.ctx_id)) {
+        if (cd.hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+        if (apple_virgl_bridge_context_destroy(bridge, cd.hdr.ctx_id) != 0) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        }
+        return;
+    }
 
     virgl_renderer_context_destroy(cd.hdr.ctx_id);
 }
@@ -386,11 +599,18 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
                                      struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_resource_flush rf;
+    struct virtio_gpu_virgl_resource *res;
     int i;
 
     VIRTIO_GPU_FILL_CMD(rf);
     trace_virtio_gpu_cmd_res_flush(rf.resource_id,
                                    rf.r.width, rf.r.height, rf.r.x, rf.r.y);
+
+    res = virtio_gpu_virgl_find_resource(g, rf.resource_id);
+    if (res && res->apple_virgl) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
 
     for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
         if (g->parent_obj.scanout[i].resource_id != rf.resource_id) {
@@ -404,6 +624,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
                                   struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_set_scanout ss;
+    struct virtio_gpu_virgl_resource *res;
     int ret;
 
     VIRTIO_GPU_FILL_CMD(ss);
@@ -414,6 +635,11 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal scanout id specified %d",
                       __func__, ss.scanout_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
+        return;
+    }
+    res = virtio_gpu_virgl_find_resource(g, ss.resource_id);
+    if (res && res->apple_virgl) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
         return;
     }
     g->parent_obj.enable = 1;
@@ -460,13 +686,30 @@ static void virgl_cmd_submit_3d(VirtIOGPU *g,
                                 struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_cmd_submit cs;
+    AppleVirglBridge *bridge;
+    bool apple_context;
     void *buf;
     size_t s;
 
     VIRTIO_GPU_FILL_CMD(cs);
     trace_virtio_gpu_cmd_ctx_submit(cs.hdr.ctx_id, cs.size);
 
-    buf = g_malloc(cs.size);
+    bridge = virtio_gpu_apple_virgl_bridge(g, false);
+    apple_context = bridge &&
+        apple_virgl_bridge_has_context(bridge, cs.hdr.ctx_id);
+    if (apple_context &&
+        ((cs.hdr.flags & VIRTIO_GPU_FLAG_FENCE) ||
+         cs.size < sizeof(AppleVirglSubmitHeaderV1) ||
+         cs.size > APPLE_VIRGL_MAX_SUBMIT_BYTES)) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
+
+    buf = apple_context ? g_try_malloc(cs.size) : g_malloc(cs.size);
+    if (!buf) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+        return;
+    }
     s = iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num,
                    sizeof(cs), buf, cs.size);
     if (s != cs.size) {
@@ -481,7 +724,14 @@ static void virgl_cmd_submit_3d(VirtIOGPU *g,
         g->stats.bytes_3d += cs.size;
     }
 
-    virgl_renderer_submit_cmd(buf, cs.hdr.ctx_id, cs.size / 4);
+    if (apple_context) {
+        if (apple_virgl_bridge_submit(bridge, cs.hdr.ctx_id,
+                                      buf, cs.size) != 0) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        }
+    } else {
+        virgl_renderer_submit_cmd(buf, cs.hdr.ctx_id, cs.size / 4);
+    }
 
 out:
     g_free(buf);
@@ -491,10 +741,17 @@ static void virgl_cmd_transfer_to_host_2d(VirtIOGPU *g,
                                           struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_transfer_to_host_2d t2d;
+    struct virtio_gpu_virgl_resource *res;
     struct virtio_gpu_box box;
 
     VIRTIO_GPU_FILL_CMD(t2d);
     trace_virtio_gpu_cmd_res_xfer_toh_2d(t2d.resource_id);
+
+    res = virtio_gpu_virgl_find_resource(g, t2d.resource_id);
+    if (res && res->apple_virgl) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
 
     box.x = t2d.r.x;
     box.y = t2d.r.y;
@@ -516,9 +773,19 @@ static void virgl_cmd_transfer_to_host_3d(VirtIOGPU *g,
                                           struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_transfer_host_3d t3d;
+    struct virtio_gpu_virgl_resource *res;
+    AppleVirglBridge *bridge;
 
     VIRTIO_GPU_FILL_CMD(t3d);
     trace_virtio_gpu_cmd_res_xfer_toh_3d(t3d.resource_id);
+
+    res = virtio_gpu_virgl_find_resource(g, t3d.resource_id);
+    bridge = virtio_gpu_apple_virgl_bridge(g, false);
+    if ((res && res->apple_virgl) ||
+        (bridge && apple_virgl_bridge_has_context(bridge, t3d.hdr.ctx_id))) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
 
     virgl_renderer_transfer_write_iov(t3d.resource_id,
                                       t3d.hdr.ctx_id,
@@ -534,9 +801,19 @@ virgl_cmd_transfer_from_host_3d(VirtIOGPU *g,
                                 struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_transfer_host_3d tf3d;
+    struct virtio_gpu_virgl_resource *res;
+    AppleVirglBridge *bridge;
 
     VIRTIO_GPU_FILL_CMD(tf3d);
     trace_virtio_gpu_cmd_res_xfer_fromh_3d(tf3d.resource_id);
+
+    res = virtio_gpu_virgl_find_resource(g, tf3d.resource_id);
+    bridge = virtio_gpu_apple_virgl_bridge(g, false);
+    if ((res && res->apple_virgl) ||
+        (bridge && apple_virgl_bridge_has_context(bridge, tf3d.hdr.ctx_id))) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
 
     virgl_renderer_transfer_read_iov(tf3d.resource_id,
                                      tf3d.hdr.ctx_id,
@@ -552,12 +829,41 @@ static void virgl_resource_attach_backing(VirtIOGPU *g,
                                           struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_resource_attach_backing att_rb;
+    struct virtio_gpu_virgl_resource *res;
     struct iovec *res_iovs;
     uint32_t res_niov;
     int ret;
 
     VIRTIO_GPU_FILL_CMD(att_rb);
     trace_virtio_gpu_cmd_res_back_attach(att_rb.resource_id);
+
+    res = virtio_gpu_virgl_find_resource(g, att_rb.resource_id);
+    if (res && res->apple_virgl) {
+        AppleVirglBridge *bridge =
+            virtio_gpu_apple_virgl_bridge(g, false);
+
+        if (!bridge || res->base.iov ||
+            (att_rb.hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+        ret = virtio_gpu_create_mapping_iov(g, att_rb.nr_entries,
+                                            sizeof(att_rb), cmd,
+                                            &res->base.addrs, &res->base.iov,
+                                            &res->base.iov_cnt);
+        if (ret < 0 ||
+            iov_size(res->base.iov, res->base.iov_cnt) !=
+                res->apple_virgl_size ||
+            apple_virgl_bridge_resource_attach_backing(
+                bridge, att_rb.resource_id, res->base.addrs, res->base.iov,
+                res->base.iov_cnt) != 0) {
+            if (res->base.iov) {
+                virtio_gpu_cleanup_mapping(g, &res->base);
+            }
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+        }
+        return;
+    }
 
     ret = virtio_gpu_create_mapping_iov(g, att_rb.nr_entries, sizeof(att_rb),
                                         cmd, NULL, &res_iovs, &res_niov);
@@ -577,11 +883,28 @@ static void virgl_resource_detach_backing(VirtIOGPU *g,
                                           struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_resource_detach_backing detach_rb;
+    struct virtio_gpu_virgl_resource *res;
     struct iovec *res_iovs = NULL;
     int num_iovs = 0;
 
     VIRTIO_GPU_FILL_CMD(detach_rb);
     trace_virtio_gpu_cmd_res_back_detach(detach_rb.resource_id);
+
+    res = virtio_gpu_virgl_find_resource(g, detach_rb.resource_id);
+    if (res && res->apple_virgl) {
+        AppleVirglBridge *bridge =
+            virtio_gpu_apple_virgl_bridge(g, false);
+
+        if (!bridge || !res->base.iov ||
+            (detach_rb.hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+        apple_virgl_bridge_resource_detach_backing(bridge,
+                                                   detach_rb.resource_id);
+        virtio_gpu_cleanup_mapping(g, &res->base);
+        return;
+    }
 
     virgl_renderer_resource_detach_iov(detach_rb.resource_id,
                                        &res_iovs,
@@ -597,10 +920,27 @@ static void virgl_cmd_ctx_attach_resource(VirtIOGPU *g,
                                           struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_ctx_resource att_res;
+    struct virtio_gpu_virgl_resource *res;
+    AppleVirglBridge *bridge;
+    bool apple_context;
 
     VIRTIO_GPU_FILL_CMD(att_res);
     trace_virtio_gpu_cmd_ctx_res_attach(att_res.hdr.ctx_id,
                                         att_res.resource_id);
+
+    bridge = virtio_gpu_apple_virgl_bridge(g, false);
+    apple_context = bridge &&
+        apple_virgl_bridge_has_context(bridge, att_res.hdr.ctx_id);
+    res = virtio_gpu_virgl_find_resource(g, att_res.resource_id);
+    if (apple_context || (res && res->apple_virgl)) {
+        if (!apple_context || !res || !res->apple_virgl ||
+            (att_res.hdr.flags & VIRTIO_GPU_FLAG_FENCE) ||
+            apple_virgl_bridge_context_attach_resource(
+                bridge, att_res.hdr.ctx_id, att_res.resource_id) != 0) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        }
+        return;
+    }
 
     virgl_renderer_ctx_attach_resource(att_res.hdr.ctx_id, att_res.resource_id);
 }
@@ -609,10 +949,27 @@ static void virgl_cmd_ctx_detach_resource(VirtIOGPU *g,
                                           struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_ctx_resource det_res;
+    struct virtio_gpu_virgl_resource *res;
+    AppleVirglBridge *bridge;
+    bool apple_context;
 
     VIRTIO_GPU_FILL_CMD(det_res);
     trace_virtio_gpu_cmd_ctx_res_detach(det_res.hdr.ctx_id,
                                         det_res.resource_id);
+
+    bridge = virtio_gpu_apple_virgl_bridge(g, false);
+    apple_context = bridge &&
+        apple_virgl_bridge_has_context(bridge, det_res.hdr.ctx_id);
+    res = virtio_gpu_virgl_find_resource(g, det_res.resource_id);
+    if (apple_context || (res && res->apple_virgl)) {
+        if (!apple_context || !res || !res->apple_virgl ||
+            (det_res.hdr.flags & VIRTIO_GPU_FLAG_FENCE) ||
+            apple_virgl_bridge_context_detach_resource(
+                bridge, det_res.hdr.ctx_id, det_res.resource_id) != 0) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        }
+        return;
+    }
 
     virgl_renderer_ctx_detach_resource(det_res.hdr.ctx_id, det_res.resource_id);
 }
@@ -630,9 +987,14 @@ static void virgl_cmd_get_capset_info(VirtIOGPU *g,
     if (info.capset_index < g->capset_ids->len) {
         resp.capset_id = g_array_index(g->capset_ids, uint32_t,
                                        info.capset_index);
-        virgl_renderer_get_cap_set(resp.capset_id,
-                                   &resp.capset_max_version,
-                                   &resp.capset_max_size);
+        if (resp.capset_id == VIRTIO_GPU_CAPSET_APPLE_VIRGL) {
+            resp.capset_max_version = APPLE_VIRGL_PROTOCOL_VERSION;
+            resp.capset_max_size = sizeof(AppleVirglCapsetV1);
+        } else {
+            virgl_renderer_get_cap_set(resp.capset_id,
+                                       &resp.capset_max_version,
+                                       &resp.capset_max_size);
+        }
     }
     resp.hdr.type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
     virtio_gpu_ctrl_response(g, cmd, &resp.hdr, sizeof(resp));
@@ -645,6 +1007,23 @@ static void virgl_cmd_get_capset(VirtIOGPU *g,
     struct virtio_gpu_resp_capset *resp;
     uint32_t max_ver, max_size;
     VIRTIO_GPU_FILL_CMD(gc);
+
+    if (gc.capset_id == VIRTIO_GPU_CAPSET_APPLE_VIRGL) {
+        AppleVirglCapsetV1 capset;
+
+        if (gc.capset_version != APPLE_VIRGL_PROTOCOL_VERSION) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+        resp = g_malloc0(sizeof(*resp) + sizeof(capset));
+        resp->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET;
+        apple_virgl_protocol_fill_capset(&capset);
+        memcpy(resp->capset_data, &capset, sizeof(capset));
+        virtio_gpu_ctrl_response(g, cmd, &resp->hdr,
+                                 sizeof(*resp) + sizeof(capset));
+        g_free(resp);
+        return;
+    }
 
     virgl_renderer_get_cap_set(gc.capset_id, &max_ver,
                                &max_size);
@@ -878,10 +1257,14 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
                                       struct virtio_gpu_ctrl_command *cmd)
 {
     bool cmd_suspended = false;
+    bool apple_command;
 
     VIRTIO_GPU_FILL_CMD(cmd->cmd_hdr);
 
-    virgl_renderer_force_ctx_0();
+    apple_command = virtio_gpu_virgl_is_apple_command(g, cmd);
+    if (!apple_command) {
+        virgl_renderer_force_ctx_0();
+    }
     switch (cmd->cmd_hdr.type) {
     case VIRTIO_GPU_CMD_CTX_CREATE:
         virgl_cmd_context_create(g, cmd);
@@ -944,7 +1327,11 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
         break;
 #if VIRGL_VERSION_MAJOR >= 1
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
-        virgl_cmd_resource_create_blob(g, cmd);
+        if (apple_command) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        } else {
+            virgl_cmd_resource_create_blob(g, cmd);
+        }
         break;
     case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
         virgl_cmd_resource_map_blob(g, cmd);
@@ -1155,6 +1542,9 @@ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g)
 
 void virtio_gpu_virgl_reset(VirtIOGPU *g)
 {
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+
+    apple_virgl_bridge_reset(gl->apple_virgl_bridge);
     virgl_renderer_reset();
 }
 
@@ -1236,6 +1626,9 @@ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
             virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VENUS);
         }
     }
+
+    virtio_gpu_virgl_add_capset(capset_ids,
+                                VIRTIO_GPU_CAPSET_APPLE_VIRGL);
 
     return capset_ids;
 }
