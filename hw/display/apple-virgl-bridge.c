@@ -41,7 +41,9 @@ typedef struct AppleVirglMapping {
 } AppleVirglMapping;
 
 typedef struct AppleVirglContextState {
-    uint32_t context_id;
+    uint32_t transport_context_id;
+    uint32_t task_id;
+    bool task_bound;
     GHashTable *attached_resources;
     GArray *mappings;
 } AppleVirglContextState;
@@ -147,6 +149,23 @@ static bool apple_virgl_range_contains(uint64_t base, uint64_t length,
     return true;
 }
 
+static AppleVirglContextState *apple_virgl_context_for_task_locked(
+    AppleVirglBridge *bridge, uint32_t task_id)
+{
+    GHashTableIter iter;
+    gpointer value;
+
+    g_hash_table_iter_init(&iter, bridge->contexts);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        AppleVirglContextState *context = value;
+
+        if (context->task_bound && context->task_id == task_id) {
+            return context;
+        }
+    }
+    return NULL;
+}
+
 static int apple_virgl_read_gpu_memory(void *opaque, uint32_t task_id,
                                        uint64_t gpu_va, void *bytes, size_t size)
 {
@@ -156,8 +175,7 @@ static int apple_virgl_read_gpu_memory(void *opaque, uint32_t task_id,
     int result = -1;
 
     qemu_mutex_lock(&bridge->lock);
-    context = g_hash_table_lookup(bridge->contexts,
-                                  GUINT_TO_POINTER(task_id));
+    context = apple_virgl_context_for_task_locked(bridge, task_id);
     if (!context) {
         goto out;
     }
@@ -274,7 +292,9 @@ void apple_virgl_bridge_reset(AppleVirglBridge *bridge)
     while (g_hash_table_iter_next(&iter, NULL, &value)) {
         AppleVirglContextState *context = value;
 
-        qmu_destroy_task(bridge->session, context->context_id);
+        if (context->task_bound) {
+            qmu_destroy_task(bridge->session, context->task_id);
+        }
     }
     g_hash_table_remove_all(bridge->contexts);
     g_hash_table_remove_all(bridge->resources);
@@ -308,7 +328,7 @@ int apple_virgl_bridge_context_create(AppleVirglBridge *bridge,
         return -1;
     }
     context = g_new0(AppleVirglContextState, 1);
-    context->context_id = context_id;
+    context->transport_context_id = context_id;
     context->attached_resources = g_hash_table_new(g_direct_hash,
                                                     g_direct_equal);
     context->mappings = g_array_new(false, false, sizeof(AppleVirglMapping));
@@ -324,12 +344,8 @@ int apple_virgl_bridge_context_create(AppleVirglBridge *bridge,
                         context);
     qemu_mutex_unlock(&bridge->lock);
 
-    if (qmu_define_task(bridge->session, context_id, 0, 0) != QMU_OK) {
-        apple_virgl_bridge_context_destroy(bridge, context_id);
-        return -1;
-    }
     fprintf(stderr,
-            "apple-virgl-qemu: context-create id=%u name=%.*s\n",
+            "apple-virgl-qemu: context-create transport=%u name=%.*s\n",
             context_id, (int)name_length, name ? name : "");
     return 0;
 }
@@ -337,20 +353,30 @@ int apple_virgl_bridge_context_create(AppleVirglBridge *bridge,
 int apple_virgl_bridge_context_destroy(AppleVirglBridge *bridge,
                                        uint32_t context_id)
 {
-    bool removed;
+    AppleVirglContextState *context;
+    bool task_bound;
+    uint32_t task_id;
 
     if (!bridge || context_id == 0) {
         return -1;
     }
     qemu_mutex_lock(&bridge->lock);
-    removed = g_hash_table_remove(bridge->contexts,
+    context = g_hash_table_lookup(bridge->contexts,
                                   GUINT_TO_POINTER(context_id));
-    qemu_mutex_unlock(&bridge->lock);
-    if (!removed) {
+    if (!context) {
+        qemu_mutex_unlock(&bridge->lock);
         return -1;
     }
-    qmu_destroy_task(bridge->session, context_id);
-    fprintf(stderr, "apple-virgl-qemu: context-destroy id=%u\n", context_id);
+    task_bound = context->task_bound;
+    task_id = context->task_id;
+    g_hash_table_remove(bridge->contexts, GUINT_TO_POINTER(context_id));
+    qemu_mutex_unlock(&bridge->lock);
+    if (task_bound) {
+        qmu_destroy_task(bridge->session, task_id);
+    }
+    fprintf(stderr,
+            "apple-virgl-qemu: context-destroy transport=%u task=%s%u\n",
+            context_id, task_bound ? "" : "unbound/", task_id);
     return 0;
 }
 
@@ -557,6 +583,42 @@ static uint32_t apple_virgl_fnv1a(const void *bytes, size_t size)
     return hash;
 }
 
+static int apple_virgl_bridge_bind_task(AppleVirglBridge *bridge,
+                                        uint32_t context_id,
+                                        uint32_t task_id)
+{
+    AppleVirglContextState *context;
+
+    qemu_mutex_lock(&bridge->lock);
+    context = g_hash_table_lookup(bridge->contexts,
+                                  GUINT_TO_POINTER(context_id));
+    if (!context || context->task_bound ||
+        apple_virgl_context_for_task_locked(bridge, task_id)) {
+        qemu_mutex_unlock(&bridge->lock);
+        return -1;
+    }
+    context->task_id = task_id;
+    context->task_bound = true;
+    qemu_mutex_unlock(&bridge->lock);
+
+    if (qmu_define_task(bridge->session, task_id, 0, 0) != QMU_OK) {
+        qemu_mutex_lock(&bridge->lock);
+        context = g_hash_table_lookup(bridge->contexts,
+                                      GUINT_TO_POINTER(context_id));
+        if (context && context->task_bound && context->task_id == task_id) {
+            context->task_bound = false;
+            context->task_id = 0;
+        }
+        qemu_mutex_unlock(&bridge->lock);
+        return -1;
+    }
+
+    fprintf(stderr,
+            "apple-virgl-qemu: task-bind transport=%u task=%u\n",
+            context_id, task_id);
+    return 0;
+}
+
 int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
                               uint32_t context_id,
                               const void *bytes,
@@ -567,6 +629,7 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     GArray *new_mappings = NULL;
     Error *local_err = NULL;
     uint32_t index;
+    uint32_t task_id;
     qmu_status status;
     uint64_t submit;
     uint16_t opcode;
@@ -580,12 +643,11 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
         }
         return -1;
     }
-    if (ldl_le_p(view.payload) != context_id) {
-        error_report("apple-virgl submit task/context mismatch: %u/%u",
-                     ldl_le_p(view.payload), context_id);
-        return -1;
-    }
     opcode = le16_to_cpu(view.header->opcode);
+    if (opcode == APPLE_VIRGL_SUBMIT_BIND_TASK) {
+        return apple_virgl_bridge_bind_task(
+            bridge, context_id, ldl_le_p(view.payload));
+    }
     switch (opcode) {
     case APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3:
         qmu_opcode = APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3;
@@ -608,8 +670,15 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     qemu_mutex_lock(&bridge->lock);
     context = g_hash_table_lookup(bridge->contexts,
                                   GUINT_TO_POINTER(context_id));
-    if (!context) {
+    if (!context || !context->task_bound) {
         qemu_mutex_unlock(&bridge->lock);
+        return -1;
+    }
+    task_id = context->task_id;
+    if (ldl_le_p(view.payload) != task_id) {
+        qemu_mutex_unlock(&bridge->lock);
+        error_report("apple-virgl submit task/transport mismatch: %u/%u (bound task %u)",
+                     ldl_le_p(view.payload), context_id, task_id);
         return -1;
     }
     new_mappings = g_array_sized_new(false, false,
@@ -683,7 +752,7 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
 
         if (apple_resource_id != 0) {
             qmu_register_buffer(bridge->session, apple_resource_id,
-                                context_id,
+                                task_id,
                                 le64_to_cpu(wire->gpu_va),
                                 le64_to_cpu(wire->length));
         }
@@ -692,8 +761,8 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     if (submit <= 64) {
         fprintf(stderr,
                 "apple-virgl-qemu: submit=%" PRIu64
-                " context=%u opcode=%u mappings=%u payload=%u hash=0x%08x\n",
-                submit, context_id, opcode, view.mapping_count,
+                " transport=%u task=%u opcode=%u mappings=%u payload=%u hash=0x%08x\n",
+                submit, context_id, task_id, opcode, view.mapping_count,
                 view.payload_bytes,
                 apple_virgl_fnv1a(view.payload, view.payload_bytes));
     }

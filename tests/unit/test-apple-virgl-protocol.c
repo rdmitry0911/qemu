@@ -42,6 +42,11 @@ typedef struct QEMU_PACKED MemoryUnmapSubmit {
     uint64_t length;
 } MemoryUnmapSubmit;
 
+typedef struct QEMU_PACKED BindTaskSubmit {
+    AppleVirglSubmitHeaderV1 header;
+    uint32_t task_id;
+} BindTaskSubmit;
+
 static OneMappingSubmit valid_submit(void)
 {
     OneMappingSubmit submit = {
@@ -129,6 +134,22 @@ static MemoryUnmapSubmit valid_memory_unmap_submit(void)
         .task_id = cpu_to_le32(3),
         .gpu_va = cpu_to_le64(0x1b0000),
         .length = cpu_to_le64(0x40000),
+    };
+
+    return submit;
+}
+
+static BindTaskSubmit valid_bind_task_submit(uint32_t task_id)
+{
+    BindTaskSubmit submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .opcode = cpu_to_le16(APPLE_VIRGL_SUBMIT_BIND_TASK),
+            .mapping_count = 0,
+            .payload_bytes = cpu_to_le32(sizeof(uint32_t)),
+        },
+        .task_id = cpu_to_le32(task_id),
     };
 
     return submit;
@@ -249,11 +270,17 @@ static void test_object_list_size(void)
     assert_rejected(&submit, sizeof(submit));
 }
 
-static void test_object_list_task(void)
+static void test_object_list_kernel_task(void)
 {
     ObjectListSubmit submit = valid_object_list_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
     submit.task_id = 0;
-    assert_rejected(&submit, sizeof(submit));
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(ldl_le_p(view.payload), ==, 0);
 }
 
 static void test_object_list_heap_alignment(void)
@@ -314,6 +341,19 @@ static void test_memory_map_alignment(void)
     assert_rejected(&submit, sizeof(submit));
 }
 
+static void test_memory_map_kernel_task(void)
+{
+    MemoryMapSubmit submit = valid_memory_map_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    submit.task_id = 0;
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(ldl_le_p(view.payload), ==, 0);
+}
+
 static void test_valid_memory_unmap(void)
 {
     MemoryUnmapSubmit submit = valid_memory_unmap_submit();
@@ -328,17 +368,45 @@ static void test_valid_memory_unmap(void)
     g_assert_cmpuint(view.mapping_count, ==, 0);
 }
 
-static void test_memory_unmap_task(void)
+static void test_memory_unmap_kernel_task(void)
 {
     MemoryUnmapSubmit submit = valid_memory_unmap_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
     submit.task_id = 0;
-    assert_rejected(&submit, sizeof(submit));
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(ldl_le_p(view.payload), ==, 0);
 }
 
 static void test_memory_unmap_size(void)
 {
     MemoryUnmapSubmit submit = valid_memory_unmap_submit();
     submit.header.payload_bytes = cpu_to_le32(16);
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_bind_kernel_task(void)
+{
+    BindTaskSubmit submit = valid_bind_task_submit(0);
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(le16_to_cpu(view.header->opcode), ==,
+                     APPLE_VIRGL_SUBMIT_BIND_TASK);
+    g_assert_cmpuint(ldl_le_p(view.payload), ==, 0);
+}
+
+static void test_bind_task_mapping(void)
+{
+    BindTaskSubmit submit = valid_bind_task_submit(7);
+
+    submit.header.mapping_count = cpu_to_le32(1);
     assert_rejected(&submit, sizeof(submit));
 }
 
@@ -363,8 +431,8 @@ int main(int argc, char **argv)
                     test_valid_object_list);
     g_test_add_func("/apple-virgl/protocol/object-list-size",
                     test_object_list_size);
-    g_test_add_func("/apple-virgl/protocol/object-list-task",
-                    test_object_list_task);
+    g_test_add_func("/apple-virgl/protocol/object-list-kernel-task",
+                    test_object_list_kernel_task);
     g_test_add_func("/apple-virgl/protocol/object-list-heap-alignment",
                     test_object_list_heap_alignment);
     g_test_add_func("/apple-virgl/protocol/object-list-mapping",
@@ -379,11 +447,17 @@ int main(int argc, char **argv)
                     test_memory_map_resource_id);
     g_test_add_func("/apple-virgl/protocol/memory-map-alignment",
                     test_memory_map_alignment);
+    g_test_add_func("/apple-virgl/protocol/memory-map-kernel-task",
+                    test_memory_map_kernel_task);
     g_test_add_func("/apple-virgl/protocol/memory-unmap-valid",
                     test_valid_memory_unmap);
-    g_test_add_func("/apple-virgl/protocol/memory-unmap-task",
-                    test_memory_unmap_task);
+    g_test_add_func("/apple-virgl/protocol/memory-unmap-kernel-task",
+                    test_memory_unmap_kernel_task);
     g_test_add_func("/apple-virgl/protocol/memory-unmap-size",
                     test_memory_unmap_size);
+    g_test_add_func("/apple-virgl/protocol/bind-kernel-task",
+                    test_bind_kernel_task);
+    g_test_add_func("/apple-virgl/protocol/bind-task-mapping",
+                    test_bind_task_mapping);
     return g_test_run();
 }

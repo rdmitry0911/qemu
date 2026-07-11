@@ -73,10 +73,6 @@ static bool apple_virgl_protocol_validate_object_list(
                    "apple-virgl SET_OBJECT_LIST payload must be 12 bytes");
         return false;
     }
-    if (ldl_le_p(payload) == 0) {
-        error_setg(errp, "apple-virgl SET_OBJECT_LIST task ID is zero");
-        return false;
-    }
     if (mapping_count != 1) {
         error_setg(errp,
                    "apple-virgl SET_OBJECT_LIST requires exactly one mapping");
@@ -120,10 +116,6 @@ static bool apple_virgl_protocol_validate_memory_range(
                    "apple-virgl memory-map payload must be 20 bytes");
         return false;
     }
-    if (ldl_le_p(payload) == 0) {
-        error_setg(errp, "apple-virgl memory-map task ID is zero");
-        return false;
-    }
     if (mapping_count != expected_mappings) {
         error_setg(errp,
                    "apple-virgl memory-map opcode requires %u mappings",
@@ -145,6 +137,19 @@ static bool apple_virgl_protocol_validate_memory_range(
          le32_to_cpu(mappings[0].apple_resource_id) != 0)) {
         error_setg(errp,
                    "apple-virgl MAP_MEMORY2 mapping does not match its range");
+        return false;
+    }
+    return true;
+}
+
+static bool apple_virgl_protocol_validate_bind_task(
+    uint32_t mapping_count,
+    uint32_t payload_bytes,
+    Error **errp)
+{
+    if (mapping_count != 0 || payload_bytes != sizeof(uint32_t)) {
+        error_setg(errp,
+                   "apple-virgl BIND_TASK requires a four-byte payload and no mappings");
         return false;
     }
     return true;
@@ -187,7 +192,8 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     if (opcode != APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3 &&
         opcode != APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST &&
         opcode != APPLE_VIRGL_SUBMIT_MAP_MEMORY2 &&
-        opcode != APPLE_VIRGL_SUBMIT_UNMAP_MEMORY) {
+        opcode != APPLE_VIRGL_SUBMIT_UNMAP_MEMORY &&
+        opcode != APPLE_VIRGL_SUBMIT_BIND_TASK) {
         error_setg(errp, "apple-virgl submit opcode is unsupported");
         return false;
     }
@@ -247,6 +253,12 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         if (!apple_virgl_protocol_validate_memory_range(
                 opcode, mappings, mapping_count, payload, payload_bytes,
                 errp)) {
+            return false;
+        }
+        break;
+    case APPLE_VIRGL_SUBMIT_BIND_TASK:
+        if (!apple_virgl_protocol_validate_bind_task(
+                mapping_count, payload_bytes, errp)) {
             return false;
         }
         break;
