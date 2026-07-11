@@ -22,6 +22,8 @@
 #define APPLE_VIRGL_QMU_ROOT_SET_OBJECT_LIST 0x33
 #define APPLE_VIRGL_QMU_GPU_UNMAP_MEMORY 0x22
 #define APPLE_VIRGL_QMU_GPU_MAP_MEMORY2 0x39
+#define APPLE_VIRGL_QMU_DISPLAY_SET_SHARED_STATE 0x01
+#define APPLE_VIRGL_QMU_DISPLAY_TRANSACTION3 0x07
 
 typedef struct AppleVirglResourceState {
     uint32_t resource_id;
@@ -635,6 +637,7 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     uint16_t opcode;
     uint32_t qmu_opcode;
     bool gpu_channel = false;
+    bool display_channel = false;
 
     if (!bridge || !bridge->session || context_id == 0 ||
         !apple_virgl_protocol_decode_submit(bytes, size, &view, &local_err)) {
@@ -663,6 +666,14 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
         qmu_opcode = APPLE_VIRGL_QMU_GPU_UNMAP_MEMORY;
         gpu_channel = true;
         break;
+    case APPLE_VIRGL_SUBMIT_DISPLAY_SET_SHARED_STATE:
+        qmu_opcode = APPLE_VIRGL_QMU_DISPLAY_SET_SHARED_STATE;
+        display_channel = true;
+        break;
+    case APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3:
+        qmu_opcode = APPLE_VIRGL_QMU_DISPLAY_TRANSACTION3;
+        display_channel = true;
+        break;
     default:
         return -1;
     }
@@ -675,10 +686,11 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
         return -1;
     }
     task_id = context->task_id;
-    if (ldl_le_p(view.payload) != task_id) {
+    if (display_channel ? task_id != 0 : ldl_le_p(view.payload) != task_id) {
         qemu_mutex_unlock(&bridge->lock);
-        error_report("apple-virgl submit task/transport mismatch: %u/%u (bound task %u)",
-                     ldl_le_p(view.payload), context_id, task_id);
+        error_report("apple-virgl submit task/transport mismatch: payload=%u transport=%u bound-task=%u display=%u",
+                     ldl_le_p(view.payload), context_id, task_id,
+                     display_channel ? 1 : 0);
         return -1;
     }
     new_mappings = g_array_sized_new(false, false,
@@ -766,10 +778,16 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
                 view.payload_bytes,
                 apple_virgl_fnv1a(view.payload, view.payload_bytes));
     }
-    status = gpu_channel
-        ? qmu_submit_gpu_channel(bridge->session, 0, qmu_opcode,
-                                 view.payload, view.payload_bytes)
-        : qmu_submit_root_fifo(bridge->session, qmu_opcode,
-                               view.payload, view.payload_bytes);
+    if (display_channel) {
+        status = qmu_submit_display_channel(bridge->session, qmu_opcode,
+                                            view.payload,
+                                            view.payload_bytes);
+    } else if (gpu_channel) {
+        status = qmu_submit_gpu_channel(bridge->session, 0, qmu_opcode,
+                                        view.payload, view.payload_bytes);
+    } else {
+        status = qmu_submit_root_fifo(bridge->session, qmu_opcode,
+                                      view.payload, view.payload_bytes);
+    }
     return status == QMU_OK ? 0 : -1;
 }

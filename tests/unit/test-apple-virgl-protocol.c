@@ -47,6 +47,23 @@ typedef struct QEMU_PACKED BindTaskSubmit {
     uint32_t task_id;
 } BindTaskSubmit;
 
+typedef struct QEMU_PACKED DisplaySharedStateSubmit {
+    AppleVirglSubmitHeaderV1 header;
+    uint32_t display_id;
+    uint32_t shared_state_pfn;
+} DisplaySharedStateSubmit;
+
+typedef struct QEMU_PACKED DisplayTransaction3Submit {
+    AppleVirglSubmitHeaderV1 header;
+    uint32_t display_id;
+    uint32_t task_id;
+    uint32_t surface_id;
+    uint64_t gamma_va;
+    uint64_t gamma_length;
+    uint32_t gamma_entries;
+    uint32_t gamma_sum;
+} DisplayTransaction3Submit;
+
 static OneMappingSubmit valid_submit(void)
 {
     OneMappingSubmit submit = {
@@ -150,6 +167,43 @@ static BindTaskSubmit valid_bind_task_submit(uint32_t task_id)
             .payload_bytes = cpu_to_le32(sizeof(uint32_t)),
         },
         .task_id = cpu_to_le32(task_id),
+    };
+
+    return submit;
+}
+
+static DisplaySharedStateSubmit valid_display_shared_state_submit(void)
+{
+    DisplaySharedStateSubmit submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .opcode = cpu_to_le16(
+                APPLE_VIRGL_SUBMIT_DISPLAY_SET_SHARED_STATE),
+            .mapping_count = 0,
+            .payload_bytes = cpu_to_le32(8),
+        },
+        .display_id = 0,
+        .shared_state_pfn = cpu_to_le32(0x12345),
+    };
+
+    return submit;
+}
+
+static DisplayTransaction3Submit valid_display_transaction3_submit(void)
+{
+    DisplayTransaction3Submit submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .opcode = cpu_to_le16(
+                APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3),
+            .mapping_count = 0,
+            .payload_bytes = cpu_to_le32(0x24),
+        },
+        .display_id = 0,
+        .task_id = 0,
+        .surface_id = cpu_to_le32(37),
     };
 
     return submit;
@@ -410,6 +464,73 @@ static void test_bind_task_mapping(void)
     assert_rejected(&submit, sizeof(submit));
 }
 
+static void test_display_shared_state_valid(void)
+{
+    DisplaySharedStateSubmit submit = valid_display_shared_state_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(view.payload_bytes, ==, 8);
+    g_assert_cmpuint(ldl_le_p(view.payload + 4), ==, 0x12345);
+}
+
+static void test_display_shared_state_identity(void)
+{
+    DisplaySharedStateSubmit submit = valid_display_shared_state_submit();
+
+    submit.display_id = cpu_to_le32(8);
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_display_shared_state_submit();
+    submit.shared_state_pfn = 0;
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_display_shared_state_size(void)
+{
+    DisplaySharedStateSubmit submit = valid_display_shared_state_submit();
+
+    submit.header.payload_bytes = cpu_to_le32(4);
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_display_transaction3_valid(void)
+{
+    DisplayTransaction3Submit submit = valid_display_transaction3_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(view.payload_bytes, ==, 0x24);
+    g_assert_cmpuint(ldl_le_p(view.payload + 8), ==, 37);
+}
+
+static void test_display_transaction3_identity(void)
+{
+    DisplayTransaction3Submit submit = valid_display_transaction3_submit();
+
+    submit.task_id = cpu_to_le32(1);
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_display_transaction3_submit();
+    submit.surface_id = 0;
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_display_transaction3_submit();
+    submit.display_id = cpu_to_le32(8);
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_display_transaction3_size(void)
+{
+    DisplayTransaction3Submit submit = valid_display_transaction3_submit();
+
+    submit.header.payload_bytes = cpu_to_le32(0x20);
+    assert_rejected(&submit, sizeof(submit));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -459,5 +580,17 @@ int main(int argc, char **argv)
                     test_bind_kernel_task);
     g_test_add_func("/apple-virgl/protocol/bind-task-mapping",
                     test_bind_task_mapping);
+    g_test_add_func("/apple-virgl/protocol/display-shared-state-valid",
+                    test_display_shared_state_valid);
+    g_test_add_func("/apple-virgl/protocol/display-shared-state-identity",
+                    test_display_shared_state_identity);
+    g_test_add_func("/apple-virgl/protocol/display-shared-state-size",
+                    test_display_shared_state_size);
+    g_test_add_func("/apple-virgl/protocol/display-transaction3-valid",
+                    test_display_transaction3_valid);
+    g_test_add_func("/apple-virgl/protocol/display-transaction3-identity",
+                    test_display_transaction3_identity);
+    g_test_add_func("/apple-virgl/protocol/display-transaction3-size",
+                    test_display_transaction3_size);
     return g_test_run();
 }

@@ -155,6 +155,45 @@ static bool apple_virgl_protocol_validate_bind_task(
     return true;
 }
 
+static bool apple_virgl_protocol_validate_display_shared_state(
+    uint32_t mapping_count,
+    const uint8_t *payload,
+    uint32_t payload_bytes,
+    Error **errp)
+{
+    if (mapping_count != 0 || payload_bytes != 8) {
+        error_setg(errp,
+                   "apple-virgl display shared-state command requires an eight-byte payload and no mappings");
+        return false;
+    }
+    if (ldl_le_p(payload) > 7 || ldl_le_p(payload + 4) == 0) {
+        error_setg(errp,
+                   "apple-virgl display shared-state identity is invalid");
+        return false;
+    }
+    return true;
+}
+
+static bool apple_virgl_protocol_validate_display_transaction3(
+    uint32_t mapping_count,
+    const uint8_t *payload,
+    uint32_t payload_bytes,
+    Error **errp)
+{
+    if (mapping_count != 0 || payload_bytes != 0x24) {
+        error_setg(errp,
+                   "apple-virgl Transaction3 requires a 36-byte payload and no mappings");
+        return false;
+    }
+    if (ldl_le_p(payload) > 7 || ldl_le_p(payload + 4) != 0 ||
+        ldl_le_p(payload + 8) == 0) {
+        error_setg(errp,
+                   "apple-virgl Transaction3 display, kernel-task, or surface identity is invalid");
+        return false;
+    }
+    return true;
+}
+
 bool apple_virgl_protocol_decode_submit(const void *bytes,
                                         size_t size,
                                         AppleVirglSubmitView *view,
@@ -193,7 +232,9 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         opcode != APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST &&
         opcode != APPLE_VIRGL_SUBMIT_MAP_MEMORY2 &&
         opcode != APPLE_VIRGL_SUBMIT_UNMAP_MEMORY &&
-        opcode != APPLE_VIRGL_SUBMIT_BIND_TASK) {
+        opcode != APPLE_VIRGL_SUBMIT_BIND_TASK &&
+        opcode != APPLE_VIRGL_SUBMIT_DISPLAY_SET_SHARED_STATE &&
+        opcode != APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3) {
         error_setg(errp, "apple-virgl submit opcode is unsupported");
         return false;
     }
@@ -259,6 +300,18 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     case APPLE_VIRGL_SUBMIT_BIND_TASK:
         if (!apple_virgl_protocol_validate_bind_task(
                 mapping_count, payload_bytes, errp)) {
+            return false;
+        }
+        break;
+    case APPLE_VIRGL_SUBMIT_DISPLAY_SET_SHARED_STATE:
+        if (!apple_virgl_protocol_validate_display_shared_state(
+                mapping_count, payload, payload_bytes, errp)) {
+            return false;
+        }
+        break;
+    case APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3:
+        if (!apple_virgl_protocol_validate_display_transaction3(
+                mapping_count, payload, payload_bytes, errp)) {
             return false;
         }
         break;
