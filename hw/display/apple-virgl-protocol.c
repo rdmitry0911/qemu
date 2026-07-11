@@ -12,6 +12,7 @@
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglCapsetV1) != 16);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitHeaderV1) != 16);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitMappingV1) != 32);
+QEMU_BUILD_BUG_ON(sizeof(AppleVirglComputeInfoV1) != 24);
 
 void apple_virgl_protocol_fill_capset(AppleVirglCapsetV1 *capset)
 {
@@ -194,6 +195,83 @@ static bool apple_virgl_protocol_validate_display_transaction3(
     return true;
 }
 
+static bool apple_virgl_protocol_mapping_contains(
+    const AppleVirglSubmitMappingV1 *mapping,
+    uint64_t address,
+    uint64_t length)
+{
+    uint64_t base = le64_to_cpu(mapping->gpu_va);
+    uint64_t mapping_length = le64_to_cpu(mapping->length);
+    uint64_t offset;
+
+    if (address < base) {
+        return false;
+    }
+    offset = address - base;
+    return offset <= mapping_length && length <= mapping_length - offset;
+}
+
+static bool apple_virgl_protocol_validate_compute_info(
+    const AppleVirglSubmitMappingV1 *mappings,
+    uint32_t mapping_count,
+    const uint8_t *payload,
+    uint32_t payload_bytes,
+    Error **errp)
+{
+    uint32_t pair_count;
+    uint64_t reply_gpu_va;
+    uint64_t reply_bytes;
+    uint32_t containing_mappings = 0;
+    uint32_t index;
+
+    if (payload_bytes != sizeof(AppleVirglComputeInfoV1)) {
+        error_setg(errp,
+                   "apple-virgl GET_COMPUTE_INFO payload must be 24 bytes");
+        return false;
+    }
+    if (mapping_count != 2) {
+        error_setg(errp,
+                   "apple-virgl GET_COMPUTE_INFO requires exactly two mappings");
+        return false;
+    }
+    if (ldl_le_p(payload) == 0 || ldl_le_p(payload + 4) == 0 ||
+        ldl_le_p(payload + 8) == 0) {
+        error_setg(errp,
+                   "apple-virgl GET_COMPUTE_INFO identity or key bound is invalid");
+        return false;
+    }
+
+    pair_count = ldl_le_p(payload + 12);
+    reply_gpu_va = ldq_le_p(payload + 16);
+    if (pair_count == 0 || pair_count > APPLE_VIRGL_MAX_COMPUTE_INFO_PAIRS ||
+        reply_gpu_va == 0) {
+        error_setg(errp,
+                   "apple-virgl GET_COMPUTE_INFO reply range is invalid");
+        return false;
+    }
+    reply_bytes = (uint64_t)pair_count * 8u;
+
+    for (index = 0; index < mapping_count; ++index) {
+        if (le32_to_cpu(mappings[index].apple_resource_id) == 0) {
+            error_setg(errp,
+                       "apple-virgl GET_COMPUTE_INFO mapping %u has no Apple resource ID",
+                       index);
+            return false;
+        }
+        if (apple_virgl_protocol_mapping_contains(&mappings[index],
+                                                  reply_gpu_va,
+                                                  reply_bytes)) {
+            ++containing_mappings;
+        }
+    }
+    if (containing_mappings != 1) {
+        error_setg(errp,
+                   "apple-virgl GET_COMPUTE_INFO reply range must belong to exactly one mapping");
+        return false;
+    }
+    return true;
+}
+
 bool apple_virgl_protocol_decode_submit(const void *bytes,
                                         size_t size,
                                         AppleVirglSubmitView *view,
@@ -234,7 +312,8 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         opcode != APPLE_VIRGL_SUBMIT_UNMAP_MEMORY &&
         opcode != APPLE_VIRGL_SUBMIT_BIND_TASK &&
         opcode != APPLE_VIRGL_SUBMIT_DISPLAY_SET_SHARED_STATE &&
-        opcode != APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3) {
+        opcode != APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3 &&
+        opcode != APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO) {
         error_setg(errp, "apple-virgl submit opcode is unsupported");
         return false;
     }
@@ -312,6 +391,12 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     case APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3:
         if (!apple_virgl_protocol_validate_display_transaction3(
                 mapping_count, payload, payload_bytes, errp)) {
+            return false;
+        }
+        break;
+    case APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO:
+        if (!apple_virgl_protocol_validate_compute_info(
+                mappings, mapping_count, payload, payload_bytes, errp)) {
             return false;
         }
         break;

@@ -21,9 +21,11 @@
 #define APPLE_VIRGL_SUBMIT_BIND_TASK 5u
 #define APPLE_VIRGL_SUBMIT_DISPLAY_SET_SHARED_STATE 6u
 #define APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3 7u
+#define APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO 8u
 
 #define APPLE_VIRGL_MAX_SUBMIT_MAPPINGS 4096u
 #define APPLE_VIRGL_MAX_SUBMIT_PAYLOAD (16u * 1024u * 1024u)
+#define APPLE_VIRGL_MAX_COMPUTE_INFO_PAIRS 4096u
 #define APPLE_VIRGL_MAX_SUBMIT_BYTES \
     (sizeof(AppleVirglSubmitHeaderV1) + \
      APPLE_VIRGL_MAX_SUBMIT_MAPPINGS * sizeof(AppleVirglSubmitMappingV1) + \
@@ -53,6 +55,14 @@ typedef struct QEMU_PACKED AppleVirglSubmitMappingV1 {
     uint32_t apple_resource_id;
     uint32_t reserved;
 } AppleVirglSubmitMappingV1;
+
+typedef struct QEMU_PACKED AppleVirglComputeInfoV1 {
+    uint32_t task_id;
+    uint32_t pipeline_ref;
+    uint32_t max_key;
+    uint32_t pair_count;
+    uint64_t reply_gpu_va;
+} AppleVirglComputeInfoV1;
 
 typedef struct AppleVirglSubmitView {
     const AppleVirglSubmitHeaderV1 *header;

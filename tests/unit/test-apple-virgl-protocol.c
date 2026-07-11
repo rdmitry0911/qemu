@@ -64,6 +64,12 @@ typedef struct QEMU_PACKED DisplayTransaction3Submit {
     uint32_t gamma_sum;
 } DisplayTransaction3Submit;
 
+typedef struct QEMU_PACKED ComputeInfoSubmit {
+    AppleVirglSubmitHeaderV1 header;
+    AppleVirglSubmitMappingV1 mappings[2];
+    AppleVirglComputeInfoV1 payload;
+} ComputeInfoSubmit;
+
 static OneMappingSubmit valid_submit(void)
 {
     OneMappingSubmit submit = {
@@ -209,6 +215,46 @@ static DisplayTransaction3Submit valid_display_transaction3_submit(void)
     return submit;
 }
 
+static ComputeInfoSubmit valid_compute_info_submit(void)
+{
+    ComputeInfoSubmit submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .opcode = cpu_to_le16(
+                APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO),
+            .mapping_count = cpu_to_le32(2),
+            .payload_bytes = cpu_to_le32(
+                sizeof(AppleVirglComputeInfoV1)),
+        },
+        .mappings = {
+            {
+                .gpu_va = cpu_to_le64(0x8000),
+                .length = cpu_to_le64(0x1000),
+                .backing_resource_id = cpu_to_le32(41),
+                .apple_resource_id = cpu_to_le32(11),
+            },
+            {
+                .gpu_va = cpu_to_le64(0x9000),
+                .length = cpu_to_le64(0x1000),
+                .backing_resource_id = cpu_to_le32(42),
+                .apple_resource_id = cpu_to_le32(12),
+            },
+        },
+        .payload = {
+            .task_id = cpu_to_le32(3),
+            .pipeline_ref = cpu_to_le32(37),
+            .max_key = cpu_to_le32(5),
+            .pair_count = cpu_to_le32(6),
+            .reply_gpu_va = cpu_to_le64(0x9080),
+        },
+    };
+
+    return submit;
+}
+
+static void assert_rejected(const void *bytes, size_t size);
+
 static void test_valid_submit(void)
 {
     OneMappingSubmit submit = valid_submit();
@@ -221,6 +267,29 @@ static void test_valid_submit(void)
     g_assert_cmpuint(view.mapping_count, ==, 1);
     g_assert_cmpuint(view.payload_bytes, ==, 28);
     g_assert_cmpuint(ldl_le_p(view.payload), ==, 3);
+}
+
+static void test_compute_info_valid(void)
+{
+    ComputeInfoSubmit submit = valid_compute_info_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_cmpuint(sizeof(AppleVirglComputeInfoV1), ==, 24);
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(view.mapping_count, ==, 2);
+    g_assert_cmpuint(view.payload_bytes, ==, 24);
+    g_assert_cmpuint(ldl_le_p(view.payload + 4), ==, 37);
+}
+
+static void test_compute_info_reply_range(void)
+{
+    ComputeInfoSubmit submit = valid_compute_info_submit();
+
+    submit.payload.reply_gpu_va = cpu_to_le64(0xa000);
+    assert_rejected(&submit, sizeof(submit));
 }
 
 static void assert_rejected(const void *bytes, size_t size)
@@ -535,6 +604,10 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/apple-virgl/protocol/valid", test_valid_submit);
+    g_test_add_func("/apple-virgl/protocol/compute-info-valid",
+                    test_compute_info_valid);
+    g_test_add_func("/apple-virgl/protocol/compute-info-reply-range",
+                    test_compute_info_reply_range);
     g_test_add_func("/apple-virgl/protocol/short-header", test_short_header);
     g_test_add_func("/apple-virgl/protocol/invalid-magic", test_invalid_magic);
     g_test_add_func("/apple-virgl/protocol/invalid-version", test_invalid_version);
