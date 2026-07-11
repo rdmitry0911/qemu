@@ -16,6 +16,7 @@
 #include "hw/virtio/apple-virgl-bridge.h"
 #include "hw/virtio/apple-virgl-protocol.h"
 #include "system/address-spaces.h"
+#include "system/dma.h"
 #include "qmu/qmetal_unified.h"
 
 #define APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3 0x2b
@@ -169,18 +170,16 @@ static AppleVirglContextState *apple_virgl_context_for_task_locked(
     return NULL;
 }
 
-static int apple_virgl_read_gpu_memory(void *opaque, uint32_t task_id,
-                                       uint64_t gpu_va, void *bytes, size_t size)
+static AppleVirglResourceState *apple_virgl_resolve_gpu_memory_locked(
+    AppleVirglBridge *bridge, uint32_t task_id, uint64_t gpu_va, size_t size,
+    uint64_t *resource_offset)
 {
-    AppleVirglBridge *bridge = opaque;
     AppleVirglContextState *context;
     uint32_t index;
-    int result = -1;
 
-    qemu_mutex_lock(&bridge->lock);
     context = apple_virgl_context_for_task_locked(bridge, task_id);
     if (!context) {
-        goto out;
+        return NULL;
     }
 
     for (index = 0; index < context->mappings->len; ++index) {
@@ -188,7 +187,7 @@ static int apple_virgl_read_gpu_memory(void *opaque, uint32_t task_id,
             &g_array_index(context->mappings, AppleVirglMapping, index);
         AppleVirglResourceState *resource;
         uint64_t delta;
-        uint64_t resource_offset;
+        uint64_t offset;
 
         if (!apple_virgl_range_contains(mapping->gpu_va, mapping->length,
                                         gpu_va, size, &delta)) {
@@ -197,18 +196,82 @@ static int apple_virgl_read_gpu_memory(void *opaque, uint32_t task_id,
         resource = g_hash_table_lookup(bridge->resources,
                                        GUINT_TO_POINTER(
                                            mapping->backing_resource_id));
-        if (!resource || !resource->iov) {
-            break;
+        if (!resource || !resource->iov || !resource->addrs) {
+            return NULL;
         }
-        resource_offset = (uint64_t)mapping->backing_offset + delta;
-        if (resource_offset > resource->backing_size ||
-            size > resource->backing_size - resource_offset) {
-            break;
+        offset = (uint64_t)mapping->backing_offset + delta;
+        if (offset > resource->backing_size ||
+            size > resource->backing_size - offset) {
+            return NULL;
         }
+        *resource_offset = offset;
+        return resource;
+    }
+
+    return NULL;
+}
+
+static int apple_virgl_read_gpu_memory(void *opaque, uint32_t task_id,
+                                       uint64_t gpu_va, void *bytes, size_t size)
+{
+    AppleVirglBridge *bridge = opaque;
+    AppleVirglResourceState *resource;
+    uint64_t resource_offset;
+    int result = -1;
+
+    qemu_mutex_lock(&bridge->lock);
+    resource = apple_virgl_resolve_gpu_memory_locked(
+        bridge, task_id, gpu_va, size, &resource_offset);
+    if (resource) {
         result = iov_to_buf(resource->iov, resource->iov_count,
                             resource_offset, bytes, size) == size ? 0 : -1;
-        break;
     }
+
+    qemu_mutex_unlock(&bridge->lock);
+    return result;
+}
+
+static int apple_virgl_write_gpu_memory(void *opaque, uint32_t task_id,
+                                        uint64_t gpu_va, const void *bytes,
+                                        size_t size)
+{
+    AppleVirglBridge *bridge = opaque;
+    AppleVirglResourceState *resource;
+    const uint8_t *source = bytes;
+    uint64_t resource_offset;
+    uint64_t segment_offset;
+    size_t remaining = size;
+    uint32_t index;
+    int result = -1;
+
+    qemu_mutex_lock(&bridge->lock);
+    resource = apple_virgl_resolve_gpu_memory_locked(
+        bridge, task_id, gpu_va, size, &resource_offset);
+    if (!resource) {
+        goto out;
+    }
+
+    segment_offset = resource_offset;
+    for (index = 0; index < resource->iov_count && remaining > 0; ++index) {
+        size_t segment_length = resource->iov[index].iov_len;
+        size_t chunk;
+
+        if (segment_offset >= segment_length) {
+            segment_offset -= segment_length;
+            continue;
+        }
+        chunk = MIN(remaining, segment_length - segment_offset);
+        if (dma_memory_write(VIRTIO_DEVICE(bridge->gpu)->dma_as,
+                             resource->addrs[index] + segment_offset,
+                             source, chunk,
+                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            goto out;
+        }
+        source += chunk;
+        remaining -= chunk;
+        segment_offset = 0;
+    }
+    result = remaining == 0 ? 0 : -1;
 
 out:
     qemu_mutex_unlock(&bridge->lock);
@@ -264,6 +327,8 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     }
     qmu_set_direct_read_callback(bridge->session,
                                  apple_virgl_read_gpu_memory, bridge);
+    qmu_set_direct_write_callback(bridge->session,
+                                  apple_virgl_write_gpu_memory, bridge);
     return bridge;
 }
 
