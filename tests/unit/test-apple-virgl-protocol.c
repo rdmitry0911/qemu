@@ -27,6 +27,21 @@ typedef struct QEMU_PACKED ObjectListSubmit {
     uint32_t heap_length;
 } ObjectListSubmit;
 
+typedef struct QEMU_PACKED MemoryMapSubmit {
+    AppleVirglSubmitHeaderV1 header;
+    AppleVirglSubmitMappingV1 mapping;
+    uint32_t task_id;
+    uint64_t gpu_va;
+    uint64_t length;
+} MemoryMapSubmit;
+
+typedef struct QEMU_PACKED MemoryUnmapSubmit {
+    AppleVirglSubmitHeaderV1 header;
+    uint32_t task_id;
+    uint64_t gpu_va;
+    uint64_t length;
+} MemoryUnmapSubmit;
+
 static OneMappingSubmit valid_submit(void)
 {
     OneMappingSubmit submit = {
@@ -73,6 +88,47 @@ static ObjectListSubmit valid_object_list_submit(void)
         .task_id = cpu_to_le32(3),
         .heap_pfn = cpu_to_le32(0x12345),
         .heap_length = cpu_to_le32(0x100000),
+    };
+
+    return submit;
+}
+
+static MemoryMapSubmit valid_memory_map_submit(void)
+{
+    MemoryMapSubmit submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .opcode = cpu_to_le16(APPLE_VIRGL_SUBMIT_MAP_MEMORY2),
+            .mapping_count = cpu_to_le32(1),
+            .payload_bytes = cpu_to_le32(20),
+        },
+        .mapping = {
+            .gpu_va = cpu_to_le64(0x1b0000),
+            .length = cpu_to_le64(0x40000),
+            .backing_resource_id = cpu_to_le32(31),
+        },
+        .task_id = cpu_to_le32(3),
+        .gpu_va = cpu_to_le64(0x1b0000),
+        .length = cpu_to_le64(0x40000),
+    };
+
+    return submit;
+}
+
+static MemoryUnmapSubmit valid_memory_unmap_submit(void)
+{
+    MemoryUnmapSubmit submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .opcode = cpu_to_le16(APPLE_VIRGL_SUBMIT_UNMAP_MEMORY),
+            .mapping_count = 0,
+            .payload_bytes = cpu_to_le32(20),
+        },
+        .task_id = cpu_to_le32(3),
+        .gpu_va = cpu_to_le64(0x1b0000),
+        .length = cpu_to_le64(0x40000),
     };
 
     return submit;
@@ -222,6 +278,70 @@ static void test_object_list_mapping_count(void)
     assert_rejected(&submit, sizeof(submit));
 }
 
+static void test_valid_memory_map(void)
+{
+    MemoryMapSubmit submit = valid_memory_map_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(le16_to_cpu(view.header->opcode), ==,
+                     APPLE_VIRGL_SUBMIT_MAP_MEMORY2);
+    g_assert_cmpuint(view.mapping_count, ==, 1);
+}
+
+static void test_memory_map_range_mismatch(void)
+{
+    MemoryMapSubmit submit = valid_memory_map_submit();
+    submit.mapping.gpu_va = cpu_to_le64(0x1c0000);
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_memory_map_resource_id(void)
+{
+    MemoryMapSubmit submit = valid_memory_map_submit();
+    submit.mapping.apple_resource_id = cpu_to_le32(9);
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_memory_map_alignment(void)
+{
+    MemoryMapSubmit submit = valid_memory_map_submit();
+    submit.gpu_va = cpu_to_le64(0x1b0001);
+    submit.mapping.gpu_va = cpu_to_le64(0x1b0001);
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_valid_memory_unmap(void)
+{
+    MemoryUnmapSubmit submit = valid_memory_unmap_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(le16_to_cpu(view.header->opcode), ==,
+                     APPLE_VIRGL_SUBMIT_UNMAP_MEMORY);
+    g_assert_cmpuint(view.mapping_count, ==, 0);
+}
+
+static void test_memory_unmap_task(void)
+{
+    MemoryUnmapSubmit submit = valid_memory_unmap_submit();
+    submit.task_id = 0;
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_memory_unmap_size(void)
+{
+    MemoryUnmapSubmit submit = valid_memory_unmap_submit();
+    submit.header.payload_bytes = cpu_to_le32(16);
+    assert_rejected(&submit, sizeof(submit));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -251,5 +371,19 @@ int main(int argc, char **argv)
                     test_object_list_mapping);
     g_test_add_func("/apple-virgl/protocol/object-list-mapping-count",
                     test_object_list_mapping_count);
+    g_test_add_func("/apple-virgl/protocol/memory-map-valid",
+                    test_valid_memory_map);
+    g_test_add_func("/apple-virgl/protocol/memory-map-range-mismatch",
+                    test_memory_map_range_mismatch);
+    g_test_add_func("/apple-virgl/protocol/memory-map-resource-id",
+                    test_memory_map_resource_id);
+    g_test_add_func("/apple-virgl/protocol/memory-map-alignment",
+                    test_memory_map_alignment);
+    g_test_add_func("/apple-virgl/protocol/memory-unmap-valid",
+                    test_valid_memory_unmap);
+    g_test_add_func("/apple-virgl/protocol/memory-unmap-task",
+                    test_memory_unmap_task);
+    g_test_add_func("/apple-virgl/protocol/memory-unmap-size",
+                    test_memory_unmap_size);
     return g_test_run();
 }

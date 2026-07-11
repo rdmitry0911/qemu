@@ -20,6 +20,8 @@
 
 #define APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3 0x2b
 #define APPLE_VIRGL_QMU_ROOT_SET_OBJECT_LIST 0x33
+#define APPLE_VIRGL_QMU_GPU_UNMAP_MEMORY 0x22
+#define APPLE_VIRGL_QMU_GPU_MAP_MEMORY2 0x39
 
 typedef struct AppleVirglResourceState {
     uint32_t resource_id;
@@ -510,12 +512,36 @@ static void apple_virgl_store_mapping(AppleVirglContextState *context,
     for (index = 0; index < context->mappings->len; ++index) {
         AppleVirglMapping *existing =
             &g_array_index(context->mappings, AppleVirglMapping, index);
-        if (existing->gpu_va == mapping->gpu_va) {
+        if (existing->gpu_va == mapping->gpu_va &&
+            existing->length == mapping->length &&
+            existing->backing_resource_id == mapping->backing_resource_id) {
             *existing = *mapping;
             return;
         }
     }
     g_array_append_val(context->mappings, *mapping);
+}
+
+static bool apple_virgl_remove_mapping(AppleVirglContextState *context,
+                                       uint64_t gpu_va, uint64_t length)
+{
+    uint32_t index = 0;
+    bool removed = false;
+    uint64_t end = gpu_va + length;
+
+    while (index < context->mappings->len) {
+        AppleVirglMapping *mapping =
+            &g_array_index(context->mappings, AppleVirglMapping, index);
+
+        if (mapping->gpu_va >= gpu_va &&
+            mapping->gpu_va + mapping->length <= end) {
+            g_array_remove_index(context->mappings, index);
+            removed = true;
+        } else {
+            ++index;
+        }
+    }
+    return removed;
 }
 
 static uint32_t apple_virgl_fnv1a(const void *bytes, size_t size)
@@ -544,7 +570,8 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     qmu_status status;
     uint64_t submit;
     uint16_t opcode;
-    uint32_t root_opcode;
+    uint32_t qmu_opcode;
+    bool gpu_channel = false;
 
     if (!bridge || !bridge->session || context_id == 0 ||
         !apple_virgl_protocol_decode_submit(bytes, size, &view, &local_err)) {
@@ -561,10 +588,18 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     opcode = le16_to_cpu(view.header->opcode);
     switch (opcode) {
     case APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3:
-        root_opcode = APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3;
+        qmu_opcode = APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3;
         break;
     case APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST:
-        root_opcode = APPLE_VIRGL_QMU_ROOT_SET_OBJECT_LIST;
+        qmu_opcode = APPLE_VIRGL_QMU_ROOT_SET_OBJECT_LIST;
+        break;
+    case APPLE_VIRGL_SUBMIT_MAP_MEMORY2:
+        qmu_opcode = APPLE_VIRGL_QMU_GPU_MAP_MEMORY2;
+        gpu_channel = true;
+        break;
+    case APPLE_VIRGL_SUBMIT_UNMAP_MEMORY:
+        qmu_opcode = APPLE_VIRGL_QMU_GPU_UNMAP_MEMORY;
+        gpu_channel = true;
         break;
     default:
         return -1;
@@ -630,6 +665,13 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
 
         apple_virgl_store_mapping(context, mapping);
     }
+    if (opcode == APPLE_VIRGL_SUBMIT_UNMAP_MEMORY &&
+        !apple_virgl_remove_mapping(context, ldq_le_p(view.payload + 4),
+                                    ldq_le_p(view.payload + 12))) {
+        qemu_mutex_unlock(&bridge->lock);
+        g_array_unref(new_mappings);
+        return -1;
+    }
     submit = ++bridge->submit_count;
     qemu_mutex_unlock(&bridge->lock);
     g_array_unref(new_mappings);
@@ -655,7 +697,10 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
                 view.payload_bytes,
                 apple_virgl_fnv1a(view.payload, view.payload_bytes));
     }
-    status = qmu_submit_root_fifo(bridge->session, root_opcode,
-                                  view.payload, view.payload_bytes);
+    status = gpu_channel
+        ? qmu_submit_gpu_channel(bridge->session, 0, qmu_opcode,
+                                 view.payload, view.payload_bytes)
+        : qmu_submit_root_fifo(bridge->session, qmu_opcode,
+                               view.payload, view.payload_bytes);
     return status == QMU_OK ? 0 : -1;
 }

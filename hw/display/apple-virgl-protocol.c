@@ -102,6 +102,54 @@ static bool apple_virgl_protocol_validate_object_list(
     return true;
 }
 
+static bool apple_virgl_protocol_validate_memory_range(
+    uint16_t opcode,
+    const AppleVirglSubmitMappingV1 *mappings,
+    uint32_t mapping_count,
+    const uint8_t *payload,
+    uint32_t payload_bytes,
+    Error **errp)
+{
+    bool is_map = opcode == APPLE_VIRGL_SUBMIT_MAP_MEMORY2;
+    uint32_t expected_mappings = is_map ? 1 : 0;
+    uint64_t gpu_va;
+    uint64_t length;
+
+    if (payload_bytes != 20) {
+        error_setg(errp,
+                   "apple-virgl memory-map payload must be 20 bytes");
+        return false;
+    }
+    if (ldl_le_p(payload) == 0) {
+        error_setg(errp, "apple-virgl memory-map task ID is zero");
+        return false;
+    }
+    if (mapping_count != expected_mappings) {
+        error_setg(errp,
+                   "apple-virgl memory-map opcode requires %u mappings",
+                   expected_mappings);
+        return false;
+    }
+
+    gpu_va = ldq_le_p(payload + 4);
+    length = ldq_le_p(payload + 12);
+    if (gpu_va == 0 || length == 0 || length > UINT64_MAX - gpu_va ||
+        (gpu_va & 0xfff) != 0 || (length & 0xfff) != 0) {
+        error_setg(errp, "apple-virgl memory-map range is invalid");
+        return false;
+    }
+    if (is_map &&
+        (le64_to_cpu(mappings[0].gpu_va) != gpu_va ||
+         le64_to_cpu(mappings[0].length) != length ||
+         le32_to_cpu(mappings[0].backing_offset) != 0 ||
+         le32_to_cpu(mappings[0].apple_resource_id) != 0)) {
+        error_setg(errp,
+                   "apple-virgl MAP_MEMORY2 mapping does not match its range");
+        return false;
+    }
+    return true;
+}
+
 bool apple_virgl_protocol_decode_submit(const void *bytes,
                                         size_t size,
                                         AppleVirglSubmitView *view,
@@ -137,7 +185,9 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     }
     opcode = le16_to_cpu(header->opcode);
     if (opcode != APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3 &&
-        opcode != APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST) {
+        opcode != APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST &&
+        opcode != APPLE_VIRGL_SUBMIT_MAP_MEMORY2 &&
+        opcode != APPLE_VIRGL_SUBMIT_UNMAP_MEMORY) {
         error_setg(errp, "apple-virgl submit opcode is unsupported");
         return false;
     }
@@ -189,6 +239,14 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     case APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST:
         if (!apple_virgl_protocol_validate_object_list(
                 mappings, mapping_count, payload, payload_bytes, errp)) {
+            return false;
+        }
+        break;
+    case APPLE_VIRGL_SUBMIT_MAP_MEMORY2:
+    case APPLE_VIRGL_SUBMIT_UNMAP_MEMORY:
+        if (!apple_virgl_protocol_validate_memory_range(
+                opcode, mappings, mapping_count, payload, payload_bytes,
+                errp)) {
             return false;
         }
         break;
