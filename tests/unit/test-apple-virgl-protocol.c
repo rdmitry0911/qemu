@@ -42,6 +42,11 @@ typedef struct QEMU_PACKED MemoryUnmapSubmit {
     uint64_t length;
 } MemoryUnmapSubmit;
 
+typedef struct QEMU_PACKED SynchronizeResourcesSubmit {
+    AppleVirglSubmitHeaderV1 header;
+    AppleVirglSynchronizeResourcesV1 payload;
+} SynchronizeResourcesSubmit;
+
 typedef struct QEMU_PACKED BindTaskSubmit {
     AppleVirglSubmitHeaderV1 header;
     uint32_t task_id;
@@ -163,6 +168,28 @@ static MemoryUnmapSubmit valid_memory_unmap_submit(void)
         .task_id = cpu_to_le32(3),
         .gpu_va = cpu_to_le64(0x1b0000),
         .length = cpu_to_le64(0x40000),
+    };
+
+    return submit;
+}
+
+static SynchronizeResourcesSubmit valid_synchronize_resources_submit(void)
+{
+    SynchronizeResourcesSubmit submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .opcode = cpu_to_le16(
+                APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES),
+            .mapping_count = 0,
+            .payload_bytes = cpu_to_le32(
+                sizeof(AppleVirglSynchronizeResourcesV1)),
+        },
+        .payload = {
+            .task_id = cpu_to_le32(3),
+            .resource_count = cpu_to_le32(1),
+            .resource_id = cpu_to_le32(7),
+        },
     };
 
     return submit;
@@ -561,6 +588,43 @@ static void test_memory_unmap_size(void)
     assert_rejected(&submit, sizeof(submit));
 }
 
+static void test_synchronize_resources_valid(void)
+{
+    SynchronizeResourcesSubmit submit = valid_synchronize_resources_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(le16_to_cpu(view.header->opcode), ==,
+                     APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES);
+    g_assert_cmpuint(view.mapping_count, ==, 0);
+    g_assert_cmpuint(ldl_le_p(view.payload), ==, 3);
+    g_assert_cmpuint(ldl_le_p(view.payload + 4), ==, 1);
+    g_assert_cmpuint(ldl_le_p(view.payload + 8), ==, 7);
+}
+
+static void test_synchronize_resources_shape(void)
+{
+    SynchronizeResourcesSubmit submit = valid_synchronize_resources_submit();
+
+    submit.payload.resource_count = 0;
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_synchronize_resources_submit();
+    submit.payload.resource_count = cpu_to_le32(2);
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_synchronize_resources_submit();
+    submit.payload.resource_id = 0;
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_synchronize_resources_submit();
+    submit.header.mapping_count = cpu_to_le32(1);
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_synchronize_resources_submit();
+    submit.header.payload_bytes = cpu_to_le32(8);
+    assert_rejected(&submit, sizeof(submit));
+}
+
 static void test_bind_kernel_task(void)
 {
     BindTaskSubmit submit = valid_bind_task_submit(0);
@@ -701,6 +765,10 @@ int main(int argc, char **argv)
                     test_memory_unmap_kernel_task);
     g_test_add_func("/apple-virgl/protocol/memory-unmap-size",
                     test_memory_unmap_size);
+    g_test_add_func("/apple-virgl/protocol/synchronize-resources-valid",
+                    test_synchronize_resources_valid);
+    g_test_add_func("/apple-virgl/protocol/synchronize-resources-shape",
+                    test_synchronize_resources_shape);
     g_test_add_func("/apple-virgl/protocol/bind-kernel-task",
                     test_bind_kernel_task);
     g_test_add_func("/apple-virgl/protocol/bind-task-mapping",

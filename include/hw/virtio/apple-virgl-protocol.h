@@ -22,6 +22,7 @@
 #define APPLE_VIRGL_SUBMIT_DISPLAY_SET_SHARED_STATE 6u
 #define APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3 7u
 #define APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO 8u
+#define APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES 9u
 
 #define APPLE_VIRGL_MAX_SUBMIT_MAPPINGS 4096u
 #define APPLE_VIRGL_MAX_SUBMIT_PAYLOAD (16u * 1024u * 1024u)
@@ -63,6 +64,13 @@ typedef struct QEMU_PACKED AppleVirglComputeInfoV1 {
     uint32_t pair_count;
     uint64_t reply_gpu_va;
 } AppleVirglComputeInfoV1;
+
+/* Exact APV CmdSynchronizeResources payload for one resource. */
+typedef struct QEMU_PACKED AppleVirglSynchronizeResourcesV1 {
+    uint32_t task_id;
+    uint32_t resource_count;
+    uint32_t resource_id;
+} AppleVirglSynchronizeResourcesV1;
 
 typedef struct AppleVirglSubmitView {
     const AppleVirglSubmitHeaderV1 *header;

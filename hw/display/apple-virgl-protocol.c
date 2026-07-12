@@ -13,6 +13,7 @@ QEMU_BUILD_BUG_ON(sizeof(AppleVirglCapsetV1) != 16);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitHeaderV1) != 16);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitMappingV1) != 32);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglComputeInfoV1) != 24);
+QEMU_BUILD_BUG_ON(sizeof(AppleVirglSynchronizeResourcesV1) != 12);
 
 void apple_virgl_protocol_fill_capset(AppleVirglCapsetV1 *capset)
 {
@@ -272,6 +273,26 @@ static bool apple_virgl_protocol_validate_compute_info(
     return true;
 }
 
+static bool apple_virgl_protocol_validate_synchronize_resources(
+    uint32_t mapping_count,
+    const uint8_t *payload,
+    uint32_t payload_bytes,
+    Error **errp)
+{
+    if (mapping_count != 0 ||
+        payload_bytes != sizeof(AppleVirglSynchronizeResourcesV1)) {
+        error_setg(errp,
+                   "apple-virgl SYNCHRONIZE_RESOURCES requires a 12-byte payload and no mappings");
+        return false;
+    }
+    if (ldl_le_p(payload + 4) != 1 || ldl_le_p(payload + 8) == 0) {
+        error_setg(errp,
+                   "apple-virgl SYNCHRONIZE_RESOURCES must name exactly one resource");
+        return false;
+    }
+    return true;
+}
+
 bool apple_virgl_protocol_decode_submit(const void *bytes,
                                         size_t size,
                                         AppleVirglSubmitView *view,
@@ -313,7 +334,8 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         opcode != APPLE_VIRGL_SUBMIT_BIND_TASK &&
         opcode != APPLE_VIRGL_SUBMIT_DISPLAY_SET_SHARED_STATE &&
         opcode != APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3 &&
-        opcode != APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO) {
+        opcode != APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO &&
+        opcode != APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES) {
         error_setg(errp, "apple-virgl submit opcode is unsupported");
         return false;
     }
@@ -397,6 +419,12 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     case APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO:
         if (!apple_virgl_protocol_validate_compute_info(
                 mappings, mapping_count, payload, payload_bytes, errp)) {
+            return false;
+        }
+        break;
+    case APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES:
+        if (!apple_virgl_protocol_validate_synchronize_resources(
+                mapping_count, payload, payload_bytes, errp)) {
             return false;
         }
         break;
