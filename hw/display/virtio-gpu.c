@@ -1132,6 +1132,7 @@ static void virtio_gpu_ctrl_bh(void *opaque)
 static void virtio_gpu_handle_cursor(VirtIODevice *vdev, VirtQueue *vq)
 {
     VirtIOGPU *g = VIRTIO_GPU(vdev);
+    VirtIOGPUClass *vgc = VIRTIO_GPU_GET_CLASS(g);
     VirtQueueElement *elem;
     size_t s;
     struct virtio_gpu_update_cursor cursor_info;
@@ -1143,6 +1144,11 @@ static void virtio_gpu_handle_cursor(VirtIODevice *vdev, VirtQueue *vq)
         elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
         if (!elem) {
             break;
+        }
+
+        if (vgc->handle_cursor_element &&
+            vgc->handle_cursor_element(g, vq, elem)) {
+            continue;
         }
 
         s = iov_to_buf(elem->out_sg, elem->out_num, 0,

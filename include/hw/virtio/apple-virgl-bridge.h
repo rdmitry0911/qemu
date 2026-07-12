@@ -12,6 +12,8 @@
 
 typedef struct VirtIOGPU VirtIOGPU;
 typedef struct AppleVirglBridge AppleVirglBridge;
+typedef struct VirtQueue VirtQueue;
+typedef struct VirtQueueElement VirtQueueElement;
 struct iovec;
 
 AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu);
@@ -51,5 +53,8 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
                               uint32_t context_id,
                               const void *bytes,
                               size_t size);
+
+bool apple_virgl_bridge_accept_completion_receiver(
+    AppleVirglBridge *bridge, VirtQueue *vq, VirtQueueElement *elem);
 
 #endif

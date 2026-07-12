@@ -61,6 +61,16 @@ static void virtio_gpu_gl_flushed(VirtIOGPUBase *b)
     virtio_gpu_process_cmdq(g);
 }
 
+static bool virtio_gpu_gl_handle_cursor_element(VirtIOGPU *g,
+                                                VirtQueue *vq,
+                                                VirtQueueElement *elem)
+{
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+
+    return apple_virgl_bridge_accept_completion_receiver(
+        gl->apple_virgl_bridge, vq, elem);
+}
+
 static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
 {
     VirtIOGPU *g = VIRTIO_GPU(vdev);
@@ -201,6 +211,7 @@ static void virtio_gpu_gl_class_init(ObjectClass *klass, const void *data)
     vgc->handle_ctrl = virtio_gpu_gl_handle_ctrl;
     vgc->process_cmd = virtio_gpu_virgl_process_cmd;
     vgc->update_cursor_data = virtio_gpu_gl_update_cursor_data;
+    vgc->handle_cursor_element = virtio_gpu_gl_handle_cursor_element;
 
     vdc->realize = virtio_gpu_gl_device_realize;
     vdc->unrealize = virtio_gpu_gl_device_unrealize;

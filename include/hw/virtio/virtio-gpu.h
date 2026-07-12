@@ -230,6 +230,8 @@ struct VirtIOGPUClass {
     void (*update_cursor_data)(VirtIOGPU *g,
                                struct virtio_gpu_scanout *s,
                                uint32_t resource_id);
+    bool (*handle_cursor_element)(VirtIOGPU *g, VirtQueue *vq,
+                                  VirtQueueElement *elem);
     void (*resource_destroy)(VirtIOGPU *g,
                              struct virtio_gpu_simple_resource *res,
                              Error **errp);

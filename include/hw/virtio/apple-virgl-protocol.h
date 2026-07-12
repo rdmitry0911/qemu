@@ -15,8 +15,13 @@
 #define APPLE_VIRGL_CAPSET_MAGIC 0x4c475641u /* "AVGL", little-endian */
 #define APPLE_VIRGL_PROTOCOL_VERSION_V1 1u
 #define APPLE_VIRGL_PROTOCOL_VERSION_V2 2u
-#define APPLE_VIRGL_PROTOCOL_VERSION APPLE_VIRGL_PROTOCOL_VERSION_V2
+#define APPLE_VIRGL_PROTOCOL_VERSION_V3 3u
+#define APPLE_VIRGL_PROTOCOL_VERSION APPLE_VIRGL_PROTOCOL_VERSION_V3
 #define APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP (1u << 0)
+#define APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_EVENT (1u << 1)
+#define APPLE_VIRGL_CURSOR_CMD_COMPLETION_RECEIVE 0xa11e0001u
+#define APPLE_VIRGL_COMPLETION_EVENT_MAGIC 0x45435641u /* "AVCE", little-endian */
+#define APPLE_VIRGL_COMPLETION_EVENT_TYPE_STAMP 1u
 #define APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3 1u
 #define APPLE_VIRGL_SUBMIT_SET_OBJECT_LIST 2u
 #define APPLE_VIRGL_SUBMIT_MAP_MEMORY2 3u
@@ -80,6 +85,21 @@ typedef struct QEMU_PACKED AppleVirglExecCompletionV2 {
     uint32_t channel_id;
     uint32_t stamp;
 } AppleVirglExecCompletionV2;
+
+/* Version-3 cursor-queue receive-credit payload, after virtio_gpu_ctrl_hdr. */
+typedef struct QEMU_PACKED AppleVirglCompletionReceiverRequestV3 {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+} AppleVirglCompletionReceiverRequestV3;
+
+typedef struct QEMU_PACKED AppleVirglCompletionEventV3 {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t type;
+    uint32_t channel_id;
+    uint32_t stamp;
+} AppleVirglCompletionEventV3;
 
 typedef struct AppleVirglSubmitView {
     const AppleVirglSubmitHeaderV1 *header;

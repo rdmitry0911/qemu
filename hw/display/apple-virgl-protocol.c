@@ -15,6 +15,8 @@ QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitMappingV1) != 32);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglComputeInfoV1) != 24);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSynchronizeResourcesV1) != 12);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglExecCompletionV2) != 8);
+QEMU_BUILD_BUG_ON(sizeof(AppleVirglCompletionReceiverRequestV3) != 8);
+QEMU_BUILD_BUG_ON(sizeof(AppleVirglCompletionEventV3) != 16);
 
 void apple_virgl_protocol_fill_capset(AppleVirglCapsetV1 *capset,
                                       uint16_t version)
@@ -25,8 +27,12 @@ void apple_virgl_protocol_fill_capset(AppleVirglCapsetV1 *capset,
     *capset = (AppleVirglCapsetV1) {
         .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
         .version = cpu_to_le16(version),
-        .flags = cpu_to_le16(version >= APPLE_VIRGL_PROTOCOL_VERSION_V2 ?
-                           APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP : 0),
+        .flags = cpu_to_le16(
+            version >= APPLE_VIRGL_PROTOCOL_VERSION_V3 ?
+                APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP |
+                    APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_EVENT :
+            version >= APPLE_VIRGL_PROTOCOL_VERSION_V2 ?
+                APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP : 0),
         .max_mappings = cpu_to_le32(APPLE_VIRGL_MAX_SUBMIT_MAPPINGS),
         .max_payload_bytes = cpu_to_le32(APPLE_VIRGL_MAX_SUBMIT_PAYLOAD),
     };
@@ -393,7 +399,7 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
 
             if (payload_bytes < sizeof(*completion)) {
                 error_setg(errp,
-                           "apple-virgl version-2 ExecIndirect3 completion prefix is missing");
+                           "apple-virgl completion-enabled ExecIndirect3 prefix is missing");
                 return false;
             }
             completion = (const AppleVirglExecCompletionV2 *)payload;
@@ -403,7 +409,7 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
                 view->completion_channel_id >= 8 ||
                 view->completion_stamp == 0) {
                 error_setg(errp,
-                           "apple-virgl version-2 ExecIndirect3 completion identity is invalid");
+                           "apple-virgl completion-enabled ExecIndirect3 identity is invalid");
                 return false;
             }
             payload += sizeof(*completion);

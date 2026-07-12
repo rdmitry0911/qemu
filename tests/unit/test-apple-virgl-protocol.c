@@ -391,6 +391,22 @@ static void test_valid_exec_completion_v2(void)
     g_assert_cmpuint(view.completion_stamp, ==, 0x5a5a);
 }
 
+static void test_valid_exec_completion_v3(void)
+{
+    ExecCompletionSubmitV2 submit = valid_exec_completion_submit_v2();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    submit.header.version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION_V3);
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(view.version, ==, APPLE_VIRGL_PROTOCOL_VERSION_V3);
+    g_assert_cmpuint(view.payload_bytes, ==, 28);
+    g_assert_cmpuint(view.completion_channel_id, ==, 1);
+    g_assert_cmpuint(view.completion_stamp, ==, 0x5a5a);
+}
+
 static void test_exec_completion_v2_requires_identity(void)
 {
     ExecCompletionSubmitV2 submit = valid_exec_completion_submit_v2();
@@ -417,6 +433,13 @@ static void test_capset_versions(void)
                      APPLE_VIRGL_PROTOCOL_VERSION_V2);
     g_assert_cmpuint(le16_to_cpu(capset.flags), ==,
                      APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP);
+    apple_virgl_protocol_fill_capset(&capset,
+                                     APPLE_VIRGL_PROTOCOL_VERSION_V3);
+    g_assert_cmpuint(le16_to_cpu(capset.version), ==,
+                     APPLE_VIRGL_PROTOCOL_VERSION_V3);
+    g_assert_cmpuint(le16_to_cpu(capset.flags), ==,
+                     APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP |
+                     APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_EVENT);
 }
 
 static void test_compute_info_valid(void)
@@ -807,6 +830,8 @@ int main(int argc, char **argv)
     g_test_add_func("/apple-virgl/protocol/valid", test_valid_submit);
     g_test_add_func("/apple-virgl/protocol/exec-completion-v2-valid",
                     test_valid_exec_completion_v2);
+    g_test_add_func("/apple-virgl/protocol/exec-completion-v3-valid",
+                    test_valid_exec_completion_v3);
     g_test_add_func("/apple-virgl/protocol/exec-completion-v2-identity",
                     test_exec_completion_v2_requires_identity);
     g_test_add_func("/apple-virgl/protocol/capset-versions",

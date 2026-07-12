@@ -10,6 +10,7 @@
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
@@ -53,6 +54,16 @@ typedef struct AppleVirglContextState {
     GArray *mappings;
 } AppleVirglContextState;
 
+typedef struct AppleVirglCompletionReceiver {
+    VirtQueue *vq;
+    VirtQueueElement *elem;
+} AppleVirglCompletionReceiver;
+
+typedef struct AppleVirglCompletionStamp {
+    uint32_t channel_id;
+    uint32_t stamp;
+} AppleVirglCompletionStamp;
+
 struct AppleVirglBridge {
     VirtIOGPU *gpu;
     QemuMutex lock;
@@ -61,7 +72,162 @@ struct AppleVirglBridge {
     qmu_session *session;
     uint64_t submit_count;
     uint64_t frame_count;
+    QemuMutex completion_lock;
+    GQueue completion_receivers;
+    GQueue completion_stamps;
+    QEMUBH *completion_bh;
+    bool completion_bh_scheduled;
+    bool completion_shutdown;
+    bool completion_resetting;
 };
+
+static void apple_virgl_completion_receiver_free(
+    AppleVirglCompletionReceiver *receiver)
+{
+    if (!receiver) {
+        return;
+    }
+    g_free(receiver->elem);
+    g_free(receiver);
+}
+
+static bool apple_virgl_completion_maybe_schedule_locked(
+    AppleVirglBridge *bridge)
+{
+    if (bridge->completion_shutdown || bridge->completion_resetting ||
+        bridge->completion_bh_scheduled ||
+        g_queue_is_empty(&bridge->completion_receivers) ||
+        g_queue_is_empty(&bridge->completion_stamps)) {
+        return false;
+    }
+
+    bridge->completion_bh_scheduled = true;
+    return true;
+}
+
+static void apple_virgl_completion_bh(void *opaque)
+{
+    AppleVirglBridge *bridge = opaque;
+
+    for (;;) {
+        AppleVirglCompletionReceiver *receiver;
+        AppleVirglCompletionStamp *stamp;
+        AppleVirglCompletionEventV3 event;
+        size_t written;
+
+        qemu_mutex_lock(&bridge->completion_lock);
+        if (bridge->completion_shutdown || bridge->completion_resetting ||
+            g_queue_is_empty(&bridge->completion_receivers) ||
+            g_queue_is_empty(&bridge->completion_stamps)) {
+            bridge->completion_bh_scheduled = false;
+            qemu_mutex_unlock(&bridge->completion_lock);
+            return;
+        }
+        receiver = g_queue_pop_head(&bridge->completion_receivers);
+        stamp = g_queue_pop_head(&bridge->completion_stamps);
+        qemu_mutex_unlock(&bridge->completion_lock);
+
+        event = (AppleVirglCompletionEventV3) {
+            .magic = cpu_to_le32(APPLE_VIRGL_COMPLETION_EVENT_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION_V3),
+            .type = cpu_to_le16(APPLE_VIRGL_COMPLETION_EVENT_TYPE_STAMP),
+            .channel_id = cpu_to_le32(stamp->channel_id),
+            .stamp = cpu_to_le32(stamp->stamp),
+        };
+        written = iov_from_buf(receiver->elem->in_sg,
+                               receiver->elem->in_num, 0, &event,
+                               sizeof(event));
+        if (written != sizeof(event)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "apple-virgl completion receiver write failed (%zu/%zu)\n",
+                          written, sizeof(event));
+            qemu_mutex_lock(&bridge->completion_lock);
+            if (!bridge->completion_shutdown && !bridge->completion_resetting) {
+                g_queue_push_head(&bridge->completion_stamps, stamp);
+            } else {
+                g_free(stamp);
+            }
+            bridge->completion_bh_scheduled = false;
+            qemu_mutex_unlock(&bridge->completion_lock);
+            virtqueue_push(receiver->vq, receiver->elem, 0);
+            virtio_notify(VIRTIO_DEVICE(bridge->gpu), receiver->vq);
+            apple_virgl_completion_receiver_free(receiver);
+            return;
+        }
+
+        virtqueue_push(receiver->vq, receiver->elem, written);
+        virtio_notify(VIRTIO_DEVICE(bridge->gpu), receiver->vq);
+        apple_virgl_completion_receiver_free(receiver);
+        g_free(stamp);
+    }
+}
+
+static void apple_virgl_completion_stamp(void *opaque, uint32_t channel_id,
+                                         uint32_t stamp_value)
+{
+    AppleVirglBridge *bridge = opaque;
+    AppleVirglCompletionStamp *stamp;
+    bool schedule = false;
+
+    if (!bridge || channel_id == 0 || channel_id >= 8 || stamp_value == 0) {
+        return;
+    }
+
+    stamp = g_new(AppleVirglCompletionStamp, 1);
+    stamp->channel_id = channel_id;
+    stamp->stamp = stamp_value;
+
+    qemu_mutex_lock(&bridge->completion_lock);
+    if (!bridge->completion_shutdown && !bridge->completion_resetting) {
+        g_queue_push_tail(&bridge->completion_stamps, stamp);
+        schedule = apple_virgl_completion_maybe_schedule_locked(bridge);
+        stamp = NULL;
+    }
+    qemu_mutex_unlock(&bridge->completion_lock);
+
+    g_free(stamp);
+    if (schedule) {
+        qemu_bh_schedule(bridge->completion_bh);
+    }
+}
+
+static void apple_virgl_bridge_clear_completion_state(AppleVirglBridge *bridge,
+                                                       bool resume)
+{
+    GQueue receivers = G_QUEUE_INIT;
+    GQueue stamps = G_QUEUE_INIT;
+
+    if (!bridge) {
+        return;
+    }
+
+    qemu_mutex_lock(&bridge->completion_lock);
+    bridge->completion_resetting = true;
+    qemu_mutex_unlock(&bridge->completion_lock);
+    if (bridge->completion_bh) {
+        qemu_bh_cancel(bridge->completion_bh);
+    }
+    qemu_mutex_lock(&bridge->completion_lock);
+    receivers = bridge->completion_receivers;
+    stamps = bridge->completion_stamps;
+    g_queue_init(&bridge->completion_receivers);
+    g_queue_init(&bridge->completion_stamps);
+    bridge->completion_bh_scheduled = false;
+    qemu_mutex_unlock(&bridge->completion_lock);
+
+    while (!g_queue_is_empty(&receivers)) {
+        apple_virgl_completion_receiver_free(g_queue_pop_head(&receivers));
+    }
+    while (!g_queue_is_empty(&stamps)) {
+        g_free(g_queue_pop_head(&stamps));
+    }
+
+    qemu_mutex_lock(&bridge->completion_lock);
+    if (resume && !bridge->completion_shutdown) {
+        bridge->completion_resetting = false;
+    }
+    qemu_mutex_unlock(&bridge->completion_lock);
+}
 
 static void apple_virgl_context_free(gpointer opaque)
 {
@@ -309,6 +475,12 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     bridge = g_new0(AppleVirglBridge, 1);
     bridge->gpu = gpu;
     qemu_mutex_init(&bridge->lock);
+    qemu_mutex_init(&bridge->completion_lock);
+    g_queue_init(&bridge->completion_receivers);
+    g_queue_init(&bridge->completion_stamps);
+    bridge->completion_bh = qemu_bh_new_guarded(
+        apple_virgl_completion_bh, bridge,
+        &DEVICE(gpu)->mem_reentrancy_guard);
     bridge->contexts = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                               NULL, apple_virgl_context_free);
     bridge->resources = g_hash_table_new_full(g_direct_hash, g_direct_equal,
@@ -320,6 +492,7 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     callbacks.read_memory = apple_virgl_read_memory;
     callbacks.write_memory = apple_virgl_write_memory;
     callbacks.read_gpu_memory = apple_virgl_read_gpu_memory;
+    callbacks.completion_stamp = apple_virgl_completion_stamp;
     callbacks.present_frame = apple_virgl_present_frame;
     bridge->session = qmu_create(&config, &callbacks);
     if (!bridge->session) {
@@ -338,12 +511,20 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
     if (!bridge) {
         return;
     }
+    qemu_mutex_lock(&bridge->completion_lock);
+    bridge->completion_shutdown = true;
+    qemu_mutex_unlock(&bridge->completion_lock);
     if (bridge->session) {
         qmu_session_begin_shutdown(bridge->session);
         qmu_destroy(bridge->session);
     }
+    apple_virgl_bridge_clear_completion_state(bridge, false);
+    if (bridge->completion_bh) {
+        qemu_bh_delete(bridge->completion_bh);
+    }
     g_hash_table_destroy(bridge->contexts);
     g_hash_table_destroy(bridge->resources);
+    qemu_mutex_destroy(&bridge->completion_lock);
     qemu_mutex_destroy(&bridge->lock);
     g_free(bridge);
 }
@@ -356,6 +537,7 @@ void apple_virgl_bridge_reset(AppleVirglBridge *bridge)
     if (!bridge) {
         return;
     }
+    apple_virgl_bridge_clear_completion_state(bridge, false);
     qemu_mutex_lock(&bridge->lock);
     g_hash_table_iter_init(&iter, bridge->contexts);
     while (g_hash_table_iter_next(&iter, NULL, &value)) {
@@ -369,6 +551,73 @@ void apple_virgl_bridge_reset(AppleVirglBridge *bridge)
     g_hash_table_remove_all(bridge->resources);
     bridge->submit_count = 0;
     qemu_mutex_unlock(&bridge->lock);
+    qemu_mutex_lock(&bridge->completion_lock);
+    if (!bridge->completion_shutdown) {
+        bridge->completion_resetting = false;
+    }
+    qemu_mutex_unlock(&bridge->completion_lock);
+}
+
+bool apple_virgl_bridge_accept_completion_receiver(
+    AppleVirglBridge *bridge, VirtQueue *vq, VirtQueueElement *elem)
+{
+    struct virtio_gpu_ctrl_hdr header;
+    AppleVirglCompletionReceiverRequestV3 request;
+    AppleVirglCompletionReceiver *receiver;
+    size_t copied;
+    bool schedule;
+
+    if (!bridge || !vq || !elem || elem->out_num == 0) {
+        return false;
+    }
+    copied = iov_to_buf(elem->out_sg, elem->out_num, 0, &header,
+                        sizeof(header));
+    if (copied != sizeof(header) ||
+        le32_to_cpu(header.type) !=
+            APPLE_VIRGL_CURSOR_CMD_COMPLETION_RECEIVE) {
+        return false;
+    }
+
+    copied = iov_to_buf(elem->out_sg, elem->out_num, sizeof(header),
+                        &request, sizeof(request));
+    if (iov_size(elem->out_sg, elem->out_num) !=
+            sizeof(header) + sizeof(request) ||
+        copied != sizeof(request) ||
+        iov_size(elem->in_sg, elem->in_num) !=
+            sizeof(AppleVirglCompletionEventV3) ||
+        le32_to_cpu(header.flags) != 0 ||
+        le64_to_cpu(header.fence_id) != 0 ||
+        le32_to_cpu(header.ctx_id) != 0 || header.ring_idx != 0 ||
+        le32_to_cpu(request.magic) != APPLE_VIRGL_COMPLETION_EVENT_MAGIC ||
+        le16_to_cpu(request.version) != APPLE_VIRGL_PROTOCOL_VERSION_V3 ||
+        le16_to_cpu(request.reserved) != 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "apple-virgl completion receiver is malformed\n");
+        virtqueue_push(vq, elem, 0);
+        virtio_notify(VIRTIO_DEVICE(bridge->gpu), vq);
+        g_free(elem);
+        return true;
+    }
+
+    receiver = g_new(AppleVirglCompletionReceiver, 1);
+    receiver->vq = vq;
+    receiver->elem = elem;
+    qemu_mutex_lock(&bridge->completion_lock);
+    if (bridge->completion_shutdown || bridge->completion_resetting) {
+        qemu_mutex_unlock(&bridge->completion_lock);
+        virtqueue_push(vq, elem, 0);
+        virtio_notify(VIRTIO_DEVICE(bridge->gpu), vq);
+        apple_virgl_completion_receiver_free(receiver);
+        return true;
+    }
+    g_queue_push_tail(&bridge->completion_receivers, receiver);
+    schedule = apple_virgl_completion_maybe_schedule_locked(bridge);
+    qemu_mutex_unlock(&bridge->completion_lock);
+
+    if (schedule) {
+        qemu_bh_schedule(bridge->completion_bh);
+    }
+    return true;
 }
 
 bool apple_virgl_bridge_has_context(AppleVirglBridge *bridge,
