@@ -33,8 +33,7 @@ struct virtio_gpu_virgl_resource {
     uint64_t apple_virgl_size;
 };
 
-static AppleVirglBridge *virtio_gpu_apple_virgl_bridge(VirtIOGPU *g,
-                                                       bool create)
+AppleVirglBridge *virtio_gpu_apple_virgl_bridge(VirtIOGPU *g, bool create)
 {
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
 

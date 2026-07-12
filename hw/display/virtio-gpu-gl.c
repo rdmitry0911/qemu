@@ -20,6 +20,7 @@
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
 #include "hw/virtio/apple-virgl-bridge.h"
+#include "hw/virtio/apple-virgl-protocol.h"
 #include "hw/virtio/virtio-gpu-bswap.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
 #include "hw/core/qdev-properties.h"
@@ -65,10 +66,18 @@ static bool virtio_gpu_gl_handle_cursor_element(VirtIOGPU *g,
                                                 VirtQueue *vq,
                                                 VirtQueueElement *elem)
 {
-    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+    AppleVirglBridge *bridge;
+    struct virtio_gpu_ctrl_hdr header = { 0 };
+    size_t copied = iov_to_buf(elem->out_sg, elem->out_num, 0, &header,
+                               sizeof(header));
 
-    return apple_virgl_bridge_accept_completion_receiver(
-        gl->apple_virgl_bridge, vq, elem);
+    if (copied != sizeof(header) ||
+        le32_to_cpu(header.type) != APPLE_VIRGL_CURSOR_CMD_COMPLETION_RECEIVE) {
+        return false;
+    }
+
+    bridge = virtio_gpu_apple_virgl_bridge(g, true);
+    return apple_virgl_bridge_accept_completion_receiver(bridge, vq, elem);
 }
 
 static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)

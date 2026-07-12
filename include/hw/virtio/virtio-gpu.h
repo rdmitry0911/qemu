@@ -385,5 +385,7 @@ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g);
 void virtio_gpu_virgl_reset(VirtIOGPU *g);
 int virtio_gpu_virgl_init(VirtIOGPU *g);
 GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g);
+struct AppleVirglBridge *virtio_gpu_apple_virgl_bridge(VirtIOGPU *g,
+                                                       bool create);
 
 #endif
