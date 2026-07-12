@@ -39,6 +39,11 @@ option('coroutine_backend', type: 'combo',
 option('gdb', type: 'string', value: '',
        description: 'Path to GDB')
 
+option('apple_virgl_qmetal_source_dir', type: 'string', value: '',
+       description: 'Source directory for the local apple-virgl QMetal build')
+option('apple_virgl_qmetal_build_dir', type: 'string', value: '',
+       description: 'Build directory for the local apple-virgl QMetal library')
+
 # Everything else can be set via --enable/--disable-* option
 # on the configure script command line.  After adding an option
 # here make sure to run "make update-buildoptions".

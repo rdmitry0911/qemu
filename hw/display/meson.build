@@ -96,12 +96,22 @@ else
     mlapi_dep = dependency('mlapi', required: false, static: false)
 
     if not mlapi_dep.found()
+        qmetal_source_dir = get_option('apple_virgl_qmetal_source_dir')
+        qmetal_build_dir = get_option('apple_virgl_qmetal_build_dir')
+
+        if qmetal_source_dir == ''
+            qmetal_source_dir = meson.current_source_dir() / '../../../qmetal'
+        endif
+        if qmetal_build_dir == ''
+            qmetal_build_dir = join_paths(qmetal_source_dir, 'build')
+        endif
+
         # Include directories: qmetal unified API + pvg protocol headers
         mlapi_inc = include_directories(
-            '../../../qmetal/include',
-            '../../../qmetal/include/pvg'
+            join_paths(qmetal_source_dir, 'include'),
+            join_paths(qmetal_source_dir, 'include/pvg')
         )
-        mlapi_dir = meson.current_source_dir() / '../../../qmetal/build'
+        mlapi_dir = qmetal_build_dir
         mlapi_lib_so = mlapi_dir / 'libmlapi.so'
 
         if not fs.exists(mlapi_lib_so)

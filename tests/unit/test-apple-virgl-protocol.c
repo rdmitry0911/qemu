@@ -19,6 +19,17 @@ typedef struct QEMU_PACKED OneMappingSubmit {
     uint64_t command_length;
 } OneMappingSubmit;
 
+typedef struct QEMU_PACKED ExecCompletionSubmitV2 {
+    AppleVirglSubmitHeaderV1 header;
+    AppleVirglSubmitMappingV1 mapping;
+    AppleVirglExecCompletionV2 completion;
+    uint32_t task_id;
+    uint32_t resource_count;
+    uint32_t command_count;
+    uint64_t command_gpu_va;
+    uint64_t command_length;
+} ExecCompletionSubmitV2;
+
 typedef struct QEMU_PACKED ObjectListSubmit {
     AppleVirglSubmitHeaderV1 header;
     AppleVirglSubmitMappingV1 mapping;
@@ -86,7 +97,7 @@ static OneMappingSubmit valid_submit(void)
     OneMappingSubmit submit = {
         .header = {
             .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
-            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION_V1),
             .opcode = cpu_to_le16(APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3),
             .mapping_count = cpu_to_le32(1),
             .payload_bytes = cpu_to_le32(28),
@@ -101,6 +112,35 @@ static OneMappingSubmit valid_submit(void)
         },
         .task_id = cpu_to_le32(3),
         .resource_count = 0,
+        .command_count = cpu_to_le32(1),
+        .command_gpu_va = cpu_to_le64(0x4000),
+        .command_length = cpu_to_le64(600),
+    };
+
+    return submit;
+}
+
+static ExecCompletionSubmitV2 valid_exec_completion_submit_v2(void)
+{
+    ExecCompletionSubmitV2 submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION_V2),
+            .opcode = cpu_to_le16(APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3),
+            .mapping_count = cpu_to_le32(1),
+            .payload_bytes = cpu_to_le32(36),
+        },
+        .mapping = {
+            .gpu_va = cpu_to_le64(0x4000),
+            .length = cpu_to_le64(0x1000),
+            .backing_resource_id = cpu_to_le32(17),
+            .apple_resource_id = cpu_to_le32(7),
+        },
+        .completion = {
+            .channel_id = cpu_to_le32(1),
+            .stamp = cpu_to_le32(0x5a5a),
+        },
+        .task_id = cpu_to_le32(3),
         .command_count = cpu_to_le32(1),
         .command_gpu_va = cpu_to_le64(0x4000),
         .command_length = cpu_to_le64(600),
@@ -330,6 +370,53 @@ static void test_valid_submit(void)
     g_assert_cmpuint(view.mapping_count, ==, 1);
     g_assert_cmpuint(view.payload_bytes, ==, 28);
     g_assert_cmpuint(ldl_le_p(view.payload), ==, 3);
+    g_assert_cmpuint(view.version, ==, APPLE_VIRGL_PROTOCOL_VERSION_V1);
+    g_assert_cmpuint(view.completion_channel_id, ==, 0);
+    g_assert_cmpuint(view.completion_stamp, ==, 0);
+}
+
+static void test_valid_exec_completion_v2(void)
+{
+    ExecCompletionSubmitV2 submit = valid_exec_completion_submit_v2();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(view.version, ==, APPLE_VIRGL_PROTOCOL_VERSION_V2);
+    g_assert_cmpuint(view.payload_bytes, ==, 28);
+    g_assert_cmpuint(ldl_le_p(view.payload), ==, 3);
+    g_assert_cmpuint(view.completion_channel_id, ==, 1);
+    g_assert_cmpuint(view.completion_stamp, ==, 0x5a5a);
+}
+
+static void test_exec_completion_v2_requires_identity(void)
+{
+    ExecCompletionSubmitV2 submit = valid_exec_completion_submit_v2();
+
+    submit.completion.channel_id = 0;
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_exec_completion_submit_v2();
+    submit.completion.stamp = 0;
+    assert_rejected(&submit, sizeof(submit));
+}
+
+static void test_capset_versions(void)
+{
+    AppleVirglCapsetV1 capset;
+
+    apple_virgl_protocol_fill_capset(&capset,
+                                     APPLE_VIRGL_PROTOCOL_VERSION_V1);
+    g_assert_cmpuint(le16_to_cpu(capset.version), ==,
+                     APPLE_VIRGL_PROTOCOL_VERSION_V1);
+    g_assert_cmpuint(le16_to_cpu(capset.flags), ==, 0);
+    apple_virgl_protocol_fill_capset(&capset,
+                                     APPLE_VIRGL_PROTOCOL_VERSION_V2);
+    g_assert_cmpuint(le16_to_cpu(capset.version), ==,
+                     APPLE_VIRGL_PROTOCOL_VERSION_V2);
+    g_assert_cmpuint(le16_to_cpu(capset.flags), ==,
+                     APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP);
 }
 
 static void test_compute_info_valid(void)
@@ -718,6 +805,12 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/apple-virgl/protocol/valid", test_valid_submit);
+    g_test_add_func("/apple-virgl/protocol/exec-completion-v2-valid",
+                    test_valid_exec_completion_v2);
+    g_test_add_func("/apple-virgl/protocol/exec-completion-v2-identity",
+                    test_exec_completion_v2_requires_identity);
+    g_test_add_func("/apple-virgl/protocol/capset-versions",
+                    test_capset_versions);
     g_test_add_func("/apple-virgl/protocol/compute-info-valid",
                     test_compute_info_valid);
     g_test_add_func("/apple-virgl/protocol/compute-info-reply-range",

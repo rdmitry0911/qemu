@@ -1011,13 +1011,14 @@ static void virgl_cmd_get_capset(VirtIOGPU *g,
     if (gc.capset_id == VIRTIO_GPU_CAPSET_APPLE_VIRGL) {
         AppleVirglCapsetV1 capset;
 
-        if (gc.capset_version != APPLE_VIRGL_PROTOCOL_VERSION) {
+        if (gc.capset_version < APPLE_VIRGL_PROTOCOL_VERSION_V1 ||
+            gc.capset_version > APPLE_VIRGL_PROTOCOL_VERSION) {
             cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
             return;
         }
         resp = g_malloc0(sizeof(*resp) + sizeof(capset));
         resp->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET;
-        apple_virgl_protocol_fill_capset(&capset);
+        apple_virgl_protocol_fill_capset(&capset, gc.capset_version);
         memcpy(resp->capset_data, &capset, sizeof(capset));
         virtio_gpu_ctrl_response(g, cmd, &resp->hdr,
                                  sizeof(*resp) + sizeof(capset));

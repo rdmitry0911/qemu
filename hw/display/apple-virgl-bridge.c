@@ -847,9 +847,11 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     if (submit <= 64) {
         fprintf(stderr,
                 "apple-virgl-qemu: submit=%" PRIu64
-                " transport=%u task=%u opcode=%u mappings=%u payload=%u hash=0x%08x\n",
+                " transport=%u task=%u opcode=%u mappings=%u payload=%u"
+                " completion=%u/%u hash=0x%08x\n",
                 submit, context_id, task_id, opcode, view.mapping_count,
-                view.payload_bytes,
+                view.payload_bytes, view.completion_channel_id,
+                view.completion_stamp,
                 apple_virgl_fnv1a(view.payload, view.payload_bytes));
     }
     if (display_channel) {
@@ -859,6 +861,11 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     } else if (gpu_channel) {
         status = qmu_submit_gpu_channel(bridge->session, 0, qmu_opcode,
                                         view.payload, view.payload_bytes);
+    } else if (opcode == APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3 &&
+               view.completion_channel_id != 0) {
+        status = qmu_submit_root_exec_indirect3_with_completion(
+            bridge->session, view.payload, view.payload_bytes,
+            view.completion_channel_id, view.completion_stamp);
     } else {
         status = qmu_submit_root_fifo(bridge->session, qmu_opcode,
                                       view.payload, view.payload_bytes);

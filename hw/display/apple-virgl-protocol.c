@@ -14,13 +14,19 @@ QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitHeaderV1) != 16);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitMappingV1) != 32);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglComputeInfoV1) != 24);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSynchronizeResourcesV1) != 12);
+QEMU_BUILD_BUG_ON(sizeof(AppleVirglExecCompletionV2) != 8);
 
-void apple_virgl_protocol_fill_capset(AppleVirglCapsetV1 *capset)
+void apple_virgl_protocol_fill_capset(AppleVirglCapsetV1 *capset,
+                                      uint16_t version)
 {
+    g_assert(version >= APPLE_VIRGL_PROTOCOL_VERSION_V1);
+    g_assert(version <= APPLE_VIRGL_PROTOCOL_VERSION);
+
     *capset = (AppleVirglCapsetV1) {
         .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
-        .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
-        .flags = 0,
+        .version = cpu_to_le16(version),
+        .flags = cpu_to_le16(version >= APPLE_VIRGL_PROTOCOL_VERSION_V2 ?
+                           APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP : 0),
         .max_mappings = cpu_to_le32(APPLE_VIRGL_MAX_SUBMIT_MAPPINGS),
         .max_payload_bytes = cpu_to_le32(APPLE_VIRGL_MAX_SUBMIT_PAYLOAD),
     };
@@ -302,6 +308,7 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     uint32_t mapping_count;
     uint32_t payload_bytes;
     uint16_t opcode;
+    uint16_t version;
     uint64_t mapping_bytes;
     uint64_t expected;
     const uint8_t *payload;
@@ -322,7 +329,9 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         error_setg(errp, "apple-virgl submit magic is invalid");
         return false;
     }
-    if (le16_to_cpu(header->version) != APPLE_VIRGL_PROTOCOL_VERSION) {
+    version = le16_to_cpu(header->version);
+    if (version < APPLE_VIRGL_PROTOCOL_VERSION_V1 ||
+        version > APPLE_VIRGL_PROTOCOL_VERSION) {
         error_setg(errp, "apple-virgl submit version is unsupported");
         return false;
     }
@@ -379,6 +388,27 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     payload = (const uint8_t *)bytes + sizeof(*header) + mapping_bytes;
     switch (opcode) {
     case APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3:
+        if (version >= APPLE_VIRGL_PROTOCOL_VERSION_V2) {
+            const AppleVirglExecCompletionV2 *completion;
+
+            if (payload_bytes < sizeof(*completion)) {
+                error_setg(errp,
+                           "apple-virgl version-2 ExecIndirect3 completion prefix is missing");
+                return false;
+            }
+            completion = (const AppleVirglExecCompletionV2 *)payload;
+            view->completion_channel_id = le32_to_cpu(completion->channel_id);
+            view->completion_stamp = le32_to_cpu(completion->stamp);
+            if (view->completion_channel_id == 0 ||
+                view->completion_channel_id >= 8 ||
+                view->completion_stamp == 0) {
+                error_setg(errp,
+                           "apple-virgl version-2 ExecIndirect3 completion identity is invalid");
+                return false;
+            }
+            payload += sizeof(*completion);
+            payload_bytes -= sizeof(*completion);
+        }
         if (!apple_virgl_protocol_validate_exec3(payload, payload_bytes,
                                                   errp)) {
             return false;
@@ -435,6 +465,7 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     view->header = header;
     view->mappings = mappings;
     view->payload = payload;
+    view->version = version;
     view->mapping_count = mapping_count;
     view->payload_bytes = payload_bytes;
     return true;
