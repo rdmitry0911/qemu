@@ -903,9 +903,15 @@ static uint32_t apple_virgl_fnv1a(const void *bytes, size_t size)
 
 static int apple_virgl_bridge_bind_task(AppleVirglBridge *bridge,
                                         uint32_t context_id,
-                                        uint32_t task_id)
+                                        const AppleVirglTaskBindV4 *wire)
 {
     AppleVirglContextState *context;
+    const uint8_t *payload = (const uint8_t *)wire;
+    uint32_t task_id_encoded = ldl_le_p(payload);
+    uint32_t task_id = task_id_encoded >> 1;
+    uint64_t vm_size = ldq_le_p(payload + 4);
+    uint32_t task_root_pfn = ldl_le_p(payload + 12);
+    bool is_kernel = (task_id_encoded & 1) != 0;
 
     qemu_mutex_lock(&bridge->lock);
     context = g_hash_table_lookup(bridge->contexts,
@@ -919,7 +925,8 @@ static int apple_virgl_bridge_bind_task(AppleVirglBridge *bridge,
     context->task_bound = true;
     qemu_mutex_unlock(&bridge->lock);
 
-    if (qmu_define_task(bridge->session, task_id, 0, 0) != QMU_OK) {
+    if (qmu_define_task(bridge->session, task_id, task_root_pfn, vm_size) !=
+        QMU_OK) {
         qemu_mutex_lock(&bridge->lock);
         context = g_hash_table_lookup(bridge->contexts,
                                       GUINT_TO_POINTER(context_id));
@@ -932,8 +939,8 @@ static int apple_virgl_bridge_bind_task(AppleVirglBridge *bridge,
     }
 
     fprintf(stderr,
-            "apple-virgl-qemu: task-bind transport=%u task=%u\n",
-            context_id, task_id);
+            "apple-virgl-qemu: task-bind transport=%u task=%u kernel=%u root=0x%x vm=0x%" PRIx64 "\n",
+            context_id, task_id, is_kernel ? 1 : 0, task_root_pfn, vm_size);
     return 0;
 }
 
@@ -965,7 +972,8 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     opcode = le16_to_cpu(view.header->opcode);
     if (opcode == APPLE_VIRGL_SUBMIT_BIND_TASK) {
         return apple_virgl_bridge_bind_task(
-            bridge, context_id, ldl_le_p(view.payload));
+            bridge, context_id,
+            (const AppleVirglTaskBindV4 *)view.payload);
     }
     switch (opcode) {
     case APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3:

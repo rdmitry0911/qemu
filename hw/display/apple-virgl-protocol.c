@@ -15,6 +15,7 @@ QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitMappingV1) != 32);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglComputeInfoV1) != 24);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSynchronizeResourcesV1) != 12);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglExecCompletionV2) != 8);
+QEMU_BUILD_BUG_ON(sizeof(AppleVirglTaskBindV4) != 16);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglCompletionReceiverRequestV3) != 8);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglCompletionEventV3) != 16);
 
@@ -157,13 +158,30 @@ static bool apple_virgl_protocol_validate_memory_range(
 }
 
 static bool apple_virgl_protocol_validate_bind_task(
+    uint16_t version,
     uint32_t mapping_count,
+    const uint8_t *payload,
     uint32_t payload_bytes,
     Error **errp)
 {
-    if (mapping_count != 0 || payload_bytes != sizeof(uint32_t)) {
+    uint32_t task_id_encoded;
+    uint64_t vm_size;
+    uint32_t task_root_pfn;
+
+    if (version != APPLE_VIRGL_PROTOCOL_VERSION_V4 ||
+        mapping_count != 0 || payload_bytes != sizeof(AppleVirglTaskBindV4)) {
         error_setg(errp,
-                   "apple-virgl BIND_TASK requires a four-byte payload and no mappings");
+                   "apple-virgl BIND_TASK requires a version-4 DefineTask payload and no mappings");
+        return false;
+    }
+
+    task_id_encoded = ldl_le_p(payload);
+    vm_size = ldq_le_p(payload + 4);
+    task_root_pfn = ldl_le_p(payload + 12);
+    if (vm_size == 0 || task_root_pfn == 0 ||
+        ((task_id_encoded & 1) != 0 && task_id_encoded != 1) ||
+        ((task_id_encoded & 1) == 0 && task_id_encoded == 0)) {
+        error_setg(errp, "apple-virgl BIND_TASK identity is invalid");
         return false;
     }
     return true;
@@ -436,7 +454,7 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         break;
     case APPLE_VIRGL_SUBMIT_BIND_TASK:
         if (!apple_virgl_protocol_validate_bind_task(
-                mapping_count, payload_bytes, errp)) {
+                version, mapping_count, payload, payload_bytes, errp)) {
             return false;
         }
         break;
