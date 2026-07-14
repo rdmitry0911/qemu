@@ -19,8 +19,10 @@
 #include "hw/virtio/apple-virgl-protocol.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+#include "ui/console.h"
 #include "qmu/qmetal_unified.h"
 #include "apple-virgl-frame-pump.h"
+#include "hw/display/apple-virgl-present-stage.h"
 #include "hw/display/apple-virgl-qmetal-abi.h"
 
 #define APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3 0x2b
@@ -99,6 +101,14 @@ struct AppleVirglBridge {
     AppleVirglFramePump frame_pump;
     QEMUBH *new_frame_bh;
     ThreadPool *frame_submit_pool;
+    /* QMetal owner-completion callbacks run outside the QEMU main loop.  They
+     * copy into this FIFO under present_lock; only present_bh touches UI APIs.
+     * present_surface is a console-owned, non-owning identity marker. */
+    QemuMutex present_lock;
+    AppleVirglPresentStage present_stage;
+    QEMUBH *present_bh;
+    DisplaySurface *present_surface;
+    bool present_bh_scheduled;
     QemuMutex completion_lock;
     GQueue completion_receivers;
     GQueue completion_stamps;
@@ -727,44 +737,158 @@ static void apple_virgl_new_frame_signal(void *opaque)
     apple_virgl_frame_pump_schedule_actions(bridge, actions);
 }
 
-static void apple_virgl_frame_completed(void *opaque, int frame_expected)
+static bool apple_virgl_presenter_apply_job(
+    AppleVirglBridge *bridge, const AppleVirglPresentStageJob *job)
 {
-    AppleVirglBridge *bridge = opaque;
-    AppleVirglFramePumpActions actions = { 0 };
+    QemuConsole *con;
+    DisplaySurface *surface;
+    bool disable_gl_scanout;
+    uint32_t row;
 
-    (void)frame_expected;
-    if (!bridge) {
-        return;
+    assert(bql_locked());
+    if (!bridge || !job || !job->payload_valid || !job->pixels) {
+        return false;
     }
 
-    /* Completion only opens the next FIFO submission edge. It never re-enters
-     * QMU from its callback context. */
-    qemu_mutex_lock(&bridge->frame_pump_lock);
-    actions = apple_virgl_frame_pump_frame_completed(&bridge->frame_pump);
-    qemu_mutex_unlock(&bridge->frame_pump_lock);
-    apple_virgl_frame_pump_schedule_actions(bridge, actions);
+    con = bridge->gpu ? bridge->gpu->parent_obj.scanout[0].con : NULL;
+    if (!con) {
+        return false;
+    }
+
+    surface = qemu_console_surface(con);
+    if (!surface || surface != bridge->present_surface ||
+        surface_width(surface) != (int)job->width ||
+        surface_height(surface) != (int)job->height ||
+        surface_format(surface) != PIXMAN_x8r8g8b8 ||
+        surface_stride(surface) < (int)job->stride) {
+        /* A GL/DMABUF scanout has no CPU surface.  Replacing it selects the
+         * CPU-surface path; notify its GL listener exactly on that transition. */
+        disable_gl_scanout = surface == NULL;
+        surface = qemu_create_displaysurface((int)job->width,
+                                             (int)job->height);
+        dpy_gfx_replace_surface(con, surface);
+        bridge->present_surface = surface;
+        if (disable_gl_scanout) {
+            dpy_gl_scanout_disable(con);
+        }
+    }
+
+    if (!surface_data(surface)) {
+        return false;
+    }
+    for (row = 0; row < job->height; row++) {
+        memcpy((uint8_t *)surface_data(surface) +
+                   (size_t)row * surface_stride(surface),
+               job->pixels + (size_t)row * job->stride, job->stride);
+    }
+    dpy_gfx_update_full(con);
+    return true;
 }
 
-static void apple_virgl_present_frame(void *opaque, const void *pixels,
-                                      uint32_t width, uint32_t height,
-                                      uint32_t stride)
+static void apple_virgl_present_bh(void *opaque)
 {
     AppleVirglBridge *bridge = opaque;
-    uint64_t frame;
+    AppleVirglFramePumpActions pending_actions = { 0 };
 
     if (!bridge) {
         return;
     }
-    qemu_mutex_lock(&bridge->frame_pump_lock);
-    frame = ++bridge->frame_count;
-    qemu_mutex_unlock(&bridge->frame_pump_lock);
+    assert(bql_locked());
 
-    if (frame <= 8) {
-        fprintf(stderr,
-                "apple-virgl-qemu: qmetal frame=%" PRIu64
-                " size=%ux%u stride=%u pixels=%p\n",
-                frame, width, height, stride, pixels);
+    for (;;) {
+        AppleVirglPresentStageJob *job;
+        AppleVirglFramePumpActions actions;
+        bool applied;
+        uint64_t frame;
+
+        qemu_mutex_lock(&bridge->present_lock);
+        job = apple_virgl_present_stage_take(&bridge->present_stage);
+        if (!job) {
+            bridge->present_bh_scheduled = false;
+            qemu_mutex_unlock(&bridge->present_lock);
+            break;
+        }
+        qemu_mutex_unlock(&bridge->present_lock);
+
+        applied = apple_virgl_presenter_apply_job(bridge, job);
+        frame = ++bridge->frame_count;
+        if (frame <= 8) {
+            fprintf(stderr,
+                    "apple-virgl-qemu: presenter owner-frame=%" PRIu64
+                    " expected=%u payload=%u size=%ux%u stride=%u applied=%u\n",
+                    frame, job->frame_expected ? 1u : 0u,
+                    job->payload_valid ? 1u : 0u, job->width, job->height,
+                    job->stride, applied ? 1u : 0u);
+        }
+
+        /* This is the only owner-completion retirement edge.  It runs after
+         * the console update/drop so the next QMetal submit cannot overtake
+         * the visible frame hand-off. */
+        qemu_mutex_lock(&bridge->frame_pump_lock);
+        actions = apple_virgl_frame_pump_frame_completed(&bridge->frame_pump);
+        qemu_mutex_unlock(&bridge->frame_pump_lock);
+        pending_actions.schedule_bh |= actions.schedule_bh;
+        pending_actions.schedule_submit |= actions.schedule_submit;
+        apple_virgl_present_stage_job_free(job);
     }
+
+    apple_virgl_frame_pump_schedule_actions(bridge, pending_actions);
+}
+
+static void apple_virgl_render_frame_complete(
+    void *opaque, const qmu_render_frame_completion *completion)
+{
+    AppleVirglBridge *bridge = opaque;
+    bool queued;
+
+    if (!bridge || !completion) {
+        return;
+    }
+
+    /* QMetal retains completion pixels only for this callback.  Keep the
+     * lock through copy and schedule so reset cannot free the guarded BH in
+     * between an accepted owner completion and its main-loop hand-off. */
+    qemu_mutex_lock(&bridge->present_lock);
+    queued = apple_virgl_present_stage_enqueue(
+        &bridge->present_stage, completion->frame_expected != 0,
+        completion->pixels, completion->width, completion->height,
+        completion->stride);
+    if (queued && !bridge->present_bh_scheduled && bridge->present_bh) {
+        bridge->present_bh_scheduled = true;
+        qemu_bh_schedule(bridge->present_bh);
+    }
+    qemu_mutex_unlock(&bridge->present_lock);
+}
+
+static void apple_virgl_presenter_quiesce(AppleVirglBridge *bridge,
+                                          bool shutdown)
+{
+    if (!bridge) {
+        return;
+    }
+
+    qemu_mutex_lock(&bridge->present_lock);
+    apple_virgl_present_stage_begin_reset(&bridge->present_stage, shutdown);
+    bridge->present_bh_scheduled = false;
+    /* This is a non-owning marker only.  Generic virtio/virgl reset owns the
+     * actual console replacement and may already have freed this surface. */
+    bridge->present_surface = NULL;
+    qemu_mutex_unlock(&bridge->present_lock);
+
+    if (bridge->present_bh) {
+        qemu_bh_cancel(bridge->present_bh);
+    }
+}
+
+static void apple_virgl_presenter_resume(AppleVirglBridge *bridge)
+{
+    if (!bridge) {
+        return;
+    }
+
+    qemu_mutex_lock(&bridge->present_lock);
+    apple_virgl_present_stage_resume(&bridge->present_stage);
+    qemu_mutex_unlock(&bridge->present_lock);
 }
 
 AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
@@ -789,6 +913,8 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     qemu_mutex_init(&bridge->frame_pump_lock);
     qemu_cond_init(&bridge->frame_pump_idle);
     apple_virgl_frame_pump_init(&bridge->frame_pump);
+    qemu_mutex_init(&bridge->present_lock);
+    apple_virgl_present_stage_init(&bridge->present_stage);
     qemu_mutex_init(&bridge->completion_lock);
     g_queue_init(&bridge->completion_receivers);
     g_queue_init(&bridge->completion_stamps);
@@ -798,6 +924,9 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
                                                NULL, apple_virgl_resource_free);
     bridge->new_frame_bh = qemu_bh_new_guarded(
         apple_virgl_new_frame_bh, bridge,
+        &DEVICE(gpu)->mem_reentrancy_guard);
+    bridge->present_bh = qemu_bh_new_guarded(
+        apple_virgl_present_bh, bridge,
         &DEVICE(gpu)->mem_reentrancy_guard);
     bridge->completion_bh = qemu_bh_new_guarded(
         apple_virgl_completion_bh, bridge,
@@ -815,9 +944,8 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     callbacks.write_memory = apple_virgl_write_memory;
     callbacks.read_gpu_memory = apple_virgl_read_gpu_memory;
     callbacks.completion_stamp = apple_virgl_completion_stamp;
-    callbacks.present_frame = apple_virgl_present_frame;
     callbacks.new_frame_signal = apple_virgl_new_frame_signal;
-    callbacks.frame_completed = apple_virgl_frame_completed;
+    callbacks.render_frame_complete = apple_virgl_render_frame_complete;
     session = qmu_create(&config, &callbacks);
     if (!session) {
         apple_virgl_bridge_free(bridge);
@@ -849,6 +977,7 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
 
     session = apple_virgl_session_gate_close(bridge, true);
     apple_virgl_bridge_clear_completion_state(bridge, false);
+    apple_virgl_presenter_quiesce(bridge, true);
     apple_virgl_frame_pump_quiesce(bridge, true);
     apple_virgl_session_gate_wait_idle(bridge);
     if (session) {
@@ -864,6 +993,10 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
     if (bridge->new_frame_bh) {
         qemu_bh_delete(bridge->new_frame_bh);
         bridge->new_frame_bh = NULL;
+    }
+    if (bridge->present_bh) {
+        qemu_bh_delete(bridge->present_bh);
+        bridge->present_bh = NULL;
     }
     if (bridge->completion_bh) {
         qemu_bh_delete(bridge->completion_bh);
@@ -881,6 +1014,7 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
     }
 
     qemu_mutex_destroy(&bridge->completion_lock);
+    qemu_mutex_destroy(&bridge->present_lock);
     qemu_cond_destroy(&bridge->frame_pump_idle);
     qemu_mutex_destroy(&bridge->frame_pump_lock);
     qemu_cond_destroy(&bridge->session_gate_idle);
@@ -907,6 +1041,7 @@ void apple_virgl_bridge_reset(AppleVirglBridge *bridge)
     qemu_mutex_lock(&bridge->lifecycle_lock);
     session = apple_virgl_session_gate_close(bridge, false);
     apple_virgl_bridge_clear_completion_state(bridge, false);
+    apple_virgl_presenter_quiesce(bridge, false);
     apple_virgl_frame_pump_quiesce(bridge, false);
     apple_virgl_session_gate_wait_idle(bridge);
     if (session && qmu_session_invalidate_display_delivery(session) != QMU_OK) {
@@ -939,6 +1074,7 @@ void apple_virgl_bridge_reset(AppleVirglBridge *bridge)
     g_array_unref(task_ids);
 
     apple_virgl_bridge_frame_pump_resume(bridge);
+    apple_virgl_presenter_resume(bridge);
     qemu_mutex_lock(&bridge->completion_lock);
     if (!bridge->completion_shutdown) {
         bridge->completion_resetting = false;
