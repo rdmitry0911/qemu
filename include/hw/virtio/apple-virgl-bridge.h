@@ -17,6 +17,9 @@ typedef struct VirtQueueElement VirtQueueElement;
 struct iovec;
 
 AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu);
+
+/* The virtio-gpu device lifecycle invokes these under the BQL.  The bridge
+ * relies on that invariant to cancel and delete its guarded QEMU BHs. */
 void apple_virgl_bridge_free(AppleVirglBridge *bridge);
 void apple_virgl_bridge_reset(AppleVirglBridge *bridge);
 
