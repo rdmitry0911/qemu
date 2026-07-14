@@ -26,6 +26,7 @@
 #define APPLE_VIRGL_QMU_ROOT_EXEC_INDIRECT3 0x2b
 #define APPLE_VIRGL_QMU_ROOT_SET_OBJECT_LIST 0x33
 #define APPLE_VIRGL_QMU_ROOT_GET_COMPUTE_INFO 0x3b
+#define APPLE_VIRGL_QMU_GPU_DELETE_RESOURCE 0x25
 #define APPLE_VIRGL_QMU_GPU_UNMAP_MEMORY 0x22
 #define APPLE_VIRGL_QMU_GPU_SYNCHRONIZE_RESOURCES 0x35
 #define APPLE_VIRGL_QMU_GPU_MAP_MEMORY2 0x39
@@ -1361,6 +1362,7 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     uint64_t submit;
     uint16_t opcode;
     uint32_t qmu_opcode;
+    uint32_t gpu_channel_id = 0;
     bool gpu_channel = false;
     bool display_channel = false;
     bool bridge_locked = false;
@@ -1388,6 +1390,14 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
         break;
     case APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO:
         qmu_opcode = APPLE_VIRGL_QMU_ROOT_GET_COMPUTE_INFO;
+        break;
+    case APPLE_VIRGL_SUBMIT_DELETE_RESOURCE:
+        /* Native PVG sends DELETE_RESOURCE on its Immediate child FIFO
+         * (channel 2), where 0x25 is GPU_DELETE_RESOURCE.  The numerical
+         * root opcode is the same, but the FIFO namespace is not. */
+        qmu_opcode = APPLE_VIRGL_QMU_GPU_DELETE_RESOURCE;
+        gpu_channel_id = 2;
+        gpu_channel = true;
         break;
     case APPLE_VIRGL_SUBMIT_MAP_MEMORY2:
         qmu_opcode = APPLE_VIRGL_QMU_GPU_MAP_MEMORY2;
@@ -1523,7 +1533,7 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
                                             view.payload,
                                             view.payload_bytes);
     } else if (gpu_channel) {
-        status = qmu_submit_gpu_channel(session, 0, qmu_opcode,
+        status = qmu_submit_gpu_channel(session, gpu_channel_id, qmu_opcode,
                                         view.payload, view.payload_bytes);
     } else if (opcode == APPLE_VIRGL_SUBMIT_EXEC_INDIRECT3 &&
                view.completion_channel_id != 0) {
