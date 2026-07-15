@@ -17,9 +17,13 @@
 #define APPLE_VIRGL_PROTOCOL_VERSION_V2 2u
 #define APPLE_VIRGL_PROTOCOL_VERSION_V3 3u
 #define APPLE_VIRGL_PROTOCOL_VERSION_V4 4u
-#define APPLE_VIRGL_PROTOCOL_VERSION APPLE_VIRGL_PROTOCOL_VERSION_V4
+#define APPLE_VIRGL_PROTOCOL_VERSION_V5 5u
+#define APPLE_VIRGL_PROTOCOL_VERSION APPLE_VIRGL_PROTOCOL_VERSION_V5
 #define APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP (1u << 0)
 #define APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_EVENT (1u << 1)
+/* V5: type-6 parent IOSurface-backing retirement is transported as a
+ * semantic operation, never as an overloaded native FIFO opcode. */
+#define APPLE_VIRGL_CAPSET_FLAG_DELETE_IOSURFACE_BACKING (1u << 2)
 #define APPLE_VIRGL_CURSOR_CMD_COMPLETION_RECEIVE 0xa11e0001u
 #define APPLE_VIRGL_COMPLETION_EVENT_MAGIC 0x45435641u /* "AVCE", little-endian */
 #define APPLE_VIRGL_COMPLETION_EVENT_TYPE_STAMP 1u
@@ -33,6 +37,7 @@
 #define APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO 8u
 #define APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES 9u
 #define APPLE_VIRGL_SUBMIT_DELETE_RESOURCE 10u
+#define APPLE_VIRGL_SUBMIT_DELETE_IOSURFACE_BACKING 11u
 
 #define APPLE_VIRGL_MAX_SUBMIT_MAPPINGS 4096u
 #define APPLE_VIRGL_MAX_SUBMIT_PAYLOAD (16u * 1024u * 1024u)
@@ -87,6 +92,15 @@ typedef struct QEMU_PACKED AppleVirglDeleteResourceV1 {
     uint32_t task_id;
     uint32_t resource_id;
 } AppleVirglDeleteResourceV1;
+
+/* V5 outer-envelope form of the reference type-6 semantic payload.  The
+ * words intentionally remain `{ backing_id, task_id }`; only the outer
+ * opcode is AppleVirgl-specific.  The first narrow implementation accepts
+ * only its UUID-gated task-0 lifetime join. */
+typedef struct QEMU_PACKED AppleVirglDeleteIOSurfaceBackingV5 {
+    uint32_t backing_id;
+    uint32_t task_id;
+} AppleVirglDeleteIOSurfaceBackingV5;
 
 /* Version-2 EXEC payload prefix. The following bytes remain ExecIndirect3. */
 typedef struct QEMU_PACKED AppleVirglExecCompletionV2 {

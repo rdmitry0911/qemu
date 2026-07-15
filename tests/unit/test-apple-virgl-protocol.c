@@ -63,6 +63,17 @@ typedef struct QEMU_PACKED DeleteResourceSubmit {
     AppleVirglDeleteResourceV1 payload;
 } DeleteResourceSubmit;
 
+typedef struct QEMU_PACKED DeleteIOSurfaceBackingSubmitV5 {
+    AppleVirglSubmitHeaderV1 header;
+    AppleVirglDeleteIOSurfaceBackingV5 payload;
+} DeleteIOSurfaceBackingSubmitV5;
+
+typedef struct QEMU_PACKED DeleteIOSurfaceBackingWithMappingSubmitV5 {
+    AppleVirglSubmitHeaderV1 header;
+    AppleVirglSubmitMappingV1 mapping;
+    AppleVirglDeleteIOSurfaceBackingV5 payload;
+} DeleteIOSurfaceBackingWithMappingSubmitV5;
+
 typedef struct QEMU_PACKED BindTaskSubmit {
     AppleVirglSubmitHeaderV1 header;
     AppleVirglTaskBindV4 payload;
@@ -254,6 +265,28 @@ static DeleteResourceSubmit valid_delete_resource_submit(void)
         .payload = {
             .task_id = cpu_to_le32(3),
             .resource_id = cpu_to_le32(7),
+        },
+    };
+
+    return submit;
+}
+
+static DeleteIOSurfaceBackingSubmitV5
+valid_delete_iosurface_backing_submit_v5(void)
+{
+    DeleteIOSurfaceBackingSubmitV5 submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION_V5),
+            .opcode = cpu_to_le16(
+                APPLE_VIRGL_SUBMIT_DELETE_IOSURFACE_BACKING),
+            .mapping_count = 0,
+            .payload_bytes = cpu_to_le32(
+                sizeof(AppleVirglDeleteIOSurfaceBackingV5)),
+        },
+        .payload = {
+            .backing_id = cpu_to_le32(7),
+            .task_id = 0,
         },
     };
 
@@ -477,6 +510,14 @@ static void test_capset_versions(void)
     g_assert_cmpuint(le16_to_cpu(capset.flags), ==,
                      APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP |
                      APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_EVENT);
+    apple_virgl_protocol_fill_capset(&capset,
+                                     APPLE_VIRGL_PROTOCOL_VERSION_V5);
+    g_assert_cmpuint(le16_to_cpu(capset.version), ==,
+                     APPLE_VIRGL_PROTOCOL_VERSION_V5);
+    g_assert_cmpuint(le16_to_cpu(capset.flags), ==,
+                     APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP |
+                     APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_EVENT |
+                     APPLE_VIRGL_CAPSET_FLAG_DELETE_IOSURFACE_BACKING);
 }
 
 static void test_compute_info_valid(void)
@@ -827,6 +868,65 @@ static void test_delete_resource_shape(void)
     assert_rejected(&submit, sizeof(submit) - sizeof(uint32_t));
 }
 
+static void test_delete_iosurface_backing_v5_valid(void)
+{
+    DeleteIOSurfaceBackingSubmitV5 submit =
+        valid_delete_iosurface_backing_submit_v5();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(le16_to_cpu(view.header->opcode), ==,
+                     APPLE_VIRGL_SUBMIT_DELETE_IOSURFACE_BACKING);
+    g_assert_cmpuint(view.version, ==, APPLE_VIRGL_PROTOCOL_VERSION_V5);
+    g_assert_cmpuint(view.mapping_count, ==, 0);
+    /* The custom envelope preserves the reference type-6 word order. */
+    g_assert_cmpuint(ldl_le_p(view.payload), ==, 7);
+    g_assert_cmpuint(ldl_le_p(view.payload + 4), ==, 0);
+}
+
+static void test_delete_iosurface_backing_v5_shape(void)
+{
+    DeleteIOSurfaceBackingSubmitV5 submit =
+        valid_delete_iosurface_backing_submit_v5();
+    DeleteIOSurfaceBackingWithMappingSubmitV5 mapped = {
+        .header = submit.header,
+        .mapping = {
+            .gpu_va = cpu_to_le64(0x4000),
+            .length = cpu_to_le64(0x1000),
+            .backing_resource_id = cpu_to_le32(1),
+        },
+        .payload = submit.payload,
+    };
+
+    submit.header.version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION_V4);
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_delete_iosurface_backing_submit_v5();
+    submit.payload.backing_id = 0;
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_delete_iosurface_backing_submit_v5();
+    submit.payload.task_id = cpu_to_le32(1);
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_delete_iosurface_backing_submit_v5();
+    submit.header.payload_bytes = cpu_to_le32(4);
+    assert_rejected(&submit, sizeof(submit) - sizeof(uint32_t));
+    mapped.header.mapping_count = cpu_to_le32(1);
+    assert_rejected(&mapped, sizeof(mapped));
+}
+
+static void test_delete_iosurface_backing_does_not_alias_fifo_opcode(void)
+{
+    DeleteIOSurfaceBackingSubmitV5 submit =
+        valid_delete_iosurface_backing_submit_v5();
+
+    /* Native FIFO values are not outer-envelope opcodes.  In particular,
+     * 0x36 is generic DISCARD_RESOURCES in the QMU child namespace. */
+    submit.header.opcode = cpu_to_le16(0x36);
+    assert_rejected(&submit, sizeof(submit));
+}
+
 static void test_bind_kernel_task(void)
 {
     BindTaskSubmit submit = valid_bind_task_submit(0, true);
@@ -1025,6 +1125,12 @@ int main(int argc, char **argv)
                     test_delete_resource_zero_resource_is_well_formed);
     g_test_add_func("/apple-virgl/protocol/delete-resource-shape",
                     test_delete_resource_shape);
+    g_test_add_func("/apple-virgl/protocol/delete-iosurface-backing-v5-valid",
+                    test_delete_iosurface_backing_v5_valid);
+    g_test_add_func("/apple-virgl/protocol/delete-iosurface-backing-v5-shape",
+                    test_delete_iosurface_backing_v5_shape);
+    g_test_add_func("/apple-virgl/protocol/delete-iosurface-backing-no-fifo-alias",
+                    test_delete_iosurface_backing_does_not_alias_fifo_opcode);
     g_test_add_func("/apple-virgl/protocol/bind-kernel-task",
                     test_bind_kernel_task);
     g_test_add_func("/apple-virgl/protocol/bind-user-task",

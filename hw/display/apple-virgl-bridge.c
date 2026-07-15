@@ -77,6 +77,14 @@ typedef struct AppleVirglFrameSubmitJob {
 struct AppleVirglBridge {
     VirtIOGPU *gpu;
     QemuMutex lock;
+    /* One serial boundary for every QMetal session mutation.  In particular,
+     * the V5 IOSurface-backing retirement may release the BQL while it drains
+     * display ownership, so bridge->lock alone cannot keep a concurrent FIFO
+     * producer out of the exact retirement window.  QMetal can synchronously
+     * invoke new_frame_signal while a producer is active; use a recursive
+     * mutex so its required signal acknowledgement can re-enter this boundary
+     * on the originating thread. */
+    QemuRecMutex command_lock;
     /* Reset and final teardown are device-lifecycle operations.  QEMU invokes
      * them with the bridge lifetime serialized; this lock additionally keeps
      * two reset paths from interleaving their quiesce/invalidate sequences. */
@@ -619,10 +627,12 @@ static int apple_virgl_frame_submit_job(void *opaque)
     qemu_mutex_unlock(&bridge->frame_pump_lock);
 
     if (apple_virgl_session_lease_begin(bridge, &session)) {
+        qemu_rec_mutex_lock(&bridge->command_lock);
         vk = qmu_session_get_vulkan(session);
         if (vk) {
             submit_result = qmu_vk_submit_captured_display_frame(vk);
         }
+        qemu_rec_mutex_unlock(&bridge->command_lock);
         apple_virgl_session_lease_end(bridge);
     }
 
@@ -692,10 +702,12 @@ static void apple_virgl_new_frame_bh(void *opaque)
     /* This is the reference-shaped main-loop edge: capture only. Submission
      * stays on the bridge-owned serial worker below. */
     if (apple_virgl_session_lease_begin(bridge, &session)) {
+        qemu_rec_mutex_lock(&bridge->command_lock);
         vk = qmu_session_get_vulkan(session);
         if (vk) {
             capture_result = qmu_vk_capture_display_frame_request(vk);
         }
+        qemu_rec_mutex_unlock(&bridge->command_lock);
         apple_virgl_session_lease_end(bridge);
     }
 
@@ -719,12 +731,14 @@ static void apple_virgl_new_frame_signal(void *opaque)
         return;
     }
 
+    qemu_rec_mutex_lock(&bridge->command_lock);
     vk = qmu_session_get_vulkan(session);
     if (vk) {
         /* The one permitted callback re-entry: signal acknowledgement takes
          * QMetal's recursive signal lock and must happen before BH handoff. */
         qmu_vk_consume_current_frame_signal(vk);
     }
+    qemu_rec_mutex_unlock(&bridge->command_lock);
     apple_virgl_session_lease_end(bridge);
 
     if (!vk) {
@@ -907,6 +921,7 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     bridge = g_new0(AppleVirglBridge, 1);
     bridge->gpu = gpu;
     qemu_mutex_init(&bridge->lock);
+    qemu_rec_mutex_init(&bridge->command_lock);
     qemu_mutex_init(&bridge->lifecycle_lock);
     qemu_mutex_init(&bridge->session_gate_lock);
     qemu_cond_init(&bridge->session_gate_idle);
@@ -1019,6 +1034,7 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
     qemu_mutex_destroy(&bridge->frame_pump_lock);
     qemu_cond_destroy(&bridge->session_gate_idle);
     qemu_mutex_destroy(&bridge->session_gate_lock);
+    qemu_rec_mutex_destroy(&bridge->command_lock);
     qemu_mutex_destroy(&bridge->lock);
     qemu_mutex_unlock(&bridge->lifecycle_lock);
     qemu_mutex_destroy(&bridge->lifecycle_lock);
@@ -1206,11 +1222,13 @@ int apple_virgl_bridge_context_destroy(AppleVirglBridge *bridge,
         !apple_virgl_session_lease_begin(bridge, &session)) {
         return -1;
     }
+    qemu_rec_mutex_lock(&bridge->command_lock);
     qemu_mutex_lock(&bridge->lock);
     context = g_hash_table_lookup(bridge->contexts,
                                   GUINT_TO_POINTER(context_id));
     if (!context) {
         qemu_mutex_unlock(&bridge->lock);
+        qemu_rec_mutex_unlock(&bridge->command_lock);
         apple_virgl_session_lease_end(bridge);
         return -1;
     }
@@ -1221,6 +1239,7 @@ int apple_virgl_bridge_context_destroy(AppleVirglBridge *bridge,
     if (task_bound) {
         qmu_destroy_task(session, task_id);
     }
+    qemu_rec_mutex_unlock(&bridge->command_lock);
     apple_virgl_session_lease_end(bridge);
     fprintf(stderr,
             "apple-virgl-qemu: context-destroy transport=%u task=%s%u\n",
@@ -1447,12 +1466,14 @@ static int apple_virgl_bridge_bind_task(AppleVirglBridge *bridge,
     if (!apple_virgl_session_lease_begin(bridge, &session)) {
         return -1;
     }
+    qemu_rec_mutex_lock(&bridge->command_lock);
     qemu_mutex_lock(&bridge->lock);
     context = g_hash_table_lookup(bridge->contexts,
                                   GUINT_TO_POINTER(context_id));
     if (!context || context->task_bound ||
         apple_virgl_context_for_task_locked(bridge, task_id)) {
         qemu_mutex_unlock(&bridge->lock);
+        qemu_rec_mutex_unlock(&bridge->command_lock);
         apple_virgl_session_lease_end(bridge);
         return -1;
     }
@@ -1470,10 +1491,12 @@ static int apple_virgl_bridge_bind_task(AppleVirglBridge *bridge,
             context->task_id = 0;
         }
         qemu_mutex_unlock(&bridge->lock);
+        qemu_rec_mutex_unlock(&bridge->command_lock);
         apple_virgl_session_lease_end(bridge);
         return -1;
     }
 
+    qemu_rec_mutex_unlock(&bridge->command_lock);
     apple_virgl_session_lease_end(bridge);
 
     fprintf(stderr,
@@ -1497,10 +1520,12 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     qmu_status status = QMU_ERROR;
     uint64_t submit;
     uint16_t opcode;
-    uint32_t qmu_opcode;
+    uint32_t qmu_opcode = 0;
     uint32_t gpu_channel_id = 0;
+    uint32_t payload_task_id;
     bool gpu_channel = false;
     bool display_channel = false;
+    bool iosurface_backing_retire = false;
     bool bridge_locked = false;
     int result = -1;
 
@@ -1535,6 +1560,13 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
         gpu_channel_id = 2;
         gpu_channel = true;
         break;
+    case APPLE_VIRGL_SUBMIT_DELETE_IOSURFACE_BACKING:
+        /* This is an AppleVirgl V5 transport semantic for the reference
+         * type-6 lifecycle boundary.  It is deliberately not routed through
+         * a numeric QMU FIFO opcode: native 0x36/0x37/0x41 live in different
+         * namespaces and collide with unrelated child commands. */
+        iosurface_backing_retire = true;
+        break;
     case APPLE_VIRGL_SUBMIT_MAP_MEMORY2:
         qmu_opcode = APPLE_VIRGL_QMU_GPU_MAP_MEMORY2;
         gpu_channel = true;
@@ -1565,6 +1597,7 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
     if (!apple_virgl_session_lease_begin(bridge, &session)) {
         return -1;
     }
+    qemu_rec_mutex_lock(&bridge->command_lock);
     qemu_mutex_lock(&bridge->lock);
     bridge_locked = true;
     context = g_hash_table_lookup(bridge->contexts,
@@ -1573,12 +1606,15 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
         goto out;
     }
     task_id = context->task_id;
-    if (display_channel ? task_id != 0 : ldl_le_p(view.payload) != task_id) {
+    payload_task_id = iosurface_backing_retire ?
+        ldl_le_p(view.payload + 4) : ldl_le_p(view.payload);
+    if (display_channel ? task_id != 0 : payload_task_id != task_id) {
         qemu_mutex_unlock(&bridge->lock);
         bridge_locked = false;
-        error_report("apple-virgl submit task/transport mismatch: payload=%u transport=%u bound-task=%u display=%u",
-                     ldl_le_p(view.payload), context_id, task_id,
-                     display_channel ? 1 : 0);
+        error_report("apple-virgl submit task/transport mismatch: payload=%u transport=%u bound-task=%u display=%u retire=%u",
+                     payload_task_id,
+                     context_id, task_id, display_channel ? 1 : 0,
+                     iosurface_backing_retire ? 1 : 0);
         goto out;
     }
     new_mappings = g_array_sized_new(false, false,
@@ -1664,7 +1700,10 @@ int apple_virgl_bridge_submit(AppleVirglBridge *bridge,
                 view.completion_stamp,
                 apple_virgl_fnv1a(view.payload, view.payload_bytes));
     }
-    if (display_channel) {
+    if (iosurface_backing_retire) {
+        status = qmu_retire_iosurface_backing(session, task_id,
+                                              ldl_le_p(view.payload));
+    } else if (display_channel) {
         status = qmu_submit_display_channel(session, qmu_opcode,
                                             view.payload,
                                             view.payload_bytes);
@@ -1689,6 +1728,7 @@ out:
     if (new_mappings) {
         g_array_unref(new_mappings);
     }
+    qemu_rec_mutex_unlock(&bridge->command_lock);
     apple_virgl_session_lease_end(bridge);
     return result;
 }

@@ -15,6 +15,7 @@ QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitMappingV1) != 32);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglComputeInfoV1) != 24);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSynchronizeResourcesV1) != 12);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglDeleteResourceV1) != 8);
+QEMU_BUILD_BUG_ON(sizeof(AppleVirglDeleteIOSurfaceBackingV5) != 8);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglExecCompletionV2) != 8);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglTaskBindV4) != 16);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglCompletionReceiverRequestV3) != 8);
@@ -26,15 +27,20 @@ void apple_virgl_protocol_fill_capset(AppleVirglCapsetV1 *capset,
     g_assert(version >= APPLE_VIRGL_PROTOCOL_VERSION_V1);
     g_assert(version <= APPLE_VIRGL_PROTOCOL_VERSION);
 
+    uint16_t flags = version >= APPLE_VIRGL_PROTOCOL_VERSION_V3 ?
+        APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP |
+            APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_EVENT :
+        version >= APPLE_VIRGL_PROTOCOL_VERSION_V2 ?
+            APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP : 0;
+
+    if (version >= APPLE_VIRGL_PROTOCOL_VERSION_V5) {
+        flags |= APPLE_VIRGL_CAPSET_FLAG_DELETE_IOSURFACE_BACKING;
+    }
+
     *capset = (AppleVirglCapsetV1) {
         .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
         .version = cpu_to_le16(version),
-        .flags = cpu_to_le16(
-            version >= APPLE_VIRGL_PROTOCOL_VERSION_V3 ?
-                APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP |
-                    APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_EVENT :
-            version >= APPLE_VIRGL_PROTOCOL_VERSION_V2 ?
-                APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP : 0),
+        .flags = cpu_to_le16(flags),
         .max_mappings = cpu_to_le32(APPLE_VIRGL_MAX_SUBMIT_MAPPINGS),
         .max_payload_bytes = cpu_to_le32(APPLE_VIRGL_MAX_SUBMIT_PAYLOAD),
     };
@@ -339,6 +345,36 @@ static bool apple_virgl_protocol_validate_delete_resource(
     return true;
 }
 
+static bool apple_virgl_protocol_validate_delete_iosurface_backing(
+    uint16_t version,
+    uint32_t mapping_count,
+    const uint8_t *payload,
+    uint32_t payload_bytes,
+    Error **errp)
+{
+    if (version != APPLE_VIRGL_PROTOCOL_VERSION_V5 ||
+        mapping_count != 0 ||
+        payload_bytes != sizeof(AppleVirglDeleteIOSurfaceBackingV5)) {
+        error_setg(errp,
+                   "apple-virgl DELETE_IOSURFACE_BACKING requires the V5 exact eight-byte payload and no mappings");
+        return false;
+    }
+    if (ldl_le_p(payload) == 0) {
+        error_setg(errp,
+                   "apple-virgl DELETE_IOSURFACE_BACKING backing ID is invalid");
+        return false;
+    }
+    /* The only UUID-gated parent-free join currently proves the task-0
+     * backing lifetime.  Do not advertise a wider task contract before its
+     * reference ownership and runtime ordering are independently joined. */
+    if (ldl_le_p(payload + sizeof(uint32_t)) != 0) {
+        error_setg(errp,
+                   "apple-virgl DELETE_IOSURFACE_BACKING supports task 0 only");
+        return false;
+    }
+    return true;
+}
+
 bool apple_virgl_protocol_decode_submit(const void *bytes,
                                         size_t size,
                                         AppleVirglSubmitView *view,
@@ -385,7 +421,8 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         opcode != APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3 &&
         opcode != APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO &&
         opcode != APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES &&
-        opcode != APPLE_VIRGL_SUBMIT_DELETE_RESOURCE) {
+        opcode != APPLE_VIRGL_SUBMIT_DELETE_RESOURCE &&
+        opcode != APPLE_VIRGL_SUBMIT_DELETE_IOSURFACE_BACKING) {
         error_setg(errp, "apple-virgl submit opcode is unsupported");
         return false;
     }
@@ -502,6 +539,12 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
     case APPLE_VIRGL_SUBMIT_DELETE_RESOURCE:
         if (!apple_virgl_protocol_validate_delete_resource(
                 mapping_count, payload, payload_bytes, errp)) {
+            return false;
+        }
+        break;
+    case APPLE_VIRGL_SUBMIT_DELETE_IOSURFACE_BACKING:
+        if (!apple_virgl_protocol_validate_delete_iosurface_backing(
+                version, mapping_count, payload, payload_bytes, errp)) {
             return false;
         }
         break;
