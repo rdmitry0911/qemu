@@ -14,6 +14,7 @@ QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitHeaderV1) != 16);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSubmitMappingV1) != 32);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglComputeInfoV1) != 24);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglSynchronizeResourcesV1) != 12);
+QEMU_BUILD_BUG_ON(sizeof(AppleVirglDeleteResourceV1) != 8);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglExecCompletionV2) != 8);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglTaskBindV4) != 16);
 QEMU_BUILD_BUG_ON(sizeof(AppleVirglCompletionReceiverRequestV3) != 8);
@@ -323,6 +324,21 @@ static bool apple_virgl_protocol_validate_synchronize_resources(
     return true;
 }
 
+static bool apple_virgl_protocol_validate_delete_resource(
+    uint32_t mapping_count,
+    const uint8_t *payload,
+    uint32_t payload_bytes,
+    Error **errp)
+{
+    if (mapping_count != 0 ||
+        payload_bytes != sizeof(AppleVirglDeleteResourceV1)) {
+        error_setg(errp,
+                   "apple-virgl DELETE_RESOURCE requires an 8-byte payload and no mappings");
+        return false;
+    }
+    return true;
+}
+
 bool apple_virgl_protocol_decode_submit(const void *bytes,
                                         size_t size,
                                         AppleVirglSubmitView *view,
@@ -368,7 +384,8 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         opcode != APPLE_VIRGL_SUBMIT_DISPLAY_SET_SHARED_STATE &&
         opcode != APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3 &&
         opcode != APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO &&
-        opcode != APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES) {
+        opcode != APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES &&
+        opcode != APPLE_VIRGL_SUBMIT_DELETE_RESOURCE) {
         error_setg(errp, "apple-virgl submit opcode is unsupported");
         return false;
     }
@@ -478,6 +495,12 @@ bool apple_virgl_protocol_decode_submit(const void *bytes,
         break;
     case APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES:
         if (!apple_virgl_protocol_validate_synchronize_resources(
+                mapping_count, payload, payload_bytes, errp)) {
+            return false;
+        }
+        break;
+    case APPLE_VIRGL_SUBMIT_DELETE_RESOURCE:
+        if (!apple_virgl_protocol_validate_delete_resource(
                 mapping_count, payload, payload_bytes, errp)) {
             return false;
         }

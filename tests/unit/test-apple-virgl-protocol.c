@@ -58,6 +58,11 @@ typedef struct QEMU_PACKED SynchronizeResourcesSubmit {
     AppleVirglSynchronizeResourcesV1 payload;
 } SynchronizeResourcesSubmit;
 
+typedef struct QEMU_PACKED DeleteResourceSubmit {
+    AppleVirglSubmitHeaderV1 header;
+    AppleVirglDeleteResourceV1 payload;
+} DeleteResourceSubmit;
+
 typedef struct QEMU_PACKED BindTaskSubmit {
     AppleVirglSubmitHeaderV1 header;
     AppleVirglTaskBindV4 payload;
@@ -228,6 +233,26 @@ static SynchronizeResourcesSubmit valid_synchronize_resources_submit(void)
         .payload = {
             .task_id = cpu_to_le32(3),
             .resource_count = cpu_to_le32(1),
+            .resource_id = cpu_to_le32(7),
+        },
+    };
+
+    return submit;
+}
+
+static DeleteResourceSubmit valid_delete_resource_submit(void)
+{
+    DeleteResourceSubmit submit = {
+        .header = {
+            .magic = cpu_to_le32(APPLE_VIRGL_CAPSET_MAGIC),
+            .version = cpu_to_le16(APPLE_VIRGL_PROTOCOL_VERSION),
+            .opcode = cpu_to_le16(APPLE_VIRGL_SUBMIT_DELETE_RESOURCE),
+            .mapping_count = 0,
+            .payload_bytes = cpu_to_le32(
+                sizeof(AppleVirglDeleteResourceV1)),
+        },
+        .payload = {
+            .task_id = cpu_to_le32(3),
             .resource_id = cpu_to_le32(7),
         },
     };
@@ -747,6 +772,61 @@ static void test_synchronize_resources_shape(void)
     assert_rejected(&submit, sizeof(submit));
 }
 
+static void test_delete_resource_valid(void)
+{
+    DeleteResourceSubmit submit = valid_delete_resource_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(le16_to_cpu(view.header->opcode), ==,
+                     APPLE_VIRGL_SUBMIT_DELETE_RESOURCE);
+    g_assert_cmpuint(view.mapping_count, ==, 0);
+    g_assert_cmpuint(ldl_le_p(view.payload), ==, 3);
+    g_assert_cmpuint(ldl_le_p(view.payload + 4), ==, 7);
+}
+
+static void test_delete_resource_kernel_task(void)
+{
+    DeleteResourceSubmit submit = valid_delete_resource_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    submit.payload.task_id = 0;
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(ldl_le_p(view.payload), ==, 0);
+}
+
+static void test_delete_resource_zero_resource_is_well_formed(void)
+{
+    DeleteResourceSubmit submit = valid_delete_resource_submit();
+    AppleVirglSubmitView view;
+    Error *err = NULL;
+
+    /* The reference host treats the two-word payload as an identity, rather
+     * than adding a transport-level nonzero resource-ID policy. */
+    submit.payload.resource_id = 0;
+    g_assert_true(apple_virgl_protocol_decode_submit(&submit, sizeof(submit),
+                                                     &view, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(ldl_le_p(view.payload + 4), ==, 0);
+}
+
+static void test_delete_resource_shape(void)
+{
+    DeleteResourceSubmit submit = valid_delete_resource_submit();
+
+    submit.header.mapping_count = cpu_to_le32(1);
+    assert_rejected(&submit, sizeof(submit));
+    submit = valid_delete_resource_submit();
+    submit.header.payload_bytes = cpu_to_le32(4);
+    assert_rejected(&submit, sizeof(submit) - sizeof(uint32_t));
+}
+
 static void test_bind_kernel_task(void)
 {
     BindTaskSubmit submit = valid_bind_task_submit(0, true);
@@ -937,6 +1017,14 @@ int main(int argc, char **argv)
                     test_synchronize_resources_valid);
     g_test_add_func("/apple-virgl/protocol/synchronize-resources-shape",
                     test_synchronize_resources_shape);
+    g_test_add_func("/apple-virgl/protocol/delete-resource-valid",
+                    test_delete_resource_valid);
+    g_test_add_func("/apple-virgl/protocol/delete-resource-kernel-task",
+                    test_delete_resource_kernel_task);
+    g_test_add_func("/apple-virgl/protocol/delete-resource-zero-resource-is-well-formed",
+                    test_delete_resource_zero_resource_is_well_formed);
+    g_test_add_func("/apple-virgl/protocol/delete-resource-shape",
+                    test_delete_resource_shape);
     g_test_add_func("/apple-virgl/protocol/bind-kernel-task",
                     test_bind_kernel_task);
     g_test_add_func("/apple-virgl/protocol/bind-user-task",
