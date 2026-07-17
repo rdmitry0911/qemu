@@ -22,6 +22,7 @@
 #include "ui/console.h"
 #include "qmu/qmetal_unified.h"
 #include "apple-virgl-frame-pump.h"
+#include "hw/display/apple-virgl-cursor-stage.h"
 #include "hw/display/apple-virgl-present-stage.h"
 #include "hw/display/apple-virgl-qmetal-abi.h"
 
@@ -113,6 +114,12 @@ struct AppleVirglBridge {
     QEMUBH *present_bh;
     DisplaySurface *present_surface;
     bool present_bh_scheduled;
+    /* Cursor callbacks stage ephemeral bytes for the guarded QEMU UI BH. */
+    QemuMutex cursor_lock;
+    AppleVirglCursorStage cursor_stage;
+    QEMUBH *cursor_bh;
+    bool cursor_bh_scheduled;
+    bool cursor_visible;
     QemuMutex completion_lock;
     GQueue completion_receivers;
     GQueue completion_stamps;
@@ -891,6 +898,189 @@ static void apple_virgl_presenter_resume(AppleVirglBridge *bridge)
     qemu_mutex_unlock(&bridge->present_lock);
 }
 
+static void apple_virgl_cursor_update(AppleVirglBridge *bridge,
+                                      uint32_t display_id)
+{
+    QemuConsole *con;
+    qmu_session *session = NULL;
+    uint32_t packed_position = 0xffffffffu;
+    qmu_status status = QMU_ERROR;
+
+    assert(bql_locked());
+    if (!bridge || display_id != 0) {
+        return;
+    }
+    con = bridge->gpu ? bridge->gpu->parent_obj.scanout[0].con : NULL;
+    if (!con || !apple_virgl_session_lease_begin(bridge, &session)) {
+        return;
+    }
+    status = qmu_get_display_cursor_position(session, display_id,
+                                             &packed_position);
+    apple_virgl_session_lease_end(bridge);
+    if (status != QMU_OK) {
+        return;
+    }
+
+    /* Decode packed y:x; QMetal's 0xffffffff sentinel stays (-1, -1). */
+    dpy_mouse_set(con, (int)(int16_t)(packed_position & 0xffffu),
+                  (int)(int16_t)(packed_position >> 16),
+                  bridge->cursor_visible);
+}
+
+static void apple_virgl_cursor_apply_glyph(
+    AppleVirglBridge *bridge, const AppleVirglCursorStageJob *job)
+{
+    QemuConsole *con;
+    QEMUCursor *cursor;
+
+    assert(bql_locked());
+    if (!bridge || !job || job->kind != APPLE_VIRGL_CURSOR_STAGE_GLYPH ||
+        job->width > UINT16_MAX || job->height > UINT16_MAX) {
+        return;
+    }
+    con = bridge->gpu ? bridge->gpu->parent_obj.scanout[0].con : NULL;
+    if (!con) {
+        return;
+    }
+    cursor = cursor_alloc((uint16_t)job->width, (uint16_t)job->height);
+    if (!cursor) {
+        return;
+    }
+    cursor->hot_x = (int)job->hot_x;
+    cursor->hot_y = (int)job->hot_y;
+    if (apple_virgl_cursor_stage_fill_qemu_cursor(
+            job, cursor->data, (size_t)cursor->width * cursor->height)) {
+        dpy_cursor_define(con, cursor);
+        apple_virgl_cursor_update(bridge, 0);
+    }
+    cursor_unref(cursor);
+}
+
+static void apple_virgl_cursor_bh(void *opaque)
+{
+    AppleVirglBridge *bridge = opaque;
+
+    if (!bridge) {
+        return;
+    }
+    assert(bql_locked());
+
+    for (;;) {
+        AppleVirglCursorStageJob *job;
+
+        qemu_mutex_lock(&bridge->cursor_lock);
+        job = apple_virgl_cursor_stage_take(&bridge->cursor_stage);
+        if (!job) {
+            bridge->cursor_bh_scheduled = false;
+            qemu_mutex_unlock(&bridge->cursor_lock);
+            return;
+        }
+        qemu_mutex_unlock(&bridge->cursor_lock);
+
+        switch (job->kind) {
+        case APPLE_VIRGL_CURSOR_STAGE_GLYPH:
+            apple_virgl_cursor_apply_glyph(bridge, job);
+            break;
+        case APPLE_VIRGL_CURSOR_STAGE_SHOW:
+            bridge->cursor_visible = job->visible;
+            apple_virgl_cursor_update(bridge, job->display_id);
+            break;
+        case APPLE_VIRGL_CURSOR_STAGE_MOVE:
+            apple_virgl_cursor_update(bridge, job->display_id);
+            break;
+        }
+        apple_virgl_cursor_stage_job_free(job);
+    }
+}
+
+static void apple_virgl_cursor_schedule_locked(AppleVirglBridge *bridge,
+                                                bool queued)
+{
+    if (queued && !bridge->cursor_bh_scheduled && bridge->cursor_bh) {
+        bridge->cursor_bh_scheduled = true;
+        qemu_bh_schedule(bridge->cursor_bh);
+    }
+}
+
+static void apple_virgl_cursor_glyph(void *opaque, const void *pixels,
+                                     uint64_t mapped_length, uint64_t stride,
+                                     uint32_t width, uint32_t height,
+                                     uint32_t hot_x, uint32_t hot_y,
+                                     uint32_t sum)
+{
+    AppleVirglBridge *bridge = opaque;
+    bool queued;
+
+    (void)sum;
+    if (!bridge) {
+        return;
+    }
+    qemu_mutex_lock(&bridge->cursor_lock);
+    queued = apple_virgl_cursor_stage_enqueue_glyph(
+        &bridge->cursor_stage, pixels, mapped_length, stride, width, height,
+        hot_x, hot_y);
+    apple_virgl_cursor_schedule_locked(bridge, queued);
+    qemu_mutex_unlock(&bridge->cursor_lock);
+}
+
+static void apple_virgl_cursor_show(void *opaque, uint32_t display_id,
+                                    int visible)
+{
+    AppleVirglBridge *bridge = opaque;
+    bool queued;
+
+    if (!bridge || display_id != 0) {
+        return;
+    }
+    qemu_mutex_lock(&bridge->cursor_lock);
+    queued = apple_virgl_cursor_stage_enqueue_show(&bridge->cursor_stage,
+                                                   display_id,
+                                                   visible != 0);
+    apple_virgl_cursor_schedule_locked(bridge, queued);
+    qemu_mutex_unlock(&bridge->cursor_lock);
+}
+
+static void apple_virgl_cursor_move(void *opaque, uint32_t display_id)
+{
+    AppleVirglBridge *bridge = opaque;
+    bool queued;
+
+    if (!bridge || display_id != 0) {
+        return;
+    }
+    qemu_mutex_lock(&bridge->cursor_lock);
+    queued = apple_virgl_cursor_stage_enqueue_move(&bridge->cursor_stage,
+                                                   display_id);
+    apple_virgl_cursor_schedule_locked(bridge, queued);
+    qemu_mutex_unlock(&bridge->cursor_lock);
+}
+
+static void apple_virgl_cursor_quiesce(AppleVirglBridge *bridge,
+                                       bool shutdown)
+{
+    if (!bridge) {
+        return;
+    }
+    qemu_mutex_lock(&bridge->cursor_lock);
+    apple_virgl_cursor_stage_begin_reset(&bridge->cursor_stage, shutdown);
+    bridge->cursor_bh_scheduled = false;
+    qemu_mutex_unlock(&bridge->cursor_lock);
+
+    if (bridge->cursor_bh) {
+        qemu_bh_cancel(bridge->cursor_bh);
+    }
+}
+
+static void apple_virgl_cursor_resume(AppleVirglBridge *bridge)
+{
+    if (!bridge) {
+        return;
+    }
+    qemu_mutex_lock(&bridge->cursor_lock);
+    apple_virgl_cursor_stage_resume(&bridge->cursor_stage);
+    qemu_mutex_unlock(&bridge->cursor_lock);
+}
+
 AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
 {
     AppleVirglBridge *bridge;
@@ -916,6 +1106,9 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     apple_virgl_frame_pump_init(&bridge->frame_pump);
     qemu_mutex_init(&bridge->present_lock);
     apple_virgl_present_stage_init(&bridge->present_stage);
+    qemu_mutex_init(&bridge->cursor_lock);
+    apple_virgl_cursor_stage_init(&bridge->cursor_stage);
+    bridge->cursor_visible = true;
     qemu_mutex_init(&bridge->completion_lock);
     g_queue_init(&bridge->completion_receivers);
     g_queue_init(&bridge->completion_stamps);
@@ -928,6 +1121,9 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
         &DEVICE(gpu)->mem_reentrancy_guard);
     bridge->present_bh = qemu_bh_new_guarded(
         apple_virgl_present_bh, bridge,
+        &DEVICE(gpu)->mem_reentrancy_guard);
+    bridge->cursor_bh = qemu_bh_new_guarded(
+        apple_virgl_cursor_bh, bridge,
         &DEVICE(gpu)->mem_reentrancy_guard);
     bridge->completion_bh = qemu_bh_new_guarded(
         apple_virgl_completion_bh, bridge,
@@ -945,6 +1141,9 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     callbacks.write_memory = apple_virgl_write_memory;
     callbacks.read_gpu_memory = apple_virgl_read_gpu_memory;
     callbacks.completion_stamp = apple_virgl_completion_stamp;
+    callbacks.cursor_glyph = apple_virgl_cursor_glyph;
+    callbacks.cursor_show = apple_virgl_cursor_show;
+    callbacks.cursor_move = apple_virgl_cursor_move;
     callbacks.new_frame_signal = apple_virgl_new_frame_signal;
     callbacks.render_frame_complete = apple_virgl_render_frame_complete;
     session = qmu_create(&config, &callbacks);
@@ -977,6 +1176,7 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
     qemu_mutex_unlock(&bridge->completion_lock);
     session = apple_virgl_session_gate_close(bridge, true);
     apple_virgl_bridge_clear_completion_state(bridge, false);
+    apple_virgl_cursor_quiesce(bridge, true);
     apple_virgl_presenter_quiesce(bridge, true);
     apple_virgl_frame_pump_quiesce(bridge, true);
     apple_virgl_session_gate_wait_idle(bridge);
@@ -1001,6 +1201,10 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
         qemu_bh_delete(bridge->present_bh);
         bridge->present_bh = NULL;
     }
+    if (bridge->cursor_bh) {
+        qemu_bh_delete(bridge->cursor_bh);
+        bridge->cursor_bh = NULL;
+    }
     if (bridge->completion_bh) {
         qemu_bh_delete(bridge->completion_bh);
         bridge->completion_bh = NULL;
@@ -1017,6 +1221,7 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
     }
 
     qemu_mutex_destroy(&bridge->completion_lock);
+    qemu_mutex_destroy(&bridge->cursor_lock);
     qemu_mutex_destroy(&bridge->present_lock);
     qemu_cond_destroy(&bridge->frame_pump_idle);
     qemu_mutex_destroy(&bridge->frame_pump_lock);
@@ -1045,6 +1250,7 @@ void apple_virgl_bridge_reset(AppleVirglBridge *bridge)
     qemu_mutex_lock(&bridge->lifecycle_lock);
     session = apple_virgl_session_gate_close(bridge, false);
     apple_virgl_bridge_clear_completion_state(bridge, false);
+    apple_virgl_cursor_quiesce(bridge, false);
     apple_virgl_presenter_quiesce(bridge, false);
     apple_virgl_frame_pump_quiesce(bridge, false);
     apple_virgl_session_gate_wait_idle(bridge);
@@ -1080,6 +1286,7 @@ void apple_virgl_bridge_reset(AppleVirglBridge *bridge)
 
     apple_virgl_bridge_frame_pump_resume(bridge);
     apple_virgl_presenter_resume(bridge);
+    apple_virgl_cursor_resume(bridge);
     qemu_mutex_lock(&bridge->completion_lock);
     if (!bridge->completion_shutdown) {
         bridge->completion_resetting = false;
