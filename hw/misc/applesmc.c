@@ -31,10 +31,12 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/cpu.h"
 #include "hw/isa/isa.h"
 #include "hw/core/qdev-properties.h"
 #include "ui/console.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -46,6 +48,7 @@
 #define TYPE_APPLE_SMC "isa-applesmc"
 #define APPLESMC_MAX_DATA_LENGTH       32
 #define APPLESMC_PROP_IO_BASE "iobase"
+#define APPLESMC_PIO_RING_CAPACITY     1024
 
 enum {
     APPLESMC_DATA_PORT               = 0x00,
@@ -95,6 +98,27 @@ struct AppleSMCData {
     QLIST_ENTRY(AppleSMCData) node;
 };
 
+/*
+ * This is deliberately a fixed, launch-lifetime diagnostic ring.  The PIO
+ * callbacks append only post-callback state and never allocate, log, take a
+ * new lock, or otherwise alter the guest-visible AppleSMC protocol.
+ */
+typedef struct AppleSMCPioRecord {
+    uint64_t seq;
+    int32_t cpu_index;
+    uint8_t port;
+    uint8_t value;
+    uint8_t direction;
+    bool value_valid;
+    uint8_t cmd;
+    uint8_t status;
+    uint8_t status_1e;
+    uint8_t read_pos;
+    uint8_t data_len;
+    uint8_t data_pos;
+    uint8_t key[4];
+} AppleSMCPioRecord;
+
 OBJECT_DECLARE_SIMPLE_TYPE(AppleSMCState, APPLE_SMC)
 
 struct AppleSMCState {
@@ -115,7 +139,102 @@ struct AppleSMCState {
     uint8_t data[255];
     char *osk;
     QLIST_HEAD(, AppleSMCData) data_def;
+
+    bool pio_ring_enabled;
+    AppleSMCPioRecord pio_ring[APPLESMC_PIO_RING_CAPACITY];
+    uint64_t pio_ring_next_seq;
+    uint64_t pio_ring_dropped;
+    uint32_t pio_ring_head;
+    uint32_t pio_ring_count;
 };
+
+static void applesmc_record_pio(AppleSMCState *s, uint8_t port,
+                                bool write, uint8_t value)
+{
+    AppleSMCPioRecord *record;
+    uint32_t slot;
+
+    if (!s->pio_ring_enabled) {
+        return;
+    }
+
+    if (s->pio_ring_count == APPLESMC_PIO_RING_CAPACITY) {
+        slot = s->pio_ring_head;
+        s->pio_ring_head = (s->pio_ring_head + 1) % APPLESMC_PIO_RING_CAPACITY;
+        s->pio_ring_dropped++;
+    } else {
+        slot = (s->pio_ring_head + s->pio_ring_count) %
+            APPLESMC_PIO_RING_CAPACITY;
+        s->pio_ring_count++;
+    }
+
+    record = &s->pio_ring[slot];
+    record->seq = s->pio_ring_next_seq++;
+    record->cpu_index = current_cpu ? current_cpu->cpu_index : -1;
+    record->port = port;
+    record->direction = write;
+    /* DATA reads may contain the guest OSK; never expose them through QMP. */
+    record->value_valid = write || port != APPLESMC_DATA_PORT;
+    record->value = record->value_valid ? value : 0;
+    record->cmd = s->cmd;
+    record->status = s->status;
+    record->status_1e = s->status_1e;
+    record->read_pos = s->read_pos;
+    record->data_len = s->data_len;
+    record->data_pos = s->data_pos;
+    memcpy(record->key, s->key, sizeof(record->key));
+}
+
+static char *applesmc_get_pio_ring(Object *obj, Error **errp)
+{
+    AppleSMCState *s = APPLE_SMC(obj);
+    GString *ring;
+    uint32_t i;
+
+    /* QMP normally already owns BQL; acquire it only for a direct QOM read. */
+    BQL_LOCK_GUARD();
+
+    ring = g_string_new("{\"schema\":\"apple-virgl-applesmc-pio-ring-v1\"");
+    g_string_append_printf(ring,
+                           ",\"enabled\":%s,\"capacity\":%u,\"count\":%u"
+                           ",\"dropped\":%" PRIu64 ",\"next_seq\":%" PRIu64
+                           ",\"records\":[",
+                           s->pio_ring_enabled ? "true" : "false",
+                           APPLESMC_PIO_RING_CAPACITY, s->pio_ring_count,
+                           s->pio_ring_dropped, s->pio_ring_next_seq);
+    for (i = 0; i < s->pio_ring_count; i++) {
+        const AppleSMCPioRecord *record = &s->pio_ring[
+            (s->pio_ring_head + i) % APPLESMC_PIO_RING_CAPACITY];
+
+        g_string_append_printf(ring,
+                               "%s{\"seq\":%" PRIu64
+                               ",\"cpu_index\":%d,\"port\":%u"
+                               ",\"direction\":\"%s\""
+                               ",\"value_valid\":%s,\"value\":",
+                               i ? "," : "", record->seq,
+                               record->cpu_index, record->port,
+                               record->direction ? "write" : "read",
+                               record->value_valid ? "true" : "false");
+        if (record->value_valid) {
+            g_string_append_printf(ring, "%u", record->value);
+        } else {
+            g_string_append(ring, "null");
+        }
+        g_string_append_printf(ring,
+                               ",\"cmd\":%u,\"status\":%u"
+                               ",\"status_1e\":%u,\"read_pos\":%u"
+                               ",\"data_len\":%u,\"data_pos\":%u"
+                               ",\"key\":\"%02x%02x%02x%02x\"}",
+                               record->cmd, record->status,
+                               record->status_1e, record->read_pos,
+                               record->data_len, record->data_pos,
+                               record->key[0], record->key[1], record->key[2],
+                               record->key[3]);
+    }
+    g_string_append(ring, "]}");
+
+    return g_string_free(ring, false);
+}
 
 static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size)
@@ -143,6 +262,7 @@ static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
     }
     s->read_pos = 0;
     s->data_pos = 0;
+    applesmc_record_pio(s, APPLESMC_CMD_PORT, true, val);
 }
 
 static const struct AppleSMCData *applesmc_find_key(AppleSMCState *s)
@@ -193,13 +313,17 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
         s->status = APPLESMC_ST_CMD_DONE;
         s->status_1e = APPLESMC_ST_1E_STILL_BAD_CMD;
     }
+    applesmc_record_pio(s, APPLESMC_DATA_PORT, true, val);
 }
 
 static void applesmc_io_err_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size)
 {
+    AppleSMCState *s = opaque;
+
     smc_debug("ERR_CODE received: 0x%02x, ignoring!\n", (uint8_t)val);
     /* NOTE: writing to the error port not supported! */
+    applesmc_record_pio(s, APPLESMC_ERR_PORT, true, val);
 }
 
 static uint64_t applesmc_io_data_read(void *opaque, hwaddr addr, unsigned size)
@@ -233,6 +357,7 @@ static uint64_t applesmc_io_data_read(void *opaque, hwaddr addr, unsigned size)
     }
     smc_debug("DATA sent: 0x%02x\n", s->last_ret);
 
+    applesmc_record_pio(s, APPLESMC_DATA_PORT, false, s->last_ret);
     return s->last_ret;
 }
 
@@ -241,6 +366,7 @@ static uint64_t applesmc_io_cmd_read(void *opaque, hwaddr addr, unsigned size)
     AppleSMCState *s = opaque;
 
     smc_debug("CMD sent: 0x%02x\n", s->status);
+    applesmc_record_pio(s, APPLESMC_CMD_PORT, false, s->status);
     return s->status;
 }
 
@@ -250,6 +376,7 @@ static uint64_t applesmc_io_err_read(void *opaque, hwaddr addr, unsigned size)
 
     /* NOTE: read does not clear the 1e status */
     smc_debug("ERR_CODE sent: 0x%02x\n", s->status_1e);
+    applesmc_record_pio(s, APPLESMC_ERR_PORT, false, s->status_1e);
     return s->status_1e;
 }
 
@@ -350,10 +477,19 @@ static void applesmc_unrealize(DeviceState *dev)
     }
 }
 
+static void applesmc_instance_init(Object *obj)
+{
+    object_property_add_str(obj, "x-pio-ring", applesmc_get_pio_ring, NULL);
+    object_property_set_description(obj, "x-pio-ring",
+                                    "Read-only AppleSMC PIO diagnostic ring");
+}
+
 static const Property applesmc_isa_properties[] = {
     DEFINE_PROP_UINT32(APPLESMC_PROP_IO_BASE, AppleSMCState, iobase,
                        APPLESMC_DEFAULT_IOBASE),
     DEFINE_PROP_STRING("osk", AppleSMCState, osk),
+    DEFINE_PROP_BOOL("x-pio-ring-enabled", AppleSMCState, pio_ring_enabled,
+                     false),
 };
 
 static void build_applesmc_aml(AcpiDevAmlIf *adev, Aml *scope)
@@ -392,6 +528,7 @@ static const TypeInfo applesmc_isa_info = {
     .name          = TYPE_APPLE_SMC,
     .parent        = TYPE_ISA_DEVICE,
     .instance_size = sizeof(AppleSMCState),
+    .instance_init = applesmc_instance_init,
     .class_init    = qdev_applesmc_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { TYPE_ACPI_DEV_AML_IF },
