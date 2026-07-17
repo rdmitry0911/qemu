@@ -54,6 +54,9 @@ tests = {
   'test-apple-virgl-frame-pump': [
     meson.project_source_root() / 'hw/display/apple-virgl-frame-pump.c'
   ],
+  'test-apple-virgl-present-stage': [
+    meson.project_source_root() / 'hw/display/apple-virgl-present-stage.c'
+  ],
 }
 
 if have_system or have_tools

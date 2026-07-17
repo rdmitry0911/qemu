@@ -164,7 +164,8 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
     if host_os == 'linux'
       virtio_gpu_gl_sources += files('apple-virgl-protocol.c',
                                      'apple-virgl-bridge.c',
-                                     'apple-virgl-frame-pump.c')
+                                     'apple-virgl-frame-pump.c',
+                                     'apple-virgl-present-stage.c')
       virtio_gpu_gl_deps += mlapi_dep
     endif
     virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl, opengl],
