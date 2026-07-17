@@ -114,6 +114,14 @@ struct AppleVirglBridge {
     QEMUBH *present_bh;
     DisplaySurface *present_surface;
     bool present_bh_scheduled;
+    /*
+     * Authoritative mode accepted by the presenter BH.  A later owner
+     * completion with different dimensions is stale and must not recreate an
+     * old console surface.
+     */
+    bool present_mode_valid;
+    uint32_t present_mode_width;
+    uint32_t present_mode_height;
     /* Cursor callbacks stage ephemeral bytes for the guarded QEMU UI BH. */
     QemuMutex cursor_lock;
     AppleVirglCursorStage cursor_stage;
@@ -752,37 +760,29 @@ static void apple_virgl_new_frame_signal(void *opaque)
     apple_virgl_frame_pump_schedule_actions(bridge, actions);
 }
 
-static bool apple_virgl_presenter_apply_job(
-    AppleVirglBridge *bridge, const AppleVirglPresentStageJob *job)
+static DisplaySurface *apple_virgl_presenter_ensure_surface(
+    AppleVirglBridge *bridge, QemuConsole *con, uint32_t width,
+    uint32_t height)
 {
-    QemuConsole *con;
     DisplaySurface *surface;
     bool disable_gl_scanout;
-    uint32_t row;
 
     assert(bql_locked());
-    if (!bridge || !job || !job->payload_valid || !job->pixels) {
-        return false;
+    if (!bridge || !con || width == 0 || height == 0) {
+        return NULL;
     }
-
-    con = bridge->gpu ? bridge->gpu->parent_obj.scanout[0].con : NULL;
-    if (!con) {
-        return false;
-    }
-
     surface = qemu_console_surface(con);
     if (!surface || surface != bridge->present_surface ||
-        surface_width(surface) != (int)job->width ||
-        surface_height(surface) != (int)job->height ||
+        surface_width(surface) != (int)width ||
+        surface_height(surface) != (int)height ||
         surface_format(surface) != PIXMAN_x8r8g8b8 ||
-        surface_stride(surface) < (int)job->stride) {
+        !surface_data(surface)) {
         /* A GL/DMABUF scanout has no CPU surface.  Replacing it selects the
          * CPU-surface path; notify its GL listener exactly on that transition. */
         disable_gl_scanout = surface == NULL;
-        surface = qemu_create_displaysurface((int)job->width,
-                                             (int)job->height);
+        surface = qemu_create_displaysurface((int)width, (int)height);
         if (!surface) {
-            return false;
+            return NULL;
         }
         dpy_gfx_replace_surface(con, surface);
         bridge->present_surface = surface;
@@ -791,9 +791,88 @@ static bool apple_virgl_presenter_apply_job(
         }
     }
 
-    if (!surface_data(surface)) {
+    return surface;
+}
+
+static bool apple_virgl_presenter_apply_mode(
+    AppleVirglBridge *bridge, const AppleVirglPresentStageJob *job)
+{
+    QemuConsole *con;
+
+    assert(bql_locked());
+    if (!bridge || !job ||
+        job->kind != APPLE_VIRGL_PRESENT_STAGE_MODE_CHANGE) {
         return false;
     }
+
+    /*
+     * Apple PVG's set_mode() selects its CPU surface from geometry alone.
+     * Keep these QMetal identity values owned in the FIFO, but do not invent
+     * a conversion or replacement for metadata-only changes.
+     */
+    (void)job->iosurface_pixel_format;
+    (void)job->protection_requirements;
+
+    con = bridge->gpu ? bridge->gpu->parent_obj.scanout[0].con : NULL;
+    if (!con || !apple_virgl_presenter_ensure_surface(bridge, con,
+                                                       job->width,
+                                                       job->height)) {
+        return false;
+    }
+
+    bridge->present_mode_valid = true;
+    bridge->present_mode_width = job->width;
+    bridge->present_mode_height = job->height;
+    return true;
+}
+
+static bool apple_virgl_presenter_apply_job(
+    AppleVirglBridge *bridge, const AppleVirglPresentStageJob *job)
+{
+    QemuConsole *con;
+    DisplaySurface *surface;
+    uint32_t row;
+
+    assert(bql_locked());
+    if (!bridge || !job ||
+        job->kind != APPLE_VIRGL_PRESENT_STAGE_FRAME_COMPLETION ||
+        !job->payload_valid || !job->pixels) {
+        return false;
+    }
+
+    /*
+     * The mode handler is the authoritative geometry edge.  Reference
+     * completion similarly drops a frame that belongs to an older mode.
+     */
+    if (bridge->present_mode_valid &&
+        (job->width != bridge->present_mode_width ||
+         job->height != bridge->present_mode_height)) {
+        return false;
+    }
+
+    con = bridge->gpu ? bridge->gpu->parent_obj.scanout[0].con : NULL;
+    if (!con) {
+        return false;
+    }
+    surface = apple_virgl_presenter_ensure_surface(
+        bridge, con, bridge->present_mode_valid ? bridge->present_mode_width
+                                                 : job->width,
+        bridge->present_mode_valid ? bridge->present_mode_height : job->height);
+    if (!surface || surface_stride(surface) < (int)job->stride) {
+        return false;
+    }
+
+    /*
+     * QMetal promises the mode callback before frame publication.  Keep a
+     * conservative fallback for a failed/dropped mode callback without using
+     * pixels to override an already accepted mode.
+     */
+    if (!bridge->present_mode_valid) {
+        bridge->present_mode_valid = true;
+        bridge->present_mode_width = job->width;
+        bridge->present_mode_height = job->height;
+    }
+
     for (row = 0; row < job->height; row++) {
         memcpy((uint8_t *)surface_data(surface) +
                    (size_t)row * surface_stride(surface),
@@ -826,20 +905,59 @@ static void apple_virgl_present_bh(void *opaque)
         }
         qemu_mutex_unlock(&bridge->present_lock);
 
-        (void)apple_virgl_presenter_apply_job(bridge, job);
+        if (job->kind == APPLE_VIRGL_PRESENT_STAGE_MODE_CHANGE) {
+            (void)apple_virgl_presenter_apply_mode(bridge, job);
+        } else if (job->kind == APPLE_VIRGL_PRESENT_STAGE_FRAME_COMPLETION) {
+            (void)apple_virgl_presenter_apply_job(bridge, job);
 
-        /* This is the only owner-completion retirement edge.  It runs after
-         * the console update/drop so the next QMetal submit cannot overtake
-         * the visible frame hand-off. */
-        qemu_mutex_lock(&bridge->frame_pump_lock);
-        actions = apple_virgl_frame_pump_frame_completed(&bridge->frame_pump);
-        qemu_mutex_unlock(&bridge->frame_pump_lock);
-        pending_actions.schedule_bh |= actions.schedule_bh;
-        pending_actions.schedule_submit |= actions.schedule_submit;
+            /*
+             * This is the only owner-completion retirement edge.  It runs
+             * after the console update/drop so the next QMetal submit cannot
+             * overtake the visible frame hand-off.
+             */
+            qemu_mutex_lock(&bridge->frame_pump_lock);
+            actions = apple_virgl_frame_pump_frame_completed(
+                &bridge->frame_pump);
+            qemu_mutex_unlock(&bridge->frame_pump_lock);
+            pending_actions.schedule_bh |= actions.schedule_bh;
+            pending_actions.schedule_submit |= actions.schedule_submit;
+        }
         apple_virgl_present_stage_job_free(job);
     }
 
     apple_virgl_frame_pump_schedule_actions(bridge, pending_actions);
+}
+
+static void apple_virgl_presenter_schedule_locked(AppleVirglBridge *bridge,
+                                                   bool queued)
+{
+    if (queued && !bridge->present_bh_scheduled && bridge->present_bh) {
+        bridge->present_bh_scheduled = true;
+        qemu_bh_schedule(bridge->present_bh);
+    }
+}
+
+static void apple_virgl_mode_change(void *opaque, uint32_t width,
+                                    uint32_t height,
+                                    uint32_t iosurface_pixel_format,
+                                    uint64_t protection_requirements)
+{
+    AppleVirglBridge *bridge = opaque;
+    bool queued;
+
+    if (!bridge) {
+        return;
+    }
+    /*
+     * Basic qmu_create() may invoke this inline.  Stage scalar data only:
+     * QEMU UI/BQL work belongs exclusively to the guarded presenter BH.
+     */
+    qemu_mutex_lock(&bridge->present_lock);
+    queued = apple_virgl_present_stage_enqueue_mode(
+        &bridge->present_stage, width, height, iosurface_pixel_format,
+        protection_requirements);
+    apple_virgl_presenter_schedule_locked(bridge, queued);
+    qemu_mutex_unlock(&bridge->present_lock);
 }
 
 static void apple_virgl_render_frame_complete(
@@ -860,10 +978,7 @@ static void apple_virgl_render_frame_complete(
         &bridge->present_stage, completion->frame_expected != 0,
         completion->pixels, completion->width, completion->height,
         completion->stride);
-    if (queued && !bridge->present_bh_scheduled && bridge->present_bh) {
-        bridge->present_bh_scheduled = true;
-        qemu_bh_schedule(bridge->present_bh);
-    }
+    apple_virgl_presenter_schedule_locked(bridge, queued);
     qemu_mutex_unlock(&bridge->present_lock);
 }
 
@@ -880,6 +995,9 @@ static void apple_virgl_presenter_quiesce(AppleVirglBridge *bridge,
     /* This is a non-owning marker only.  Generic virtio/virgl reset owns the
      * actual console replacement and may already have freed this surface. */
     bridge->present_surface = NULL;
+    bridge->present_mode_valid = false;
+    bridge->present_mode_width = 0;
+    bridge->present_mode_height = 0;
     qemu_mutex_unlock(&bridge->present_lock);
 
     if (bridge->present_bh) {
@@ -1144,6 +1262,7 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     callbacks.cursor_glyph = apple_virgl_cursor_glyph;
     callbacks.cursor_show = apple_virgl_cursor_show;
     callbacks.cursor_move = apple_virgl_cursor_move;
+    callbacks.mode_change = apple_virgl_mode_change;
     callbacks.new_frame_signal = apple_virgl_new_frame_signal;
     callbacks.render_frame_complete = apple_virgl_render_frame_complete;
     session = qmu_create(&config, &callbacks);

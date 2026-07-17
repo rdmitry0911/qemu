@@ -11,6 +11,33 @@
 
 #include <limits.h>
 
+/*
+ * qemu_create_displaysurface() passes width * 4 and then height * stride
+ * through signed-int arithmetic before handing the result to Pixman.
+ */
+static bool apple_virgl_present_stage_surface_geometry(
+    uint32_t width, uint32_t height, uint32_t *out_packed_stride,
+    uint64_t *out_packed_bytes)
+{
+    uint32_t packed_stride;
+
+    if (width == 0 || height == 0 ||
+        width > (uint32_t)INT_MAX / 4u) {
+        return false;
+    }
+    packed_stride = width * 4u;
+    if (height > (uint32_t)INT_MAX / packed_stride) {
+        return false;
+    }
+    if (out_packed_stride) {
+        *out_packed_stride = packed_stride;
+    }
+    if (out_packed_bytes) {
+        *out_packed_bytes = (uint64_t)packed_stride * height;
+    }
+    return true;
+}
+
 static bool apple_virgl_present_stage_copy_payload(
     AppleVirglPresentStageJob *job, const void *pixels, uint32_t width,
     uint32_t height, uint32_t stride)
@@ -21,11 +48,9 @@ static bool apple_virgl_present_stage_copy_payload(
     uint64_t source_bytes;
     uint32_t row;
 
-    if (!source || width == 0 || height == 0 ||
-        umul32_overflow(width, 4, &packed_stride) ||
-        width > INT_MAX || height > INT_MAX || stride > INT_MAX ||
-        packed_stride > INT_MAX || stride < packed_stride ||
-        umul64_overflow(packed_stride, height, &packed_bytes) ||
+    if (!source || !apple_virgl_present_stage_surface_geometry(
+                       width, height, &packed_stride, &packed_bytes) ||
+        stride > INT_MAX || stride < packed_stride ||
         umul64_overflow(stride, height, &source_bytes) ||
         packed_bytes > SIZE_MAX || source_bytes > SIZE_MAX) {
         return false;
@@ -82,11 +107,35 @@ bool apple_virgl_present_stage_enqueue(AppleVirglPresentStage *stage,
     }
 
     job = g_new0(AppleVirglPresentStageJob, 1);
+    job->kind = APPLE_VIRGL_PRESENT_STAGE_FRAME_COMPLETION;
     job->frame_expected = frame_expected;
     if (frame_expected) {
         (void)apple_virgl_present_stage_copy_payload(job, pixels, width,
                                                       height, stride);
     }
+    apple_virgl_present_stage_append(stage, job);
+    return true;
+}
+
+bool apple_virgl_present_stage_enqueue_mode(
+    AppleVirglPresentStage *stage, uint32_t width, uint32_t height,
+    uint32_t iosurface_pixel_format, uint64_t protection_requirements)
+{
+    AppleVirglPresentStageJob *job;
+
+    if (!stage || stage->resetting || stage->shutdown ||
+        stage->pending_jobs == SIZE_MAX ||
+        !apple_virgl_present_stage_surface_geometry(width, height, NULL,
+                                                    NULL)) {
+        return false;
+    }
+
+    job = g_new0(AppleVirglPresentStageJob, 1);
+    job->kind = APPLE_VIRGL_PRESENT_STAGE_MODE_CHANGE;
+    job->width = width;
+    job->height = height;
+    job->iosurface_pixel_format = iosurface_pixel_format;
+    job->protection_requirements = protection_requirements;
     apple_virgl_present_stage_append(stage, job);
     return true;
 }

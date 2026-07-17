@@ -18,14 +18,22 @@
  * mutex), then hands the owned job to the main-loop presenter.  In
  * particular, it never retains the producer's pixels pointer.
  */
+typedef enum AppleVirglPresentStageJobKind {
+    APPLE_VIRGL_PRESENT_STAGE_FRAME_COMPLETION,
+    APPLE_VIRGL_PRESENT_STAGE_MODE_CHANGE,
+} AppleVirglPresentStageJobKind;
+
 typedef struct AppleVirglPresentStageJob {
     struct AppleVirglPresentStageJob *next;
+    AppleVirglPresentStageJobKind kind;
     bool frame_expected;
     bool payload_valid;
     uint8_t *pixels;
     uint32_t width;
     uint32_t height;
     uint32_t stride;
+    uint32_t iosurface_pixel_format;
+    uint64_t protection_requirements;
     size_t pixel_bytes;
 } AppleVirglPresentStageJob;
 
@@ -54,7 +62,17 @@ bool apple_virgl_present_stage_enqueue(AppleVirglPresentStage *stage,
                                        uint32_t height,
                                        uint32_t stride);
 
-/* Transfer the oldest queued terminal token to the caller. */
+/*
+ * Enqueue one QMetal mode edge before its later frame publication.  The stage
+ * owns only scalar callback data; the BQL consumer decides whether equal
+ * geometry is a QEMU surface no-op.  Reject dimensions that cannot form the
+ * signed four-byte-per-pixel QEMU stride and signed surface allocation size.
+ */
+bool apple_virgl_present_stage_enqueue_mode(
+    AppleVirglPresentStage *stage, uint32_t width, uint32_t height,
+    uint32_t iosurface_pixel_format, uint64_t protection_requirements);
+
+/* Transfer the oldest queued mode event or terminal token to the caller. */
 AppleVirglPresentStageJob *
 apple_virgl_present_stage_take(AppleVirglPresentStage *stage);
 

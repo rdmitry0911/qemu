@@ -36,6 +36,8 @@ static void test_row_packs_bgra_without_padding(void)
     g_assert_true(apple_virgl_present_stage_enqueue(&stage, true, source,
                                                      2, 2, 12));
     job = take_job(&stage);
+    g_assert_cmpint(job->kind, ==,
+                    APPLE_VIRGL_PRESENT_STAGE_FRAME_COMPLETION);
     g_assert_true(job->frame_expected);
     g_assert_true(job->payload_valid);
     g_assert_cmpuint(job->width, ==, 2);
@@ -44,6 +46,58 @@ static void test_row_packs_bgra_without_padding(void)
     g_assert_cmpuint(job->pixel_bytes, ==, sizeof(expected));
     g_assert_cmpmem(job->pixels, job->pixel_bytes, expected, sizeof(expected));
     apple_virgl_present_stage_job_free(job);
+    g_assert_true(apple_virgl_present_stage_is_idle(&stage));
+}
+
+static void test_mode_events_keep_fifo_order_and_metadata(void)
+{
+    AppleVirglPresentStage stage;
+    AppleVirglPresentStageJob *job;
+    const uint8_t pixels[] = { 0x10, 0x11, 0x12, 0x13 };
+
+    apple_virgl_present_stage_init(&stage);
+    g_assert_true(apple_virgl_present_stage_enqueue_mode(
+        &stage, 1920, 1080, 0x42475241u, UINT64_C(0x1122334455667788)));
+    g_assert_true(apple_virgl_present_stage_enqueue(&stage, true, pixels,
+                                                     1, 1, 4));
+
+    job = take_job(&stage);
+    g_assert_cmpint(job->kind, ==, APPLE_VIRGL_PRESENT_STAGE_MODE_CHANGE);
+    g_assert_false(job->frame_expected);
+    g_assert_false(job->payload_valid);
+    g_assert_cmpuint(job->width, ==, 1920);
+    g_assert_cmpuint(job->height, ==, 1080);
+    g_assert_cmpuint(job->iosurface_pixel_format, ==, 0x42475241u);
+    g_assert_cmpuint(job->protection_requirements, ==,
+                     UINT64_C(0x1122334455667788));
+    apple_virgl_present_stage_job_free(job);
+
+    job = take_job(&stage);
+    g_assert_cmpint(job->kind, ==,
+                    APPLE_VIRGL_PRESENT_STAGE_FRAME_COMPLETION);
+    g_assert_true(job->payload_valid);
+    apple_virgl_present_stage_job_free(job);
+    g_assert_true(apple_virgl_present_stage_is_idle(&stage));
+}
+
+static void test_invalid_mode_dimensions_are_rejected(void)
+{
+    AppleVirglPresentStage stage;
+
+    apple_virgl_present_stage_init(&stage);
+    g_assert_false(apple_virgl_present_stage_enqueue_mode(&stage, 0, 1,
+                                                           0, 0));
+    g_assert_false(apple_virgl_present_stage_enqueue_mode(&stage, 1, 0,
+                                                           0, 0));
+    g_assert_false(apple_virgl_present_stage_enqueue_mode(&stage,
+                                                           UINT32_MAX, 1,
+                                                           0, 0));
+    g_assert_false(apple_virgl_present_stage_enqueue_mode(
+        &stage, (uint32_t)INT_MAX / 4u + 1u, 1, 0, 0));
+    g_assert_false(apple_virgl_present_stage_enqueue_mode(
+        &stage, 1, (uint32_t)INT_MAX / 4u + 1u, 0, 0));
+    g_assert_false(apple_virgl_present_stage_enqueue_mode(&stage, 1,
+                                                           UINT32_MAX, 0, 0));
     g_assert_true(apple_virgl_present_stage_is_idle(&stage));
 }
 
@@ -124,8 +178,10 @@ static void test_malformed_dimensions_make_terminal_jobs(void)
     g_assert_true(apple_virgl_present_stage_enqueue(&stage, true, pixels,
                                                      UINT32_MAX, 1,
                                                      UINT32_MAX));
+    g_assert_true(apple_virgl_present_stage_enqueue(
+        &stage, true, pixels, 1, (uint32_t)INT_MAX / 4u + 1u, 4));
 
-    for (index = 0; index < 4; index++) {
+    for (index = 0; index < 5; index++) {
         job = take_job(&stage);
         g_assert_true(job->frame_expected);
         g_assert_false(job->payload_valid);
@@ -142,6 +198,8 @@ static void test_reset_shutdown_reject_drain_and_resume(void)
     const uint8_t pixels[] = { 0x10, 0x11, 0x12, 0x13 };
 
     apple_virgl_present_stage_init(&stage);
+    g_assert_true(apple_virgl_present_stage_enqueue_mode(&stage, 2, 2,
+                                                          0x42475241u, 0));
     g_assert_true(apple_virgl_present_stage_enqueue(&stage, true, pixels,
                                                      1, 1, 4));
     apple_virgl_present_stage_begin_reset(&stage, false);
@@ -154,8 +212,13 @@ static void test_reset_shutdown_reject_drain_and_resume(void)
 
     apple_virgl_present_stage_resume(&stage);
     g_assert_false(stage.resetting);
+    g_assert_true(apple_virgl_present_stage_enqueue_mode(&stage, 2, 2,
+                                                          0x42475241u, 0));
     g_assert_true(apple_virgl_present_stage_enqueue(&stage, true, pixels,
                                                      1, 1, 4));
+    job = take_job(&stage);
+    g_assert_cmpint(job->kind, ==, APPLE_VIRGL_PRESENT_STAGE_MODE_CHANGE);
+    apple_virgl_present_stage_job_free(job);
     job = take_job(&stage);
     apple_virgl_present_stage_job_free(job);
 
@@ -177,6 +240,10 @@ int main(int argc, char **argv)
                     test_row_packs_bgra_without_padding);
     g_test_add_func("/apple-virgl/present-stage/owns-pixel-copy",
                     test_enqueue_owns_pixel_copy);
+    g_test_add_func("/apple-virgl/present-stage/mode-fifo-metadata",
+                    test_mode_events_keep_fifo_order_and_metadata);
+    g_test_add_func("/apple-virgl/present-stage/invalid-mode-dimensions",
+                    test_invalid_mode_dimensions_are_rejected);
     g_test_add_func("/apple-virgl/present-stage/fifo-terminal-tokens",
                     test_fifo_keeps_terminal_tokens);
     g_test_add_func("/apple-virgl/present-stage/malformed-terminal-tokens",
