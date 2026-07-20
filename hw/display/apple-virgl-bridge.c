@@ -11,6 +11,7 @@
 #include "qemu/iov.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
+#include "qemu/notify.h"
 #include "qemu/thread.h"
 #include "block/thread-pool.h"
 #include "hw/virtio/virtio.h"
@@ -19,6 +20,7 @@
 #include "hw/virtio/apple-virgl-protocol.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+#include "system/system.h"
 #include "ui/console.h"
 #include "qmu/qmetal_unified.h"
 #include "apple-virgl-frame-pump.h"
@@ -135,6 +137,8 @@ struct AppleVirglBridge {
     /* P4 writes may originate from the render callback or presenter BH. */
     QemuMutex p4_semantic_ledger_lock;
     AppleVirglP4SemanticLedger p4_semantic_ledger;
+    Notifier p4_exit_notifier;
+    bool p4_exit_notifier_registered;
     QEMUBH *present_bh;
     DisplaySurface *present_surface;
     bool present_bh_scheduled;
@@ -850,6 +854,32 @@ static bool apple_virgl_presenter_apply_mode(
     return true;
 }
 
+static void apple_virgl_p4_stop_and_finalize(AppleVirglBridge *bridge)
+{
+    if (!bridge) {
+        return;
+    }
+    qemu_mutex_lock(&bridge->p4_semantic_ledger_lock);
+    apple_virgl_p4_semantic_ledger_destroy(&bridge->p4_semantic_ledger);
+    qemu_mutex_unlock(&bridge->p4_semantic_ledger_lock);
+}
+
+static void apple_virgl_p4_exit_notify(Notifier *notifier, void *data)
+{
+    AppleVirglBridge *bridge =
+        container_of(notifier, AppleVirglBridge, p4_exit_notifier);
+
+    (void)data;
+
+    /*
+     * QEMU's normal qemu_cleanup() intentionally does not unrealize devices.
+     * The atexit notifier runs with BQL after vm_shutdown(); close admission,
+     * drain the bounded writer, fsync the terminal summary, and only then let
+     * process exit make the run directory visible to the validator.
+     */
+    apple_virgl_p4_stop_and_finalize(bridge);
+}
+
 static void apple_virgl_p4_record_apply_failure(
     AppleVirglBridge *bridge, uint64_t ledger_id,
     const AppleVirglP4OwnerBackingIdentity *owner_backing, const char *reason)
@@ -1345,6 +1375,11 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     apple_virgl_present_stage_init(&bridge->present_stage);
     qemu_mutex_init(&bridge->p4_semantic_ledger_lock);
     apple_virgl_p4_semantic_ledger_init(&bridge->p4_semantic_ledger);
+    if (bridge->p4_semantic_ledger.enabled) {
+        bridge->p4_exit_notifier.notify = apple_virgl_p4_exit_notify;
+        qemu_add_exit_notifier(&bridge->p4_exit_notifier);
+        bridge->p4_exit_notifier_registered = true;
+    }
     qemu_mutex_init(&bridge->cursor_lock);
     apple_virgl_cursor_stage_init(&bridge->cursor_stage);
     bridge->cursor_visible = true;
@@ -1410,6 +1445,10 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
     }
 
     assert(bql_locked());
+    if (bridge->p4_exit_notifier_registered) {
+        qemu_remove_exit_notifier(&bridge->p4_exit_notifier);
+        bridge->p4_exit_notifier_registered = false;
+    }
     qemu_mutex_lock(&bridge->lifecycle_lock);
     qemu_mutex_lock(&bridge->completion_lock);
     bridge->completion_shutdown = true;
@@ -1459,9 +1498,7 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
     if (bridge->resources) {
         g_hash_table_destroy(bridge->resources);
     }
-    qemu_mutex_lock(&bridge->p4_semantic_ledger_lock);
-    apple_virgl_p4_semantic_ledger_destroy(&bridge->p4_semantic_ledger);
-    qemu_mutex_unlock(&bridge->p4_semantic_ledger_lock);
+    apple_virgl_p4_stop_and_finalize(bridge);
 
     qemu_mutex_destroy(&bridge->completion_lock);
     qemu_mutex_destroy(&bridge->cursor_lock);

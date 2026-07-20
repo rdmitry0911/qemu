@@ -195,6 +195,11 @@ slow_tests = {
 foreach test_name, extra: tests
   src = [test_name + '.c']
   deps = [qemuutil]
+  test_c_args = []
+  if test_name == 'test-apple-virgl-p4-semantic-ledger'
+    # Keep P4 durability-fault injection out of production QEMU binaries.
+    test_c_args += ['-DAPPLE_VIRGL_P4_UNIT_TEST=1']
+  endif
   if extra.length() > 0
     # use a sourceset to quickly separate sources and deps
     test_ss = ss.source_set()
@@ -202,7 +207,7 @@ foreach test_name, extra: tests
     src += test_ss.all_sources()
     deps += test_ss.all_dependencies()
   endif
-  exe = executable(test_name, src, genh, dependencies: deps)
+  exe = executable(test_name, src, genh, dependencies: deps, c_args: test_c_args)
 
   test(test_name, exe,
        depends: test_deps.get(test_name, []),

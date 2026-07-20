@@ -78,6 +78,7 @@ static void test_default_off_ignores_nonzero_tag(void)
     g_unsetenv("APPLE_VIRGL_QEMU_P4_SEMANTIC_LEDGER_DIR");
     apple_virgl_p4_semantic_ledger_init(&ledger);
     g_assert_false(ledger.enabled);
+    g_assert_null(ledger.async);
     apple_virgl_p4_semantic_ledger_record_applied(&ledger, 1, pixels, 1, 1,
                                                    4, sizeof(pixels), pixels,
                                                    4, NULL);
@@ -317,6 +318,173 @@ static void test_receipt_budget_is_bounded_and_fail_closed(void)
     remove_tree(directory);
 }
 
+static void test_async_capture_drains_before_terminal_summary(void)
+{
+    AppleVirglP4SemanticLedger ledger;
+    g_autofree char *directory = make_capture_dir();
+    g_autofree char *record_dir = NULL;
+    g_autofree char *owner_path = NULL;
+    g_autofree char *cpu_path = NULL;
+    g_autofree char *summary_path = NULL;
+    g_autofree char *summary = NULL;
+    g_autofree uint8_t *owner = NULL;
+    g_autofree uint8_t *cpu = NULL;
+    GStatBuf stat_buffer;
+    const uint32_t width = APPLE_VIRGL_P4_SEMANTIC_LEDGER_MAX_WIDTH;
+    const uint32_t height = APPLE_VIRGL_P4_SEMANTIC_LEDGER_MAX_HEIGHT;
+    const uint32_t stride = width * 4u;
+    const size_t bytes = (size_t)stride * height;
+
+    owner = g_malloc0(bytes);
+    cpu = g_malloc0(bytes);
+    owner[0] = cpu[0] = 0x31;
+    owner[bytes - 1] = cpu[bytes - 1] = 0x7f;
+
+    configure_capture_dir(directory);
+    apple_virgl_p4_semantic_ledger_init(&ledger);
+    g_assert_true(ledger.enabled);
+    g_assert_nonnull(ledger.async);
+    apple_virgl_p4_semantic_ledger_record_applied(
+        &ledger, UINT64_C(0xabcdef), owner, width, height, stride, bytes, cpu,
+        stride, NULL);
+
+    /*
+     * Destroy is the exit-notifier lifecycle primitive: it must stop
+     * admission, join the writer, and only then publish the final summary.
+     */
+    apple_virgl_p4_semantic_ledger_destroy(&ledger);
+    apple_virgl_p4_semantic_ledger_destroy(&ledger); /* Idempotent unrealize. */
+    g_unsetenv("APPLE_VIRGL_QEMU_P4_SEMANTIC_LEDGER");
+    g_unsetenv("APPLE_VIRGL_QEMU_P4_SEMANTIC_LEDGER_DIR");
+
+    record_dir = g_build_filename(directory, "p4-0000000000abcdef", NULL);
+    owner_path = g_build_filename(record_dir, "owner-packed.bgra", NULL);
+    cpu_path = g_build_filename(record_dir, "cpu-surface-packed.bgra", NULL);
+    summary_path = g_build_filename(directory, "qemu-ledger-summary.json",
+                                    NULL);
+    g_assert_true(g_file_test(owner_path, G_FILE_TEST_IS_REGULAR));
+    g_assert_true(g_file_test(cpu_path, G_FILE_TEST_IS_REGULAR));
+    g_assert_cmpint(g_stat(owner_path, &stat_buffer), ==, 0);
+    g_assert_cmpuint(stat_buffer.st_size, ==, bytes);
+    g_assert_cmpint(g_stat(cpu_path, &stat_buffer), ==, 0);
+    g_assert_cmpuint(stat_buffer.st_size, ==, bytes);
+    g_assert_true(g_file_get_contents(summary_path, &summary, NULL, NULL));
+    assert_valid_json(summary);
+    g_assert_nonnull(strstr(summary, "\"captures\": 1"));
+    g_assert_nonnull(strstr(summary, "\"write_error\": false"));
+    remove_tree(directory);
+}
+
+static void test_oversize_capture_fails_without_dynamic_staging(void)
+{
+    AppleVirglP4SemanticLedger ledger;
+    g_autofree char *directory = make_capture_dir();
+    g_autofree char *pixels = NULL;
+    g_autofree char *record_dir = NULL;
+    g_autofree char *failure_path = NULL;
+    g_autofree char *summary_path = NULL;
+    g_autofree char *summary = NULL;
+    const uint32_t width = APPLE_VIRGL_P4_SEMANTIC_LEDGER_MAX_WIDTH + 1u;
+    const uint32_t stride = width * 4u;
+
+    pixels = g_malloc0(stride);
+    configure_capture_dir(directory);
+    apple_virgl_p4_semantic_ledger_init(&ledger);
+    g_assert_true(ledger.enabled);
+    apple_virgl_p4_semantic_ledger_record_applied(
+        &ledger, UINT64_C(0xdead), (const uint8_t *)pixels, width, 1, stride,
+        stride, (const uint8_t *)pixels, stride, NULL);
+    apple_virgl_p4_semantic_ledger_destroy(&ledger);
+    g_unsetenv("APPLE_VIRGL_QEMU_P4_SEMANTIC_LEDGER");
+    g_unsetenv("APPLE_VIRGL_QEMU_P4_SEMANTIC_LEDGER_DIR");
+
+    record_dir = g_build_filename(directory, "p4-000000000000dead", NULL);
+    failure_path = g_build_filename(
+        directory, "p4-000000000000dead-failure-1.json", NULL);
+    summary_path = g_build_filename(directory, "qemu-ledger-summary.json",
+                                    NULL);
+    g_assert_false(g_file_test(record_dir, G_FILE_TEST_EXISTS));
+    g_assert_true(g_file_test(failure_path, G_FILE_TEST_IS_REGULAR));
+    assert_valid_json_file(failure_path);
+    g_assert_true(g_file_get_contents(summary_path, &summary, NULL, NULL));
+    assert_valid_json(summary);
+    g_assert_nonnull(strstr(summary, "\"unique_tags\": 1"));
+    g_assert_nonnull(strstr(summary, "\"captures\": 0"));
+    g_assert_nonnull(strstr(summary, "\"write_error\": false"));
+    remove_tree(directory);
+}
+
+static void test_async_capture_persist_failure_has_receipt(void)
+{
+    AppleVirglP4SemanticLedger ledger;
+    g_autofree char *directory = make_capture_dir();
+    g_autofree char *record_dir = NULL;
+    g_autofree char *failure_path = NULL;
+    g_autofree char *failure = NULL;
+    g_autofree char *summary_path = NULL;
+    g_autofree char *summary = NULL;
+    const uint8_t pixels[] = { 0x10, 0x11, 0x12, 0x13 };
+
+    record_dir = g_build_filename(directory, "p4-000000000000f00d", NULL);
+    g_assert_cmpint(g_mkdir(record_dir, 0700), ==, 0);
+    configure_capture_dir(directory);
+    apple_virgl_p4_semantic_ledger_init(&ledger);
+    g_assert_true(ledger.enabled);
+    apple_virgl_p4_semantic_ledger_record_applied(
+        &ledger, UINT64_C(0xf00d), pixels, 1, 1, 4, sizeof(pixels), pixels, 4,
+        NULL);
+    apple_virgl_p4_semantic_ledger_destroy(&ledger);
+    g_unsetenv("APPLE_VIRGL_QEMU_P4_SEMANTIC_LEDGER");
+    g_unsetenv("APPLE_VIRGL_QEMU_P4_SEMANTIC_LEDGER_DIR");
+
+    failure_path = g_build_filename(
+        directory, "p4-000000000000f00d-failure-1.json", NULL);
+    summary_path = g_build_filename(directory, "qemu-ledger-summary.json",
+                                    NULL);
+    g_assert_true(g_file_get_contents(failure_path, &failure, NULL, NULL));
+    assert_valid_json(failure);
+    g_assert_nonnull(strstr(failure,
+                            "\"reason\": \"capture_persist_failed\""));
+    g_assert_nonnull(strstr(failure, "\"write_error\": true"));
+    g_assert_true(g_file_get_contents(summary_path, &summary, NULL, NULL));
+    assert_valid_json(summary);
+    g_assert_nonnull(strstr(summary, "\"unique_tags\": 1"));
+    g_assert_nonnull(strstr(summary, "\"captures\": 0"));
+    g_assert_nonnull(strstr(summary, "\"write_error\": true"));
+    remove_tree(directory);
+}
+
+static void test_final_summary_dirsync_failure_is_fail_closed(void)
+{
+    AppleVirglP4SemanticLedger ledger;
+    g_autofree char *directory = make_capture_dir();
+    g_autofree char *summary_path = NULL;
+    g_autofree char *guard_path = NULL;
+    const uint8_t pixels[] = { 0x10, 0x11, 0x12, 0x13 };
+
+    configure_capture_dir(directory);
+    apple_virgl_p4_semantic_ledger_init(&ledger);
+    g_assert_true(ledger.enabled);
+    apple_virgl_p4_semantic_ledger_record_applied(
+        &ledger, UINT64_C(0xcafe), pixels, 1, 1, 4, sizeof(pixels), pixels,
+        4, NULL);
+    /* Fault is injected only after qemu-ledger-summary.json has been renamed. */
+    apple_virgl_p4_semantic_ledger_test_fail_final_summary_dirsync_once(
+        &ledger);
+    apple_virgl_p4_semantic_ledger_destroy(&ledger);
+    g_unsetenv("APPLE_VIRGL_QEMU_P4_SEMANTIC_LEDGER");
+    g_unsetenv("APPLE_VIRGL_QEMU_P4_SEMANTIC_LEDGER_DIR");
+
+    summary_path = g_build_filename(directory, "qemu-ledger-summary.json",
+                                    NULL);
+    guard_path = g_build_filename(directory, ".p4-finalization-pending", NULL);
+    /* No canonical acceptance token remains after the post-rename fsync fault. */
+    g_assert_false(g_file_test(summary_path, G_FILE_TEST_EXISTS));
+    /* If unlink/fsync ever also fails, this validator-visible guard is fail-closed. */
+    g_assert_true(g_file_test(guard_path, G_FILE_TEST_IS_REGULAR));
+    remove_tree(directory);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -330,5 +498,13 @@ int main(int argc, char **argv)
                     test_mismatch_duplicate_and_saturation_are_explicit);
     g_test_add_func("/apple-virgl/p4-semantic-ledger/receipt-budget",
                     test_receipt_budget_is_bounded_and_fail_closed);
+    g_test_add_func("/apple-virgl/p4-semantic-ledger/async-drain-summary",
+                    test_async_capture_drains_before_terminal_summary);
+    g_test_add_func("/apple-virgl/p4-semantic-ledger/oversize-fixed-staging",
+                    test_oversize_capture_fails_without_dynamic_staging);
+    g_test_add_func("/apple-virgl/p4-semantic-ledger/persist-failure-receipt",
+                    test_async_capture_persist_failure_has_receipt);
+    g_test_add_func("/apple-virgl/p4-semantic-ledger/final-summary-dirsync-fail-closed",
+                    test_final_summary_dirsync_failure_is_fail_closed);
     return g_test_run();
 }
