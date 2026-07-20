@@ -126,6 +126,80 @@ static void test_enqueue_owns_pixel_copy(void)
     apple_virgl_present_stage_job_free(job);
 }
 
+static void test_tagged_enqueue_keeps_identity(void)
+{
+    AppleVirglPresentStage stage;
+    AppleVirglPresentStageJob *job;
+    const uint8_t pixels[] = { 0x10, 0x11, 0x12, 0x13 };
+    AppleVirglP4OwnerBackingIdentity identity = {
+        .owner_object_id = UINT64_C(0x1111222233334444),
+        .owner_image_id = UINT64_C(0x5555666677778888),
+        .owner_generation = UINT64_C(0x9999aaaabbbbcccc),
+        .backing_id = UINT64_C(0xddddeeeeffff0001),
+        .backing_generation = UINT64_C(0x0203040506070809),
+        .guest_va = UINT64_C(0x123456789abcdef0),
+        .physical_image_id = UINT64_C(0x0fedcba987654321),
+        .physical_allocation_id = UINT64_C(0x1020304050607080),
+        .physical_width = 1920,
+        .physical_height = 1080,
+        .physical_pixel_format = 0x42475241u,
+        .physical_row_bytes = 7680,
+    };
+
+    apple_virgl_present_stage_init(&stage);
+    g_assert_true(apple_virgl_present_stage_enqueue_tagged(
+        &stage, true, pixels, 1, 1, 4, UINT64_C(0x8e3f4a1c), &identity));
+    memset(&identity, 0, sizeof(identity));
+    g_assert_true(apple_virgl_present_stage_enqueue(&stage, true, pixels,
+                                                     1, 1, 4));
+
+    job = take_job(&stage);
+    g_assert_cmpuint(job->p4_ledger_id, ==, UINT64_C(0x8e3f4a1c));
+    g_assert_cmpuint(job->p4_owner_backing.owner_object_id, ==,
+                     UINT64_C(0x1111222233334444));
+    g_assert_cmpuint(job->p4_owner_backing.physical_width, ==, 1920);
+    g_assert_cmpuint(job->p4_owner_backing.physical_row_bytes, ==, 7680);
+    apple_virgl_present_stage_job_free(job);
+    job = take_job(&stage);
+    g_assert_cmpuint(job->p4_ledger_id, ==, 0);
+    apple_virgl_present_stage_job_free(job);
+}
+
+static void test_detach_all_keeps_tagged_fifo_for_bridge_receipts(void)
+{
+    AppleVirglPresentStage stage;
+    AppleVirglPresentStageJob *jobs;
+    AppleVirglPresentStageJob *next;
+    AppleVirglP4OwnerBackingIdentity identity = {
+        .owner_object_id = UINT64_C(0x1111222233334444),
+        .physical_width = 1920,
+        .physical_height = 1080,
+        .physical_row_bytes = 7680,
+    };
+    const uint8_t pixels[] = { 0x10, 0x11, 0x12, 0x13 };
+
+    apple_virgl_present_stage_init(&stage);
+    g_assert_true(apple_virgl_present_stage_enqueue_tagged(
+        &stage, true, pixels, 1, 1, 4, UINT64_C(0x55), &identity));
+    g_assert_true(apple_virgl_present_stage_enqueue(&stage, false, NULL,
+                                                     0, 0, 0));
+    jobs = apple_virgl_present_stage_detach_all(&stage);
+    g_assert_nonnull(jobs);
+    g_assert_true(apple_virgl_present_stage_is_idle(&stage));
+    g_assert_cmpuint(jobs->p4_ledger_id, ==, UINT64_C(0x55));
+    g_assert_cmpuint(jobs->p4_owner_backing.owner_object_id, ==,
+                     UINT64_C(0x1111222233334444));
+    g_assert_nonnull(jobs->next);
+    g_assert_cmpuint(jobs->next->p4_ledger_id, ==, 0);
+
+    while (jobs) {
+        next = jobs->next;
+        jobs->next = NULL;
+        apple_virgl_present_stage_job_free(jobs);
+        jobs = next;
+    }
+}
+
 static void test_fifo_keeps_terminal_tokens(void)
 {
     AppleVirglPresentStage stage;
@@ -240,6 +314,10 @@ int main(int argc, char **argv)
                     test_row_packs_bgra_without_padding);
     g_test_add_func("/apple-virgl/present-stage/owns-pixel-copy",
                     test_enqueue_owns_pixel_copy);
+    g_test_add_func("/apple-virgl/present-stage/tagged-identity",
+                    test_tagged_enqueue_keeps_identity);
+    g_test_add_func("/apple-virgl/present-stage/detach-tagged-fifo",
+                    test_detach_all_keeps_tagged_fifo_for_bridge_receipts);
     g_test_add_func("/apple-virgl/present-stage/mode-fifo-metadata",
                     test_mode_events_keep_fifo_order_and_metadata);
     g_test_add_func("/apple-virgl/present-stage/invalid-mode-dimensions",

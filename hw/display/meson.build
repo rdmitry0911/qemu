@@ -166,6 +166,7 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
                                      'apple-virgl-bridge.c',
                                      'apple-virgl-frame-pump.c',
                                      'apple-virgl-present-stage.c',
+                                     'apple-virgl-p4-semantic-ledger.c',
                                      'apple-virgl-cursor-stage.c')
       virtio_gpu_gl_deps += mlapi_dep
     endif

@@ -57,6 +57,9 @@ tests = {
   'test-apple-virgl-present-stage': [
     meson.project_source_root() / 'hw/display/apple-virgl-present-stage.c'
   ],
+  'test-apple-virgl-p4-semantic-ledger': [
+    meson.project_source_root() / 'hw/display/apple-virgl-p4-semantic-ledger.c'
+  ],
   'test-apple-virgl-cursor-stage': [
     meson.project_source_root() / 'hw/display/apple-virgl-cursor-stage.c'
   ],

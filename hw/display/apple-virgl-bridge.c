@@ -23,6 +23,7 @@
 #include "qmu/qmetal_unified.h"
 #include "apple-virgl-frame-pump.h"
 #include "hw/display/apple-virgl-cursor-stage.h"
+#include "hw/display/apple-virgl-p4-semantic-ledger.h"
 #include "hw/display/apple-virgl-present-stage.h"
 #include "hw/display/apple-virgl-qmetal-abi.h"
 
@@ -35,6 +36,26 @@
 #define APPLE_VIRGL_QMU_GPU_MAP_MEMORY2 0x39
 #define APPLE_VIRGL_QMU_DISPLAY_SET_SHARED_STATE 0x01
 #define APPLE_VIRGL_QMU_DISPLAY_TRANSACTION3 0x07
+
+/* The P4 host copy is an exact scalar ABI mirror, never a reinterpret cast. */
+QEMU_BUILD_BUG_ON(sizeof(AppleVirglP4OwnerBackingIdentity) !=
+                  sizeof(qmu_p4_owner_backing_identity));
+#define APPLE_VIRGL_P4_TAIL_FIELD_MATCH(field) \
+    QEMU_BUILD_BUG_ON(offsetof(AppleVirglP4OwnerBackingIdentity, field) != \
+                      offsetof(qmu_p4_owner_backing_identity, field))
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(owner_object_id);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(owner_image_id);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(owner_generation);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(backing_id);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(backing_generation);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(guest_va);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(physical_image_id);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(physical_allocation_id);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(physical_width);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(physical_height);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(physical_pixel_format);
+APPLE_VIRGL_P4_TAIL_FIELD_MATCH(physical_row_bytes);
+#undef APPLE_VIRGL_P4_TAIL_FIELD_MATCH
 
 typedef struct AppleVirglResourceState {
     uint32_t resource_id;
@@ -111,6 +132,9 @@ struct AppleVirglBridge {
      * present_surface is a console-owned, non-owning identity marker. */
     QemuMutex present_lock;
     AppleVirglPresentStage present_stage;
+    /* P4 writes may originate from the render callback or presenter BH. */
+    QemuMutex p4_semantic_ledger_lock;
+    AppleVirglP4SemanticLedger p4_semantic_ledger;
     QEMUBH *present_bh;
     DisplaySurface *present_surface;
     bool present_bh_scheduled;
@@ -826,6 +850,35 @@ static bool apple_virgl_presenter_apply_mode(
     return true;
 }
 
+static void apple_virgl_p4_record_apply_failure(
+    AppleVirglBridge *bridge, uint64_t ledger_id,
+    const AppleVirglP4OwnerBackingIdentity *owner_backing, const char *reason)
+{
+    if (!bridge || ledger_id == 0) {
+        return;
+    }
+    qemu_mutex_lock(&bridge->p4_semantic_ledger_lock);
+    apple_virgl_p4_semantic_ledger_record_apply_failure(
+        &bridge->p4_semantic_ledger, ledger_id, owner_backing, reason);
+    qemu_mutex_unlock(&bridge->p4_semantic_ledger_lock);
+}
+
+static void apple_virgl_p4_record_applied(
+    AppleVirglBridge *bridge, const AppleVirglPresentStageJob *job,
+    DisplaySurface *surface)
+{
+    if (!bridge || !job || !surface || job->p4_ledger_id == 0) {
+        return;
+    }
+    qemu_mutex_lock(&bridge->p4_semantic_ledger_lock);
+    apple_virgl_p4_semantic_ledger_record_applied(
+        &bridge->p4_semantic_ledger, job->p4_ledger_id, job->pixels,
+        job->width, job->height, job->stride, job->pixel_bytes,
+        surface_data(surface), surface_stride(surface),
+        &job->p4_owner_backing);
+    qemu_mutex_unlock(&bridge->p4_semantic_ledger_lock);
+}
+
 static bool apple_virgl_presenter_apply_job(
     AppleVirglBridge *bridge, const AppleVirglPresentStageJob *job)
 {
@@ -879,6 +932,12 @@ static bool apple_virgl_presenter_apply_job(
                job->pixels + (size_t)row * job->stride, job->stride);
     }
     dpy_gfx_update_full(con);
+    /*
+     * P4 is deliberately after the exact CPU DisplaySurface copy and its
+     * update notification.  The helper only snapshots already-owned bytes;
+     * it has no QMetal, FIFO, or frame-pump side effects.
+     */
+    apple_virgl_p4_record_applied(bridge, job, surface);
     return true;
 }
 
@@ -908,7 +967,13 @@ static void apple_virgl_present_bh(void *opaque)
         if (job->kind == APPLE_VIRGL_PRESENT_STAGE_MODE_CHANGE) {
             (void)apple_virgl_presenter_apply_mode(bridge, job);
         } else if (job->kind == APPLE_VIRGL_PRESENT_STAGE_FRAME_COMPLETION) {
-            (void)apple_virgl_presenter_apply_job(bridge, job);
+            bool applied = apple_virgl_presenter_apply_job(bridge, job);
+
+            if (!applied) {
+                apple_virgl_p4_record_apply_failure(
+                    bridge, job->p4_ledger_id, &job->p4_owner_backing,
+                    "cpu_surface_apply_failed");
+            }
 
             /*
              * This is the only owner-completion retirement edge.  It runs
@@ -964,6 +1029,7 @@ static void apple_virgl_render_frame_complete(
     void *opaque, const qmu_render_frame_completion *completion)
 {
     AppleVirglBridge *bridge = opaque;
+    AppleVirglP4OwnerBackingIdentity owner_backing = { 0 };
     bool queued;
 
     if (!bridge || !completion) {
@@ -973,23 +1039,74 @@ static void apple_virgl_render_frame_complete(
     /* QMetal retains completion pixels only for this callback.  Keep the
      * lock through copy and schedule so reset cannot free the guarded BH in
      * between an accepted owner completion and its main-loop hand-off. */
+    if (completion->p4_ledger_id != 0) {
+        owner_backing.owner_object_id =
+            completion->p4_owner_backing.owner_object_id;
+        owner_backing.owner_image_id =
+            completion->p4_owner_backing.owner_image_id;
+        owner_backing.owner_generation =
+            completion->p4_owner_backing.owner_generation;
+        owner_backing.backing_id = completion->p4_owner_backing.backing_id;
+        owner_backing.backing_generation =
+            completion->p4_owner_backing.backing_generation;
+        owner_backing.guest_va = completion->p4_owner_backing.guest_va;
+        owner_backing.physical_image_id =
+            completion->p4_owner_backing.physical_image_id;
+        owner_backing.physical_allocation_id =
+            completion->p4_owner_backing.physical_allocation_id;
+        owner_backing.physical_width =
+            completion->p4_owner_backing.physical_width;
+        owner_backing.physical_height =
+            completion->p4_owner_backing.physical_height;
+        owner_backing.physical_pixel_format =
+            completion->p4_owner_backing.physical_pixel_format;
+        owner_backing.physical_row_bytes =
+            completion->p4_owner_backing.physical_row_bytes;
+    }
     qemu_mutex_lock(&bridge->present_lock);
-    queued = apple_virgl_present_stage_enqueue(
+    queued = apple_virgl_present_stage_enqueue_tagged(
         &bridge->present_stage, completion->frame_expected != 0,
         completion->pixels, completion->width, completion->height,
-        completion->stride);
+        completion->stride, completion->p4_ledger_id, &owner_backing);
     apple_virgl_presenter_schedule_locked(bridge, queued);
     qemu_mutex_unlock(&bridge->present_lock);
+
+    if (!queued) {
+        /* Do not turn an observed P4 tail into a silent reset/shutdown gap. */
+        apple_virgl_p4_record_apply_failure(
+            bridge, completion->p4_ledger_id, &owner_backing,
+            "present_stage_enqueue_rejected");
+    }
+}
+
+static void apple_virgl_presenter_record_discarded_jobs(
+    AppleVirglBridge *bridge, AppleVirglPresentStageJob *jobs)
+{
+    while (jobs) {
+        AppleVirglPresentStageJob *next = jobs->next;
+
+        jobs->next = NULL;
+        if (jobs->kind == APPLE_VIRGL_PRESENT_STAGE_FRAME_COMPLETION) {
+            apple_virgl_p4_record_apply_failure(
+                bridge, jobs->p4_ledger_id, &jobs->p4_owner_backing,
+                "present_stage_quiesced");
+        }
+        apple_virgl_present_stage_job_free(jobs);
+        jobs = next;
+    }
 }
 
 static void apple_virgl_presenter_quiesce(AppleVirglBridge *bridge,
                                           bool shutdown)
 {
+    AppleVirglPresentStageJob *discarded;
+
     if (!bridge) {
         return;
     }
 
     qemu_mutex_lock(&bridge->present_lock);
+    discarded = apple_virgl_present_stage_detach_all(&bridge->present_stage);
     apple_virgl_present_stage_begin_reset(&bridge->present_stage, shutdown);
     bridge->present_bh_scheduled = false;
     /* This is a non-owning marker only.  Generic virtio/virgl reset owns the
@@ -999,6 +1116,8 @@ static void apple_virgl_presenter_quiesce(AppleVirglBridge *bridge,
     bridge->present_mode_width = 0;
     bridge->present_mode_height = 0;
     qemu_mutex_unlock(&bridge->present_lock);
+
+    apple_virgl_presenter_record_discarded_jobs(bridge, discarded);
 
     if (bridge->present_bh) {
         qemu_bh_cancel(bridge->present_bh);
@@ -1224,6 +1343,8 @@ AppleVirglBridge *apple_virgl_bridge_new(VirtIOGPU *gpu)
     apple_virgl_frame_pump_init(&bridge->frame_pump);
     qemu_mutex_init(&bridge->present_lock);
     apple_virgl_present_stage_init(&bridge->present_stage);
+    qemu_mutex_init(&bridge->p4_semantic_ledger_lock);
+    apple_virgl_p4_semantic_ledger_init(&bridge->p4_semantic_ledger);
     qemu_mutex_init(&bridge->cursor_lock);
     apple_virgl_cursor_stage_init(&bridge->cursor_stage);
     bridge->cursor_visible = true;
@@ -1338,9 +1459,13 @@ void apple_virgl_bridge_free(AppleVirglBridge *bridge)
     if (bridge->resources) {
         g_hash_table_destroy(bridge->resources);
     }
+    qemu_mutex_lock(&bridge->p4_semantic_ledger_lock);
+    apple_virgl_p4_semantic_ledger_destroy(&bridge->p4_semantic_ledger);
+    qemu_mutex_unlock(&bridge->p4_semantic_ledger_lock);
 
     qemu_mutex_destroy(&bridge->completion_lock);
     qemu_mutex_destroy(&bridge->cursor_lock);
+    qemu_mutex_destroy(&bridge->p4_semantic_ledger_lock);
     qemu_mutex_destroy(&bridge->present_lock);
     qemu_cond_destroy(&bridge->frame_pump_idle);
     qemu_mutex_destroy(&bridge->frame_pump_lock);

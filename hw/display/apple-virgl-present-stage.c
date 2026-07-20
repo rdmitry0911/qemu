@@ -99,6 +99,16 @@ bool apple_virgl_present_stage_enqueue(AppleVirglPresentStage *stage,
                                        uint32_t height,
                                        uint32_t stride)
 {
+    return apple_virgl_present_stage_enqueue_tagged(stage, frame_expected,
+                                                    pixels, width, height,
+                                                    stride, 0, NULL);
+}
+
+bool apple_virgl_present_stage_enqueue_tagged(
+    AppleVirglPresentStage *stage, bool frame_expected, const void *pixels,
+    uint32_t width, uint32_t height, uint32_t stride, uint64_t p4_ledger_id,
+    const AppleVirglP4OwnerBackingIdentity *p4_owner_backing)
+{
     AppleVirglPresentStageJob *job;
 
     if (!stage || stage->resetting || stage->shutdown ||
@@ -109,6 +119,10 @@ bool apple_virgl_present_stage_enqueue(AppleVirglPresentStage *stage,
     job = g_new0(AppleVirglPresentStageJob, 1);
     job->kind = APPLE_VIRGL_PRESENT_STAGE_FRAME_COMPLETION;
     job->frame_expected = frame_expected;
+    job->p4_ledger_id = p4_ledger_id;
+    if (p4_ledger_id != 0 && p4_owner_backing) {
+        job->p4_owner_backing = *p4_owner_backing;
+    }
     if (frame_expected) {
         (void)apple_virgl_present_stage_copy_payload(job, pixels, width,
                                                       height, stride);
@@ -159,6 +173,21 @@ apple_virgl_present_stage_take(AppleVirglPresentStage *stage)
     return job;
 }
 
+AppleVirglPresentStageJob *
+apple_virgl_present_stage_detach_all(AppleVirglPresentStage *stage)
+{
+    AppleVirglPresentStageJob *jobs;
+
+    if (!stage) {
+        return NULL;
+    }
+    jobs = stage->head;
+    stage->head = NULL;
+    stage->tail = NULL;
+    stage->pending_jobs = 0;
+    return jobs;
+}
+
 void apple_virgl_present_stage_job_free(AppleVirglPresentStageJob *job)
 {
     if (!job) {
@@ -176,12 +205,14 @@ void apple_virgl_present_stage_drain(AppleVirglPresentStage *stage)
         return;
     }
 
-    while ((job = stage->head)) {
-        stage->head = job->next;
+    job = apple_virgl_present_stage_detach_all(stage);
+    while (job) {
+        AppleVirglPresentStageJob *next = job->next;
+
+        job->next = NULL;
         apple_virgl_present_stage_job_free(job);
+        job = next;
     }
-    stage->tail = NULL;
-    stage->pending_jobs = 0;
 }
 
 void apple_virgl_present_stage_begin_reset(AppleVirglPresentStage *stage,

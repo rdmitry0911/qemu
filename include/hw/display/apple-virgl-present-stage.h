@@ -12,6 +12,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "hw/display/apple-virgl-p4-semantic-ledger.h"
+
 /*
  * The stage is deliberately independent of QEMU display objects and QMU.
  * Its caller serializes all operations (normally with the bridge presenter
@@ -32,6 +34,9 @@ typedef struct AppleVirglPresentStageJob {
     uint32_t width;
     uint32_t height;
     uint32_t stride;
+    /* Immutable QMetal P4 semantic-ledger id; zero keeps diagnostics inert. */
+    uint64_t p4_ledger_id;
+    AppleVirglP4OwnerBackingIdentity p4_owner_backing;
     uint32_t iosurface_pixel_format;
     uint64_t protection_requirements;
     size_t pixel_bytes;
@@ -62,6 +67,12 @@ bool apple_virgl_present_stage_enqueue(AppleVirglPresentStage *stage,
                                        uint32_t height,
                                        uint32_t stride);
 
+/* As above, while retaining the immutable P4 identity through the FIFO. */
+bool apple_virgl_present_stage_enqueue_tagged(
+    AppleVirglPresentStage *stage, bool frame_expected, const void *pixels,
+    uint32_t width, uint32_t height, uint32_t stride, uint64_t p4_ledger_id,
+    const AppleVirglP4OwnerBackingIdentity *p4_owner_backing);
+
 /*
  * Enqueue one QMetal mode edge before its later frame publication.  The stage
  * owns only scalar callback data; the BQL consumer decides whether equal
@@ -75,6 +86,14 @@ bool apple_virgl_present_stage_enqueue_mode(
 /* Transfer the oldest queued mode event or terminal token to the caller. */
 AppleVirglPresentStageJob *
 apple_virgl_present_stage_take(AppleVirglPresentStage *stage);
+
+/*
+ * Detach the complete FIFO without freeing it.  The caller owns the returned
+ * list and must free every job.  The bridge uses this at reset to emit an
+ * explicit diagnostic receipt for tagged work that cannot reach scanout.
+ */
+AppleVirglPresentStageJob *
+apple_virgl_present_stage_detach_all(AppleVirglPresentStage *stage);
 
 void apple_virgl_present_stage_job_free(AppleVirglPresentStageJob *job);
 
