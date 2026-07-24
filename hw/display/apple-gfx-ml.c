@@ -27,6 +27,7 @@
 #include "block/thread-pool.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pci.h"
 #include "hw/pci/msi.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/resettable.h"
@@ -722,6 +723,61 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
      * frame_completed_bh copying from the completed display texture into the
      * visible surface on the BH edge. */
     s->frame_count++;
+
+    /* AGFX_FRAME_CAPTURE_DIR_ALL — env-gated per-present PPM capture for the
+     * frame-480 determinism comparison (aiam methodology). Inert when unset.
+     * Writes one P6 PPM per present as frame_%06lu.ppm keyed on frame_count,
+     * from the same visible display_fb payload QEMU shows. */
+    {
+        static const char *agfx_cap_dir;
+        static int agfx_cap_init;
+        static int agfx_cap_ok;
+        static unsigned long agfx_cap_start;
+        if (!agfx_cap_init) {
+            const char *env = getenv("AGFX_FRAME_CAPTURE_DIR_ALL");
+            if (env && env[0]) {
+                agfx_cap_dir = env;
+                if (mkdir(env, 0755) == 0 || errno == EEXIST) {
+                    agfx_cap_ok = 1;
+                }
+            }
+            /* AGFX_FRAME_CAPTURE_START — skip captures below this frame index.
+             * Per-present capture on the BH edge delays the interrupt BH on
+             * the same main loop and visibly starves guest display-link
+             * pacing during boot; a windowed capture (settled tail only)
+             * keeps the measurement without perturbing the bring-up. */
+            const char *start_env = getenv("AGFX_FRAME_CAPTURE_START");
+            if (start_env && start_env[0]) {
+                agfx_cap_start = strtoul(start_env, NULL, 0);
+            }
+            agfx_cap_init = 1;
+        }
+        if (agfx_cap_ok && agfx_cap_dir &&
+            (unsigned long)s->frame_count >= agfx_cap_start) {
+            char ppm_path[PATH_MAX];
+            int pn = snprintf(ppm_path, sizeof(ppm_path), "%s/frame_%06lu.ppm",
+                              agfx_cap_dir, (unsigned long)s->frame_count);
+            if (pn > 0 && pn < (int)sizeof(ppm_path)) {
+                FILE *cf = fopen(ppm_path, "wb");
+                if (cf) {
+                    fprintf(cf, "P6\n%u %u\n255\n", width, height);
+                    const uint8_t *csrc = (const uint8_t *)s->display_fb;
+                    uint8_t *rgb_row = g_malloc((size_t)width * 3);
+                    for (uint32_t cy = 0; cy < height; cy++) {
+                        const uint8_t *crow = csrc + (size_t)cy * stride;
+                        for (uint32_t cx = 0; cx < width; cx++) {
+                            rgb_row[cx * 3 + 0] = crow[cx * 4 + 2];
+                            rgb_row[cx * 3 + 1] = crow[cx * 4 + 1];
+                            rgb_row[cx * 3 + 2] = crow[cx * 4 + 0];
+                        }
+                        fwrite(rgb_row, 1, (size_t)width * 3, cf);
+                    }
+                    g_free(rgb_row);
+                    fclose(cf);
+                }
+            }
+        }
+    }
     {
         uint64_t pc = qatomic_fetch_inc(&s->present_count) + 1;
         if (pc <= AGFX_LOG_INITIAL_COUNT || (pc % AGFX_LOG_INTERVAL) == 0) {
@@ -1712,7 +1768,24 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     agfx_log_init(s);
     agfx_log(s, "[apple-gfx-ml] Realizing device: %ux%u, VRAM=%uMB\n",
              s->display_width, s->display_height, s->vram_size_mb);
-    
+
+    /* Optional PCI identity override.  pci_qdev_realize has already written
+     * the class-default vendor/device into config space before this device
+     * realize runs, so override it here.  This does not affect the MMIO/FIFO
+     * host backend; it only changes which guest driver personality matches. */
+    if (s->pci_vendor_id_override != 0xffffffff) {
+        pci_config_set_vendor_id(pci_dev->config,
+                                 (uint16_t)s->pci_vendor_id_override);
+        agfx_log(s, "[apple-gfx-ml] PCI vendor id overridden to 0x%04x\n",
+                 (uint16_t)s->pci_vendor_id_override);
+    }
+    if (s->pci_device_id_override != 0xffffffff) {
+        pci_config_set_device_id(pci_dev->config,
+                                 (uint16_t)s->pci_device_id_override);
+        agfx_log(s, "[apple-gfx-ml] PCI device id overridden to 0x%04x\n",
+                 (uint16_t)s->pci_device_id_override);
+    }
+
     /* OptionROM is handled via inherited 'romfile' property from PCIDevice.
      * Just like Apple does in apple-gfx-pci.m:
      *   pci->romfile = apple_gfx_pci_option_rom_path;
