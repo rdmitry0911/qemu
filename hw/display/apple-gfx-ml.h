@@ -98,6 +98,11 @@ struct AppleGfxMLState {
     uint32_t vram_size_mb;
     uint32_t display_width;
     uint32_t display_height;
+    /* Optional PCI identity override.  0xffffffff = keep the class default
+     * (0x106b:0xeeee).  Used to steer guest driver matching away from the
+     * stock AppleParavirtGPU personality during native-transport bring-up. */
+    uint32_t pci_vendor_id_override;
+    uint32_t pci_device_id_override;
     /* NOTE: romfile is inherited from PCIDevice, don't redefine! */
     bool vsync_enabled;
     uint32_t debug_level;
@@ -172,6 +177,8 @@ struct AppleGfxMLState {
     DEFINE_PROP_BOOL("vsync", AppleGfxMLState, vsync_enabled, true), \
     DEFINE_PROP_UINT32("debug", AppleGfxMLState, debug_level, 0), \
     DEFINE_PROP_BOOL("direct_scanout", AppleGfxMLState, direct_scanout, false), \
-    DEFINE_PROP_STRING("spirv_cache_dir", AppleGfxMLState, spirv_cache_dir)
+    DEFINE_PROP_STRING("spirv_cache_dir", AppleGfxMLState, spirv_cache_dir), \
+    DEFINE_PROP_UINT32("x-pci-vendor-id", AppleGfxMLState, pci_vendor_id_override, 0xffffffff), \
+    DEFINE_PROP_UINT32("x-pci-device-id", AppleGfxMLState, pci_device_id_override, 0xffffffff)
 
 #endif /* HW_DISPLAY_APPLE_GFX_ML_H */
