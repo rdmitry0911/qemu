@@ -22918,6 +22918,34 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
      * frame_completed_bh copying from the completed display texture into the
      * visible surface on the BH edge. */
     s->frame_count++;
+    /* Reference-parity frame accounting: the genuine PVG host logs a content hash and a
+     * non-black percentage per presented frame (FRAME_CONTENT in its trace), and its
+     * settled lock screen repeats ONE hash indefinitely. Emitting the same two numbers
+     * lets a boot be compared to the reference at the sequence level rather than by
+     * screenshots. Env-gated: AGFX_FRAME_CONTENT=1. */
+    {
+        static int fc_gate = -1;
+        if (fc_gate == -1) fc_gate = getenv("AGFX_FRAME_CONTENT") ? 1 : 0;
+        if (fc_gate) {
+            const uint8_t *fb = (const uint8_t *)s->display_fb;
+            uint64_t h = 1469598103934665603ULL;   /* FNV-1a */
+            uint64_t nonblack = 0, total = 0;
+            for (uint32_t y = 0; y < height; y += 4) {
+                const uint8_t *row = fb + (size_t)y * stride;
+                for (uint32_t x = 0; x < width; x += 4) {
+                    const uint8_t *px = row + (size_t)x * 4;
+                    uint32_t v = ((uint32_t)px[2] << 16) | ((uint32_t)px[1] << 8) | px[0];
+                    h = (h ^ v) * 1099511628211ULL;
+                    if (v > 0x0f0f0f) nonblack++;
+                    total++;
+                }
+            }
+            agfx_log(s, "[apple-gfx-ml] FRAME_CONTENT: #%lu hash=0x%08x nonblack=%d%%\n",
+                     (unsigned long)(qatomic_read(&s->present_count) + 1),
+                     (unsigned)(h ^ (h >> 32)),
+                     (int)(total ? (nonblack * 100 / total) : 0));
+        }
+    }
     {
         uint64_t pc = qatomic_fetch_inc(&s->present_count) + 1;
         if (pc <= AGFX_LOG_INITIAL_COUNT || (pc % AGFX_LOG_INTERVAL) == 0) {
@@ -22942,8 +22970,13 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
             static const char *agfx_capture_dir;
             static int agfx_capture_dir_init;
             static int agfx_capture_dir_ok;
+            static unsigned long agfx_capture_start;
             if (!agfx_capture_dir_init) {
                 const char *env = getenv("AGFX_FRAME_CAPTURE_DIR_ALL");
+                const char *start_env = getenv("AGFX_FRAME_CAPTURE_START");
+                if (start_env && start_env[0]) {
+                    agfx_capture_start = strtoul(start_env, NULL, 10);
+                }
                 if (env && env[0]) {
                     agfx_capture_dir = env;
                     if (mkdir(env, 0755) == 0 || errno == EEXIST) {
@@ -22960,7 +22993,8 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                 }
                 agfx_capture_dir_init = 1;
             }
-            if (agfx_capture_dir_ok && agfx_capture_dir) {
+            if (agfx_capture_dir_ok && agfx_capture_dir &&
+                (unsigned long)pc >= agfx_capture_start) {
                 char ppm_path[PATH_MAX];
                 int n = snprintf(ppm_path, sizeof(ppm_path),
                                  "%s/frame_%06lu.ppm",
@@ -22970,17 +23004,20 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                     if (f) {
                         fprintf(f, "P6\n%u %u\n255\n", width, height);
                         const uint8_t *src = (const uint8_t *)s->display_fb;
+                        uint8_t *rgb = g_malloc((size_t)width * 3);
                         for (uint32_t y = 0; y < height; y++) {
                             const uint8_t *row =
                                 src + (size_t)y * stride;
                             for (uint32_t x = 0; x < width; x++) {
                                 /* PIXMAN_x8r8g8b8 is BGRX in memory on
                                  * little-endian; emit RGB for PPM. */
-                                fputc(row[x * 4 + 2], f);
-                                fputc(row[x * 4 + 1], f);
-                                fputc(row[x * 4 + 0], f);
+                                rgb[x * 3 + 0] = row[x * 4 + 2];
+                                rgb[x * 3 + 1] = row[x * 4 + 1];
+                                rgb[x * 3 + 2] = row[x * 4 + 0];
                             }
+                            fwrite(rgb, 1, (size_t)width * 3, f);
                         }
+                        g_free(rgb);
                         fclose(f);
                     } else if (pc <= AGFX_LOG_INITIAL_COUNT) {
                         agfx_log(s,
