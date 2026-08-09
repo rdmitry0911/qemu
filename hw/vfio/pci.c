@@ -135,10 +135,21 @@ static void vfio_intx_interrupt(void *opaque)
     }
 }
 
+static void vfio_pci_irq_deassert_intx(VFIOPCIDevice *vdev)
+{
+    PCIDevice *pdev = PCI_DEVICE(vdev);
+    int intx = pci_intx(pdev);
+
+    if (intx < 0 || intx >= PCI_NUM_PINS) {
+        return;
+    }
+
+    pci_irq_deassert(pdev);
+}
+
 void vfio_pci_intx_eoi(VFIODevice *vbasedev)
 {
     VFIOPCIDevice *vdev = container_of(vbasedev, VFIOPCIDevice, vbasedev);
-    PCIDevice *pdev = PCI_DEVICE(vdev);
 
     if (!vdev->intx.pending) {
         return;
@@ -147,14 +158,13 @@ void vfio_pci_intx_eoi(VFIODevice *vbasedev)
     trace_vfio_pci_intx_eoi(vbasedev->name);
 
     vdev->intx.pending = false;
-    pci_irq_deassert(pdev);
+    vfio_pci_irq_deassert_intx(vdev);
     vfio_device_irq_unmask(vbasedev, VFIO_PCI_INTX_IRQ_INDEX);
 }
 
 static bool vfio_intx_enable_kvm(VFIOPCIDevice *vdev, Error **errp)
 {
 #ifdef CONFIG_KVM
-    PCIDevice *pdev = PCI_DEVICE(vdev);
     int irq_fd = event_notifier_get_fd(&vdev->intx.interrupt);
 
     if (vdev->no_kvm_intx || !kvm_irqfds_enabled() ||
@@ -167,7 +177,7 @@ static bool vfio_intx_enable_kvm(VFIOPCIDevice *vdev, Error **errp)
     qemu_set_fd_handler(irq_fd, NULL, NULL, vdev);
     vfio_device_irq_mask(&vdev->vbasedev, VFIO_PCI_INTX_IRQ_INDEX);
     vdev->intx.pending = false;
-    pci_irq_deassert(pdev);
+    vfio_pci_irq_deassert_intx(vdev);
 
     /* Get an eventfd for resample/unmask */
     if (!vfio_notifier_init(vdev, &vdev->intx.unmask, "intx-unmask", 0, errp)) {
@@ -245,8 +255,6 @@ static bool vfio_cpr_intx_enable_kvm(VFIOPCIDevice *vdev, Error **errp)
 static void vfio_intx_disable_kvm(VFIOPCIDevice *vdev)
 {
 #ifdef CONFIG_KVM
-    PCIDevice *pdev = PCI_DEVICE(vdev);
-
     if (!vdev->intx.kvm_accel) {
         return;
     }
@@ -257,7 +265,7 @@ static void vfio_intx_disable_kvm(VFIOPCIDevice *vdev)
      */
     vfio_device_irq_mask(&vdev->vbasedev, VFIO_PCI_INTX_IRQ_INDEX);
     vdev->intx.pending = false;
-    pci_irq_deassert(pdev);
+    vfio_pci_irq_deassert_intx(vdev);
 
     /* Tell KVM to stop listening for an INTx irqfd */
     if (kvm_irqchip_remove_irqfd_notifier_gsi(kvm_state, &vdev->intx.interrupt,
@@ -397,14 +405,13 @@ skip_signaling:
 
 static void vfio_intx_disable(VFIOPCIDevice *vdev)
 {
-    PCIDevice *pdev = PCI_DEVICE(vdev);
     int fd;
 
     timer_del(vdev->intx.mmap_timer);
     vfio_intx_disable_kvm(vdev);
     vfio_device_irq_disable(&vdev->vbasedev, VFIO_PCI_INTX_IRQ_INDEX);
     vdev->intx.pending = false;
-    pci_irq_deassert(pdev);
+    vfio_pci_irq_deassert_intx(vdev);
     vfio_mmap_set_enabled(vdev, true);
 
     fd = event_notifier_get_fd(&vdev->intx.interrupt);
@@ -2556,7 +2563,7 @@ static void vfio_add_ext_cap(VFIOPCIDevice *vdev)
     bool pasid_cap_added = false;
     Error *err = NULL;
     uint32_t header;
-    uint16_t cap_id, next, size;
+    uint16_t cap_id, next, pos, size;
     uint8_t cap_ver;
     uint8_t *config;
 
@@ -2603,11 +2610,18 @@ static void vfio_add_ext_cap(VFIOPCIDevice *vdev)
     pci_set_long(pdev->wmask + PCI_CONFIG_SPACE_SIZE, 0);
     pci_set_long(vdev->emulated_config_bits + PCI_CONFIG_SPACE_SIZE, ~0);
 
-    for (next = PCI_CONFIG_SPACE_SIZE; next;
-         next = PCI_EXT_CAP_NEXT(pci_get_long(config + next))) {
-        header = pci_get_long(config + next);
+    for (next = PCI_CONFIG_SPACE_SIZE; next;) {
+        if (next < PCI_CONFIG_SPACE_SIZE ||
+            next > PCIE_CONFIG_SPACE_SIZE - PCI_EXT_CAP_ALIGN ||
+            (next & (PCI_EXT_CAP_ALIGN - 1))) {
+            break;
+        }
+
+        pos = next;
+        header = pci_get_long(config + pos);
         cap_id = PCI_EXT_CAP_ID(header);
         cap_ver = PCI_EXT_CAP_VER(header);
+        next = PCI_EXT_CAP_NEXT(header);
 
         /*
          * If it becomes important to configure extended capabilities to their
@@ -2615,21 +2629,21 @@ static void vfio_add_ext_cap(VFIOPCIDevice *vdev)
          * recognize. Since QEMU doesn't actually handle many of the config
          * accesses, exact size doesn't seem worthwhile.
          */
-        size = vfio_ext_cap_max_size(config, next);
+        size = vfio_ext_cap_max_size(config, pos);
 
         /* Use emulated next pointer to allow dropping extended caps */
-        pci_long_test_and_set_mask(vdev->emulated_config_bits + next,
+        pci_long_test_and_set_mask(vdev->emulated_config_bits + pos,
                                    PCI_EXT_CAP_NEXT_MASK);
 
         switch (cap_id) {
         case 0: /* kernel masked capability */
         case PCI_EXT_CAP_ID_SRIOV: /* Read-only VF BARs confuse OVMF */
         case PCI_EXT_CAP_ID_ARI: /* XXX Needs next function virtualization */
-            trace_vfio_add_ext_cap_dropped(vdev->vbasedev.name, cap_id, next);
+            trace_vfio_add_ext_cap_dropped(vdev->vbasedev.name, cap_id, pos);
             break;
         case PCI_EXT_CAP_ID_REBAR:
-            if (!vfio_setup_rebar_ecap(vdev, next)) {
-                pcie_add_capability(pdev, cap_id, cap_ver, next, size);
+            if (!vfio_setup_rebar_ecap(vdev, pos)) {
+                pcie_add_capability(pdev, cap_id, cap_ver, pos, size);
             }
             break;
         /*
@@ -2641,7 +2655,7 @@ static void vfio_add_ext_cap(VFIOPCIDevice *vdev)
             pasid_cap_added = true;
             /* fallthrough */
         default:
-            pcie_add_capability(pdev, cap_id, cap_ver, next, size);
+            pcie_add_capability(pdev, cap_id, cap_ver, pos, size);
         }
 
     }
