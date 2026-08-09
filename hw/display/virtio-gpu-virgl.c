@@ -56,6 +56,20 @@ virtio_gpu_virgl_find_resource(VirtIOGPU *g, uint32_t resource_id)
     return container_of(res, struct virtio_gpu_virgl_resource, base);
 }
 
+static bool apple_virgl_resource_lifecycle_diagnostic_enabled(void)
+{
+    const char *environment = g_getenv("QMU_DIAG_RESOURCE_LIFECYCLE");
+
+    return environment && *environment && strcmp(environment, "0") != 0;
+}
+
+static bool apple_virgl_scanout_diagnostic_enabled(void)
+{
+    const char *environment = g_getenv("APPLE_VIRGL_SCANOUT_DIAGNOSTICS");
+
+    return environment && *environment && strcmp(environment, "0") != 0;
+}
+
 static bool virtio_gpu_virgl_read_command(
     struct virtio_gpu_ctrl_command *cmd, void *command, size_t size)
 {
@@ -481,6 +495,14 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
             cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
             return;
         }
+        if (apple_virgl_bridge_defer_resource_unref(bridge,
+                                                    unref.resource_id)) {
+            /* The bridge owns the matching renderer_blocked credit. The
+             * same command stays at the cmdq head until its exact completion
+             * writeback lease is released on the QEMU main-loop BH. */
+            *cmd_suspended = true;
+            return;
+        }
         apple_virgl_bridge_resource_destroy(bridge, unref.resource_id);
         if (res->base.iov) {
             virtio_gpu_cleanup_mapping(g, &res->base);
@@ -606,6 +628,12 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
                                    rf.r.width, rf.r.height, rf.r.x, rf.r.y);
 
     res = virtio_gpu_virgl_find_resource(g, rf.resource_id);
+    if (apple_virgl_scanout_diagnostic_enabled()) {
+        error_report("apple-virgl scanout: event=flush resource=%u apple_resource=%u "
+                     "rect=%ux%u+%u+%u",
+                     rf.resource_id, res && res->apple_virgl,
+                     rf.r.width, rf.r.height, rf.r.x, rf.r.y);
+    }
     if (res && res->apple_virgl) {
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
         return;
@@ -637,6 +665,12 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         return;
     }
     res = virtio_gpu_virgl_find_resource(g, ss.resource_id);
+    if (apple_virgl_scanout_diagnostic_enabled()) {
+        error_report("apple-virgl scanout: event=set resource=%u apple_resource=%u "
+                     "scanout=%u rect=%ux%u+%u+%u",
+                     ss.resource_id, res && res->apple_virgl, ss.scanout_id,
+                     ss.r.width, ss.r.height, ss.r.x, ss.r.y);
+    }
     if (res && res->apple_virgl) {
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
         return;
@@ -831,6 +865,8 @@ static void virgl_resource_attach_backing(VirtIOGPU *g,
     struct virtio_gpu_virgl_resource *res;
     struct iovec *res_iovs;
     uint32_t res_niov;
+    uint64_t mapped_size = 0;
+    int bridge_result = 0;
     int ret;
 
     VIRTIO_GPU_FILL_CMD(att_rb);
@@ -843,6 +879,14 @@ static void virgl_resource_attach_backing(VirtIOGPU *g,
 
         if (!bridge || res->base.iov ||
             (att_rb.hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
+            if (apple_virgl_resource_lifecycle_diagnostic_enabled()) {
+                error_report("apple-virgl attach-backing reject: resource=%u "
+                             "context=%u entries=%u flags=0x%x bridge=%u "
+                             "already_iov=%u",
+                             att_rb.resource_id, att_rb.hdr.ctx_id,
+                             att_rb.nr_entries, att_rb.hdr.flags,
+                             bridge ? 1 : 0, res->base.iov ? 1 : 0);
+            }
             cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
             return;
         }
@@ -850,12 +894,26 @@ static void virgl_resource_attach_backing(VirtIOGPU *g,
                                             sizeof(att_rb), cmd,
                                             &res->base.addrs, &res->base.iov,
                                             &res->base.iov_cnt);
-        if (ret < 0 ||
-            iov_size(res->base.iov, res->base.iov_cnt) !=
-                res->apple_virgl_size ||
-            apple_virgl_bridge_resource_attach_backing(
-                bridge, att_rb.resource_id, res->base.addrs, res->base.iov,
-                res->base.iov_cnt) != 0) {
+        if (ret >= 0) {
+            mapped_size = iov_size(res->base.iov, res->base.iov_cnt);
+            if (mapped_size == res->apple_virgl_size) {
+                bridge_result = apple_virgl_bridge_resource_attach_backing(
+                    bridge, att_rb.resource_id, res->base.addrs, res->base.iov,
+                    res->base.iov_cnt);
+            }
+        }
+        if (ret < 0 || mapped_size != res->apple_virgl_size ||
+            bridge_result != 0) {
+            if (apple_virgl_resource_lifecycle_diagnostic_enabled()) {
+                error_report("apple-virgl attach-backing reject: resource=%u "
+                             "context=%u entries=%u flags=0x%x iov_result=%d "
+                             "mapped_size=0x%" PRIx64 " expected_size=0x%" PRIx64
+                             " iov_count=%u bridge_result=%d",
+                             att_rb.resource_id, att_rb.hdr.ctx_id,
+                             att_rb.nr_entries, att_rb.hdr.flags, ret,
+                             mapped_size, res->apple_virgl_size,
+                             res->base.iov_cnt, bridge_result);
+            }
             if (res->base.iov) {
                 virtio_gpu_cleanup_mapping(g, &res->base);
             }
@@ -922,6 +980,9 @@ static void virgl_cmd_ctx_attach_resource(VirtIOGPU *g,
     struct virtio_gpu_virgl_resource *res;
     AppleVirglBridge *bridge;
     bool apple_context;
+    bool resource_is_apple;
+    bool has_fence;
+    int bridge_result = 0;
 
     VIRTIO_GPU_FILL_CMD(att_res);
     trace_virtio_gpu_cmd_ctx_res_attach(att_res.hdr.ctx_id,
@@ -931,11 +992,34 @@ static void virgl_cmd_ctx_attach_resource(VirtIOGPU *g,
     apple_context = bridge &&
         apple_virgl_bridge_has_context(bridge, att_res.hdr.ctx_id);
     res = virtio_gpu_virgl_find_resource(g, att_res.resource_id);
+    resource_is_apple = res && res->apple_virgl;
+    has_fence = (att_res.hdr.flags & VIRTIO_GPU_FLAG_FENCE) != 0;
     if (apple_context || (res && res->apple_virgl)) {
-        if (!apple_context || !res || !res->apple_virgl ||
-            (att_res.hdr.flags & VIRTIO_GPU_FLAG_FENCE) ||
-            apple_virgl_bridge_context_attach_resource(
-                bridge, att_res.hdr.ctx_id, att_res.resource_id) != 0) {
+        if (apple_virgl_resource_lifecycle_diagnostic_enabled()) {
+            error_report("apple-virgl context-attach: event=attempt context=%u "
+                         "resource=%u flags=0x%x apple_context=%u resource=%u "
+                         "apple_resource=%u iov=%u",
+                         att_res.hdr.ctx_id, att_res.resource_id,
+                         att_res.hdr.flags, apple_context ? 1 : 0,
+                         res ? 1 : 0, resource_is_apple ? 1 : 0,
+                         res && res->base.iov ? 1 : 0);
+        }
+        if (apple_context && resource_is_apple && !has_fence) {
+            bridge_result = apple_virgl_bridge_context_attach_resource(
+                bridge, att_res.hdr.ctx_id, att_res.resource_id);
+        }
+        if (!apple_context || !resource_is_apple || has_fence ||
+            bridge_result != 0) {
+            if (apple_virgl_resource_lifecycle_diagnostic_enabled()) {
+                error_report("apple-virgl context-attach reject: context=%u "
+                             "resource=%u flags=0x%x apple_context=%u "
+                             "resource=%u apple_resource=%u iov=%u "
+                             "bridge_result=%d",
+                             att_res.hdr.ctx_id, att_res.resource_id,
+                             att_res.hdr.flags, apple_context ? 1 : 0,
+                             res ? 1 : 0, resource_is_apple ? 1 : 0,
+                             res && res->base.iov ? 1 : 0, bridge_result);
+            }
             cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
         }
         return;

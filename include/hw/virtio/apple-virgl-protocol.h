@@ -16,7 +16,8 @@
 #define APPLE_VIRGL_PROTOCOL_VERSION_V1 1u
 #define APPLE_VIRGL_PROTOCOL_VERSION_V2 2u
 #define APPLE_VIRGL_PROTOCOL_VERSION_V3 3u
-#define APPLE_VIRGL_PROTOCOL_VERSION APPLE_VIRGL_PROTOCOL_VERSION_V3
+#define APPLE_VIRGL_PROTOCOL_VERSION_V4 4u
+#define APPLE_VIRGL_PROTOCOL_VERSION APPLE_VIRGL_PROTOCOL_VERSION_V4
 #define APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_STAMP (1u << 0)
 #define APPLE_VIRGL_CAPSET_FLAG_EXEC_COMPLETION_EVENT (1u << 1)
 #define APPLE_VIRGL_CURSOR_CMD_COMPLETION_RECEIVE 0xa11e0001u
@@ -31,6 +32,7 @@
 #define APPLE_VIRGL_SUBMIT_DISPLAY_TRANSACTION3 7u
 #define APPLE_VIRGL_SUBMIT_GET_COMPUTE_INFO 8u
 #define APPLE_VIRGL_SUBMIT_SYNCHRONIZE_RESOURCES 9u
+#define APPLE_VIRGL_SUBMIT_DELETE_RESOURCE 10u
 
 #define APPLE_VIRGL_MAX_SUBMIT_MAPPINGS 4096u
 #define APPLE_VIRGL_MAX_SUBMIT_PAYLOAD (16u * 1024u * 1024u)
@@ -80,11 +82,24 @@ typedef struct QEMU_PACKED AppleVirglSynchronizeResourcesV1 {
     uint32_t resource_id;
 } AppleVirglSynchronizeResourcesV1;
 
+/* Exact APV CmdDeleteResource payload. */
+typedef struct QEMU_PACKED AppleVirglDeleteResourceV1 {
+    uint32_t task_id;
+    uint32_t resource_id;
+} AppleVirglDeleteResourceV1;
+
 /* Version-2 EXEC payload prefix. The following bytes remain ExecIndirect3. */
 typedef struct QEMU_PACKED AppleVirglExecCompletionV2 {
     uint32_t channel_id;
     uint32_t stamp;
 } AppleVirglExecCompletionV2;
+
+/* Native APV DefineTask layout carried by the BIND_TASK transport opcode. */
+typedef struct QEMU_PACKED AppleVirglTaskBindV4 {
+    uint32_t task_id_encoded;
+    uint64_t vm_size;
+    uint32_t task_root_pfn;
+} AppleVirglTaskBindV4;
 
 /* Version-3 cursor-queue receive-credit payload, after virtio_gpu_ctrl_hdr. */
 typedef struct QEMU_PACKED AppleVirglCompletionReceiverRequestV3 {

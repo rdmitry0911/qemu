@@ -32,6 +32,8 @@ int apple_virgl_bridge_context_destroy(AppleVirglBridge *bridge,
 int apple_virgl_bridge_resource_create(AppleVirglBridge *bridge,
                                        uint32_t resource_id,
                                        uint64_t declared_size);
+bool apple_virgl_bridge_defer_resource_unref(AppleVirglBridge *bridge,
+                                             uint32_t resource_id);
 void apple_virgl_bridge_resource_destroy(AppleVirglBridge *bridge,
                                          uint32_t resource_id);
 int apple_virgl_bridge_resource_attach_backing(AppleVirglBridge *bridge,
