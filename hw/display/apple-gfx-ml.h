@@ -17,12 +17,15 @@
 #include "hw/pci/pci_device.h"
 #include "qemu/typedefs.h"
 #include "qemu/thread.h"      /* QemuThread, QemuSemaphore, QemuMutex */
+#include "qemu/notify.h"
 
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
 struct AppleGfxMLFrameCompletionJob;
 struct AgfxBootstrapPresentCommand;
 typedef struct ThreadPool ThreadPool;
+
+#define AGFX_GUEST_SCHED_APV_EVENT_WP_SEEN_MAX 64
 
 typedef struct AgfxBootstrapPresentSource {
     bool pending;
@@ -34,6 +37,7 @@ typedef struct AgfxBootstrapPresentTimer {
 } AgfxBootstrapPresentTimer;
 
 typedef struct AgfxCompletionJob {
+    struct AgfxCompletionJob *next;
     void (*fn)(void *);
     void *ctx;
 } AgfxCompletionJob;
@@ -105,11 +109,236 @@ struct AppleGfxMLState {
     char *spirv_cache_dir;  /* SPIR-V + VkPipelineCache disk cache directory */
 
     /* Runtime state */
+    bool exiting;
+    bool shutdown_notifier_registered;
+    Notifier shutdown_notifier;
     bool msi_used;
     bool display_enabled;
     uint64_t frame_count;
     uint64_t present_count;     /* Counter for present_frame calls */
     uint64_t irq_count;         /* Counter for IRQ deliveries */
+    uint64_t stamp_irq_request_seq;
+    uint64_t stamp_irq_delivery_seq;
+    uint64_t stamp_irq_pending_bh;
+    uint64_t stamp_irq_requests_since_event_read;
+    uint64_t stamp_irq_deliveries_since_event_read;
+    uint64_t stamp_irq_event_read_seq;
+    uint64_t stamp_irq_display_irq_read_seq;
+    uint64_t guest_sched_callsite_seq;
+    uint64_t guest_sched_event_read_seq;
+    uint64_t guest_sched_display_irq_read_seq;
+    uint64_t guest_sched_last_event_read_seq;
+    uint64_t guest_sched_last_event_read_value;
+    uint64_t guest_sched_last_display_irq_read_seq;
+    uint64_t guest_sched_last_display_irq_read_value;
+    uint64_t guest_sched_kick_seq;
+    uint64_t guest_sched_last_kick_seq;
+    uint64_t guest_sched_last_kick_channel;
+    uint64_t guest_sched_last_kick1_seq;
+    uint64_t guest_sched_last_kick2_seq;
+    uint64_t guest_sched_last_kick5_seq;
+    uint64_t guest_sched_ch5_interval_id;
+    uint64_t guest_sched_last_fifo_read_value;
+    uint64_t guest_sched_last_fifo_write_value;
+    uint64_t guest_sched_render_sample_interval;
+    uint64_t guest_sched_render_sample_kick1_count;
+    uint64_t guest_sched_render_sample_kick2_count;
+    uint64_t guest_sched_render_sample_event_marker;
+    uint64_t guest_sched_render_sample_event_remaining;
+    uint64_t guest_sched_apv_entry_bp_addr;
+    uint64_t guest_sched_apv_entry_bp_arm_seq;
+    uint64_t guest_sched_apv_entry_bp_hit_seq;
+    uint64_t guest_sched_apv_entry_bp_arm_ch5_interval;
+    uint64_t guest_sched_apv_entry_bp_last_param;
+    uint64_t guest_sched_apv_entry_bp_last_event_mask;
+    uint64_t guest_sched_apv_entry_bp_last_event_e0;
+    uint64_t guest_sched_apv_entry_bp_last_event_e1;
+    uint64_t guest_sched_apv_entry_bp_last_event_e2;
+    uint64_t guest_sched_apv_entry_bp_last_event_e3;
+    uint32_t guest_sched_apv_entry_bp_armed;
+    uint64_t guest_sched_apv_begin_bp_addr;
+    uint64_t guest_sched_apv_begin_bp_arm_seq;
+    uint64_t guest_sched_apv_begin_bp_hit_seq;
+    uint64_t guest_sched_apv_begin_bp_arm_ch5_interval;
+    uint64_t guest_sched_apv_begin_bp_last_event_ptr;
+    uint64_t guest_sched_apv_begin_bp_last_event_mask;
+    uint64_t guest_sched_apv_begin_bp_last_event_e0;
+    uint32_t guest_sched_apv_begin_bp_armed;
+    uint64_t guest_sched_apv_validate_bp_addr;
+    uint64_t guest_sched_apv_validate_bp_arm_seq;
+    uint64_t guest_sched_apv_validate_bp_hit_seq;
+    uint64_t guest_sched_apv_validate_bp_arm_ch5_interval;
+    uint64_t guest_sched_apv_validate_bp_last_param;
+    uint64_t guest_sched_apv_validate_bp_last_event_mask;
+    uint64_t guest_sched_apv_validate_bp_last_event_e0;
+    uint32_t guest_sched_apv_validate_bp_armed;
+    uint64_t guest_sched_apv_base_cached;
+    uint64_t guest_sched_exec3_author_bp_base;
+    uint64_t guest_sched_exec3_author_bp_addr;
+    uint64_t guest_sched_exec3_author_bp_arm_seq;
+    uint64_t guest_sched_exec3_author_bp_hit_seq;
+    uint64_t guest_sched_exec3_author_bp_arm_ch5_interval;
+    uint64_t guest_sched_exec3_author_rearm_bp_addr;
+    uint32_t guest_sched_exec3_author_rearm_bp_armed;
+    uint32_t guest_sched_exec3_author_bp_armed;
+    uint64_t guest_sched_submit_buffer_bp_base;
+    uint64_t guest_sched_submit_buffer_bp_addr;
+    uint64_t guest_sched_submit_buffer_bp_arm_seq;
+    uint64_t guest_sched_submit_buffer_bp_hit_seq;
+    uint64_t guest_sched_submit_buffer_bp_arm_ch5_interval;
+    uint64_t guest_sched_submit_buffer_rearm_bp_addr;
+    uint32_t guest_sched_submit_buffer_rearm_bp_armed;
+    uint32_t guest_sched_submit_buffer_bp_armed;
+    uint64_t guest_sched_pcb_call_bp_base;
+    uint64_t guest_sched_pcb_call_bp_addr;
+    uint64_t guest_sched_pcb_call_bp_arm_seq;
+    uint64_t guest_sched_pcb_call_bp_hit_seq;
+    uint64_t guest_sched_pcb_call_bp_arm_ch5_interval;
+    uint64_t guest_sched_pcb_call_rearm_bp_addr;
+    uint32_t guest_sched_pcb_call_rearm_bp_armed;
+    uint32_t guest_sched_pcb_call_bp_armed;
+    uint64_t guest_sched_pcb_parse_seg_bp_base;
+    uint64_t guest_sched_pcb_parse_seg_bp_addr;
+    uint64_t guest_sched_pcb_parse_seg_return_bp_addr;
+    uint64_t guest_sched_pcb_parse_seg_bp_arm_seq;
+    uint64_t guest_sched_pcb_parse_seg_bp_hit_seq;
+    uint64_t guest_sched_pcb_parse_seg_bp_arm_ch5_interval;
+    uint64_t guest_sched_pcb_parse_seg_last_hit_seq;
+    uint64_t guest_sched_pcb_parse_seg_last_rbp;
+    uint64_t guest_sched_pcb_parse_seg_last_this;
+    uint64_t guest_sched_pcb_parse_seg_last_param;
+    uint64_t guest_sched_pcb_parse_seg_last_segment_entry;
+    uint64_t guest_sched_pcb_parse_seg_last_segment_shmem;
+    uint64_t guest_sched_pcb_parse_seg_last_kernel_hash;
+    uint64_t guest_sched_pcb_parse_seg_last_segment_hash;
+    uint32_t guest_sched_pcb_parse_seg_return_bp_armed;
+    uint32_t guest_sched_pcb_parse_seg_bp_armed;
+    uint64_t guest_sched_submit_cbs_bp_base;
+    uint64_t guest_sched_submit_cbs_bp_addr;
+    uint64_t guest_sched_submit_cbs_bp_arm_seq;
+    uint64_t guest_sched_submit_cbs_bp_hit_seq;
+    uint64_t guest_sched_submit_cbs_bp_arm_ch5_interval;
+    uint64_t guest_sched_submit_cbs_bp_scan_seq;
+    uint64_t guest_sched_submit_cbs_bp_scan_last_ch5_interval;
+    uint64_t guest_sched_submit_cbs_rearm_bp_addr;
+    uint32_t guest_sched_submit_cbs_rearm_bp_armed;
+    uint32_t guest_sched_submit_cbs_bp_armed;
+    uint64_t guest_sched_segment_init_bp_base;
+    uint64_t guest_sched_segment_init_bp_addr;
+    uint64_t guest_sched_segment_init_bp_arm_seq;
+    uint64_t guest_sched_segment_init_bp_hit_seq;
+    uint64_t guest_sched_segment_init_bp_arm_ch5_interval;
+    uint64_t guest_sched_segment_init_last_this;
+    uint64_t guest_sched_segment_init_last_header;
+    uint64_t guest_sched_segment_init_last_hit_seq;
+    uint64_t guest_sched_segment_init_rearm_bp_addr;
+    uint32_t guest_sched_segment_init_rearm_bp_armed;
+    uint32_t guest_sched_segment_init_bp_armed;
+    uint64_t guest_sched_segment_header_wp_addr;
+    uint64_t guest_sched_segment_header_wp_len;
+    uint64_t guest_sched_segment_header_wp_arm_seq;
+    uint64_t guest_sched_segment_header_wp_hit_seq;
+    uint64_t guest_sched_segment_header_wp_hits_in_arm;
+    uint64_t guest_sched_segment_header_wp_arm_init_hit_seq;
+    uint64_t guest_sched_segment_header_wp_arm_ch5_interval;
+    uint64_t guest_sched_segment_header_wp_header;
+    uint64_t guest_sched_segment_header_wp_kernel_addr;
+    uint64_t guest_sched_segment_header_wp_kernel_header;
+    uint64_t guest_sched_segment_header_wp_client_base;
+    uint64_t guest_sched_segment_header_wp_client_header;
+    uint64_t guest_sched_segment_header_wp_header_off;
+    uint64_t guest_sched_segment_header_wp_arm_q0;
+    uint64_t guest_sched_segment_header_wp_arm_q1;
+    uint32_t guest_sched_segment_header_wp_seg_index;
+    uint32_t guest_sched_segment_header_wp_res_index;
+    uint32_t guest_sched_segment_header_wp_res_id;
+    uint32_t guest_sched_segment_header_wp_armed;
+    uint64_t guest_sched_metal_author_bp_addr;
+    uint64_t guest_sched_metal_author_return_bp_addr;
+    uint64_t guest_sched_metal_author_bp_arm_seq;
+    uint64_t guest_sched_metal_author_bp_hit_seq;
+    uint64_t guest_sched_metal_author_bp_arm_ch5_interval;
+    uint64_t guest_sched_metal_author_last_hit_seq;
+    uint64_t guest_sched_metal_author_last_arg0;
+    uint64_t guest_sched_metal_author_last_arg1;
+    uint64_t guest_sched_metal_author_last_arg2;
+    uint64_t guest_sched_metal_author_last_arg3;
+    uint64_t guest_sched_metal_author_last_ret;
+    uint32_t guest_sched_metal_author_kind;
+    uint32_t guest_sched_metal_author_return_bp_armed;
+    uint32_t guest_sched_metal_author_bp_armed;
+    uint64_t guest_sched_apv_event_wp_base;
+    uint64_t guest_sched_apv_event_wp_addr;
+    uint64_t guest_sched_apv_event_wp_arm_seq;
+    uint64_t guest_sched_apv_event_wp_hit_seq;
+    uint64_t guest_sched_apv_event_wp_arm_ch5_interval;
+    uint64_t guest_sched_apv_event_wp_arm_entry_hit_seq;
+    uint64_t guest_sched_apv_event_wp_hits_in_arm;
+    uint64_t guest_sched_apv_event_wp_seen_count;
+    uint64_t guest_sched_apv_event_wp_seen[
+        AGFX_GUEST_SCHED_APV_EVENT_WP_SEEN_MAX];
+    uint32_t guest_sched_apv_event_wp_armed;
+    uint64_t guest_sched_apv_inner_bp_base;
+    uint64_t guest_sched_apv_inner_bp_arm_seq;
+    uint64_t guest_sched_apv_inner_bp_hit_seq;
+    uint32_t guest_sched_apv_inner_bp_armed;
+    uint64_t guest_sched_iogpu_event_bp_base;
+    uint64_t guest_sched_iogpu_event_bp_arm_seq;
+    uint64_t guest_sched_iogpu_event_bp_hit_seq;
+    uint32_t guest_sched_iogpu_event_bp_armed;
+    uint64_t guest_sched_ioaccel_merge_bp_base;
+    uint64_t guest_sched_ioaccel_merge_bp_addr;
+    uint64_t guest_sched_ioaccel_merge_bp_arm_seq;
+    uint64_t guest_sched_ioaccel_merge_bp_hit_seq;
+    uint64_t guest_sched_ioaccel_merge_bp_arm_ch5_interval;
+    uint64_t guest_sched_ioaccel_merge_bp_arm_validate_hit_seq;
+    uint64_t guest_sched_ioaccel_merge_bp_tracked_param;
+    uint64_t guest_sched_ioaccel_merge_bp_tracked_dst;
+    uint32_t guest_sched_ioaccel_merge_bp_armed;
+    uint64_t guest_sched_resource_life_bp_apv_base;
+    uint64_t guest_sched_resource_life_bp_ioaccel_base;
+    uint64_t guest_sched_resource_life_bp_arm_seq;
+    uint64_t guest_sched_resource_life_bp_hit_seq;
+    uint64_t guest_sched_resource_life_bp_hits_in_arm;
+    uint64_t guest_sched_resource_life_bp_arm_ch5_interval;
+    uint64_t guest_sched_resource_life_bp_arm_inner_hit_seq;
+    uint64_t guest_sched_resource_life_bp_source_txn;
+    uint64_t guest_sched_resource_life_bp_src_obj;
+    uint64_t guest_sched_resource_life_bp_src_event;
+    uint64_t guest_sched_resource_life_bp_src_e0;
+    uint32_t guest_sched_resource_life_bp_src_lane;
+    uint32_t guest_sched_resource_life_bp_armed;
+    uint64_t guest_sched_resource_state_wp_obj;
+    uint64_t guest_sched_resource_state_wp_state_addr;
+    uint64_t guest_sched_resource_state_wp_ref_addr;
+    uint64_t guest_sched_resource_state_wp_dirty_addr;
+    uint64_t guest_sched_resource_state_wp_arm_seq;
+    uint64_t guest_sched_resource_state_wp_hit_seq;
+    uint64_t guest_sched_resource_state_wp_hits_in_arm;
+    uint64_t guest_sched_resource_state_wp_arm_ch5_interval;
+    uint64_t guest_sched_resource_state_wp_arm_inner_hit_seq;
+    uint64_t guest_sched_resource_state_wp_source_txn;
+    uint64_t guest_sched_resource_state_wp_src_event;
+    uint64_t guest_sched_resource_state_wp_src_e0;
+    uint32_t guest_sched_resource_state_wp_src_lane;
+    uint32_t guest_sched_resource_state_wp_armed;
+    uint64_t guest_sched_pcb_source_wp_addr;
+    uint64_t guest_sched_pcb_source_wp_len;
+    uint64_t guest_sched_pcb_source_wp_ptr;
+    uint64_t guest_sched_pcb_source_wp_entries;
+    uint64_t guest_sched_pcb_source_wp_arm_seq;
+    uint64_t guest_sched_pcb_source_wp_hit_seq;
+    uint64_t guest_sched_pcb_source_wp_hits_in_arm;
+    uint64_t guest_sched_pcb_source_wp_arm_row_seq;
+    uint64_t guest_sched_pcb_source_wp_arm_cmd_stamp;
+    uint64_t guest_sched_pcb_source_wp_arm_ch5_interval;
+    uint64_t guest_sched_pcb_source_wp_arm_q0;
+    uint64_t guest_sched_pcb_source_wp_arm_q1;
+    uint32_t guest_sched_pcb_source_wp_kind;
+    uint32_t guest_sched_pcb_source_wp_slot;
+    uint32_t guest_sched_pcb_source_wp_entry_index;
+    uint32_t guest_sched_pcb_source_wp_res_id;
+    uint32_t guest_sched_pcb_source_wp_armed;
 
     /* Async MMIO worker (replaces GCD dispatch_async_f from reference) */
     QemuThread mmio_worker;
@@ -122,6 +351,15 @@ struct AppleGfxMLState {
     QemuMutex mmio_job_mutex;  /* Protects MMIO session job queue */
     QemuMutex session_mutex;   /* Serializes wrapper-owned owner-render capture/submit */
     int mmio_wait_active;      /* Main thread is inside AIO_WAIT_WHILE for MMIO */
+
+    /* Reference PGDisplayDescriptor.queue publishes one callback item at a time
+     * on a serial host queue. Keep FIFO ordering without collapsing several
+     * queued items into one BH drain. */
+    QemuMutex completion_mutex;
+    AgfxCompletionJob *completion_head;
+    AgfxCompletionJob *completion_tail;
+    bool completion_bh_scheduled;
+    QEMUBH *completion_bh;
 
     int iosfc_bootstrap_active;
 

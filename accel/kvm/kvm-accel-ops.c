@@ -27,6 +27,8 @@
 #include <linux/kvm.h>
 #include "kvm-cpus.h"
 
+bool qmu_diag_handle_guest_debug(CPUState *cpu) __attribute__((weak));
+
 static void *kvm_vcpu_thread_fn(void *arg)
 {
     CPUState *cpu = arg;
@@ -52,6 +54,10 @@ static void *kvm_vcpu_thread_fn(void *arg)
         if (cpu_can_run(cpu)) {
             r = kvm_cpu_exec(cpu);
             if (r == EXCP_DEBUG) {
+                if (qmu_diag_handle_guest_debug &&
+                    qmu_diag_handle_guest_debug(cpu)) {
+                    continue;
+                }
                 cpu_handle_guest_debug(cpu);
             }
         }
