@@ -25,6 +25,7 @@
 #include "ui/console.h"
 #include "ui/dbus-display.h"
 #include "ui/qemu-spice.h"
+#include "hw/display/apple-gfx-ml.h"
 #ifdef CONFIG_PNG
 #include <png.h>
 #endif
@@ -326,6 +327,68 @@ static bool ppm_save(int fd, pixman_image_t *image, Error **errp)
     return true;
 }
 
+static void qmp_write_agfx_seqbridge(const char *filename,
+                                     const AppleGfxMLCaptureBridge *bridge)
+{
+    g_autofree char *path = NULL;
+    FILE *f;
+
+    if (!filename || !bridge) {
+        return;
+    }
+
+    path = g_strdup_printf("%s.seqbridge", filename);
+    f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "qmp_ordinal=%llu\n", (unsigned long long)bridge->qmp_ordinal);
+    fprintf(f, "valid=%d\n", bridge->valid);
+    fprintf(f, "host_apply_seq=%llu\n",
+            (unsigned long long)bridge->host_apply_seq);
+    fprintf(f, "qmetal_host_delivery_seq=%llu\n",
+            (unsigned long long)bridge->qmetal_host_delivery_seq);
+    fprintf(f, "display_cookie=%llu\n",
+            (unsigned long long)bridge->display_cookie);
+    fprintf(f, "txn3_seq=%llu\n", (unsigned long long)bridge->txn3_seq);
+    fprintf(f, "txn3_digest_lo=0x%llx\n",
+            (unsigned long long)bridge->txn3_digest_lo);
+    fprintf(f, "txn3_digest_hi=0x%llx\n",
+            (unsigned long long)bridge->txn3_digest_hi);
+    fprintf(f, "source_texture_id=%u\n", bridge->source_texture_id);
+    fprintf(f, "source_vk_image=0x%llx\n",
+            (unsigned long long)bridge->source_vk_image);
+    fprintf(f, "source_vk_image_view=0x%llx\n",
+            (unsigned long long)bridge->source_vk_image_view);
+    fprintf(f, "source_aspect=0x%x\n", bridge->source_aspect);
+    fprintf(f, "source_mip=%u\n", bridge->source_mip);
+    fprintf(f, "source_layer=%u\n", bridge->source_layer);
+    fprintf(f, "image_lifetime_generation=%llu\n",
+            (unsigned long long)bridge->image_lifetime_generation);
+    fprintf(f, "backing_id=%u\n", bridge->backing_id);
+    fprintf(f, "backing_generation=%llu\n",
+            (unsigned long long)bridge->backing_generation);
+    fprintf(f, "backing_va=0x%llx\n",
+            (unsigned long long)bridge->backing_va);
+    fprintf(f, "backing_span=%llu\n",
+            (unsigned long long)bridge->backing_span);
+    fprintf(f, "backing_task=%u\n", bridge->backing_task);
+    fprintf(f, "backing_resource=%u\n", bridge->backing_resource);
+    fprintf(f, "backing_plane=%u\n", bridge->backing_plane);
+    fprintf(f, "writer_seq=%llu\n", (unsigned long long)bridge->writer_seq);
+    fprintf(f, "queue_submit_seq=%llu\n",
+            (unsigned long long)bridge->queue_submit_seq);
+    fprintf(f, "request_epoch=%llu\n",
+            (unsigned long long)bridge->request_epoch);
+    fprintf(f, "frame_serial=%llu\n",
+            (unsigned long long)bridge->frame_serial);
+    fprintf(f, "qemu_frame_count=%llu\n",
+            (unsigned long long)bridge->qemu_frame_count);
+    fprintf(f, "qemu_present_count=%llu\n",
+            (unsigned long long)bridge->qemu_present_count);
+    fclose(f);
+}
+
 /* Safety: coroutine-only, concurrent-coroutine safe, main thread only */
 void coroutine_fn
 qmp_screendump(const char *filename, const char *device,
@@ -335,6 +398,8 @@ qmp_screendump(const char *filename, const char *device,
     g_autoptr(pixman_image_t) image = NULL;
     QemuConsole *con;
     DisplaySurface *surface;
+    AppleGfxMLCaptureBridge agfx_bridge;
+    bool have_agfx_bridge = false;
     int fd;
 
     if (device) {
@@ -368,6 +433,7 @@ qmp_screendump(const char *filename, const char *device,
         return;
     }
     image = pixman_image_ref(surface->image);
+    have_agfx_bridge = apple_gfx_ml_get_qmp_capture_bridge(&agfx_bridge);
 
     fd = qemu_create(filename, O_WRONLY | O_TRUNC | O_BINARY, 0666, errp);
     if (fd == -1) {
@@ -389,6 +455,9 @@ qmp_screendump(const char *filename, const char *device,
         if (!ppm_save(fd, image, errp)) {
             qemu_unlink(filename);
         }
+    }
+    if (have_agfx_bridge) {
+        qmp_write_agfx_seqbridge(filename, &agfx_bridge);
     }
 }
 #endif /* CONFIG_PIXMAN */

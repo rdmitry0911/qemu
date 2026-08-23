@@ -69,7 +69,144 @@ struct AppleGfxMLFrameCompletionJob {
     uint32_t width;
     uint32_t height;
     uint32_t stride;
+    AppleGfxMLCaptureBridge bridge;
 };
+
+static QemuMutex agfx_capture_bridge_mutex;
+static gsize agfx_capture_bridge_inited;
+static AppleGfxMLCaptureBridge agfx_capture_bridge_latest;
+static uint64_t agfx_capture_bridge_next_apply_seq;
+static uint64_t agfx_capture_bridge_next_qmp_ordinal;
+
+/* ── AGFX_PRESENT_RECEIPT (diagnostic, s0-frozen spec v2.2 2026-08-23) ──
+ * Env AGFX_PRESENT_RECEIPT_FILE=<path>: per delivered present, append one
+ * in-memory row {qemu_present_count, host_apply_seq, bridge metadata,
+ * canonical ROI SHA-256, ppm path}; flushed ONCE at exit (in-memory ring —
+ * per-present file I/O historically suppressed the flicker under study).
+ * Canonical hash: row-major RGB (from BGRA bytes b2,b1,b0), ROI
+ * x[827,1089) y[147,260), no header. Behavior-neutral: log-only. */
+/* local SHA-256 (public-domain style, no external locks — BH-safe) */
+typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t off; } agfx_sha256;
+static const uint32_t agfx_sha_k[64] = {
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+#define AGFX_ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+static void agfx_sha256_block(agfx_sha256 *c, const uint8_t *p)
+{
+    uint32_t w[64], a,b,cc,d,e,f,g,h; int i;
+    for (i=0;i<16;i++) w[i]=((uint32_t)p[i*4]<<24)|((uint32_t)p[i*4+1]<<16)|((uint32_t)p[i*4+2]<<8)|p[i*4+3];
+    for (i=16;i<64;i++){uint32_t s0=AGFX_ROR(w[i-15],7)^AGFX_ROR(w[i-15],18)^(w[i-15]>>3);
+        uint32_t s1=AGFX_ROR(w[i-2],17)^AGFX_ROR(w[i-2],19)^(w[i-2]>>10); w[i]=w[i-16]+s0+w[i-7]+s1;}
+    a=c->h[0];b=c->h[1];cc=c->h[2];d=c->h[3];e=c->h[4];f=c->h[5];g=c->h[6];h=c->h[7];
+    for (i=0;i<64;i++){uint32_t S1=AGFX_ROR(e,6)^AGFX_ROR(e,11)^AGFX_ROR(e,25);
+        uint32_t ch=(e&f)^((~e)&g); uint32_t t1=h+S1+ch+agfx_sha_k[i]+w[i];
+        uint32_t S0=AGFX_ROR(a,2)^AGFX_ROR(a,13)^AGFX_ROR(a,22);
+        uint32_t mj=(a&b)^(a&cc)^(b&cc); uint32_t t2=S0+mj;
+        h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2;}
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
+}
+static void agfx_sha256_init(agfx_sha256 *c){
+    static const uint32_t iv[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    memcpy(c->h,iv,sizeof iv); c->len=0; c->off=0; }
+static void agfx_sha256_update(agfx_sha256 *c,const uint8_t *d,size_t n){
+    c->len+=n;
+    while(n){ size_t t=64-c->off; if(t>n)t=n; memcpy(c->buf+c->off,d,t); c->off+=t; d+=t; n-=t;
+        if(c->off==64){agfx_sha256_block(c,c->buf); c->off=0;} } }
+static void agfx_sha256_final(agfx_sha256 *c, uint8_t out[32]){
+    uint64_t bits=c->len*8; uint8_t pad=0x80; agfx_sha256_update(c,&pad,1); pad=0;
+    while(c->off!=56) agfx_sha256_update(c,&pad,1);
+    uint8_t lb[8]; for(int i=0;i<8;i++) lb[i]=(uint8_t)(bits>>(56-8*i));
+    agfx_sha256_update(c,lb,8);
+    for(int i=0;i<8;i++){out[i*4]=(uint8_t)(c->h[i]>>24);out[i*4+1]=(uint8_t)(c->h[i]>>16);
+        out[i*4+2]=(uint8_t)(c->h[i]>>8);out[i*4+3]=(uint8_t)c->h[i];}}
+#define AGFX_RCPT_ROI_X0 827
+#define AGFX_RCPT_ROI_X1 1089
+#define AGFX_RCPT_ROI_Y0 147
+#define AGFX_RCPT_ROI_Y1 260
+static FILE *agfx_rcpt_fp;
+static const char *agfx_rcpt_file;
+static int agfx_rcpt_init_done;
+static uint64_t agfx_rcpt_rowcount;
+static void agfx_rcpt_flush(void)
+{
+    if (agfx_rcpt_fp) {
+        fflush(agfx_rcpt_fp);
+    }
+}
+static void agfx_rcpt_init(void)
+{
+    if (agfx_rcpt_init_done) return;
+    agfx_rcpt_init_done = 1;
+    agfx_rcpt_file = getenv("AGFX_PRESENT_RECEIPT_FILE");
+    if (agfx_rcpt_file && agfx_rcpt_file[0]) {
+        agfx_rcpt_fp = fopen(agfx_rcpt_file, "w");
+        if (agfx_rcpt_fp) {
+            setvbuf(agfx_rcpt_fp, NULL, _IOFBF, 1 << 16);
+            fprintf(agfx_rcpt_fp,
+                "present_count\thost_apply_seq\tbridge_valid\tqmetal_delivery_seq\t"
+                "display_cookie\tsource_texture_id\tsource_vk_image\tsource_vk_view\t"
+                "image_generation\tbacking_id\tbacking_generation\tbacking_va\t"
+                "backing_task\tbacking_resource\twriter_seq\tqueue_submit_seq\t"
+                "request_epoch\tframe_serial\ttxn3_seq\ttxn3_digest_lo\ttxn3_digest_hi\t"
+                "roi_sha256\tppm\n");
+            atexit(agfx_rcpt_flush);
+        } else {
+            agfx_rcpt_file = NULL;
+        }
+    } else {
+        agfx_rcpt_file = NULL;
+    }
+}
+
+static void agfx_capture_bridge_init_once(void)
+{
+    if (g_once_init_enter(&agfx_capture_bridge_inited)) {
+        qemu_mutex_init(&agfx_capture_bridge_mutex);
+        memset(&agfx_capture_bridge_latest, 0, sizeof(agfx_capture_bridge_latest));
+        agfx_capture_bridge_next_apply_seq = 1;
+        agfx_capture_bridge_next_qmp_ordinal = 1;
+        g_once_init_leave(&agfx_capture_bridge_inited, 1);
+    }
+}
+
+static void agfx_capture_bridge_note_apply(AppleGfxMLState *s,
+                                           const AppleGfxMLFrameCompletionJob *job,
+                                           uint64_t present_count)
+{
+    AppleGfxMLCaptureBridge bridge;
+
+    if (!s || !job) {
+        return;
+    }
+
+    agfx_capture_bridge_init_once();
+    bridge = job->bridge;
+    qemu_mutex_lock(&agfx_capture_bridge_mutex);
+    bridge.host_apply_seq = agfx_capture_bridge_next_apply_seq++;
+    bridge.qemu_frame_count = s->frame_count;
+    bridge.qemu_present_count = present_count;
+    agfx_capture_bridge_latest = bridge;
+    qemu_mutex_unlock(&agfx_capture_bridge_mutex);
+}
+
+bool apple_gfx_ml_get_qmp_capture_bridge(AppleGfxMLCaptureBridge *out)
+{
+    if (!out) {
+        return false;
+    }
+    agfx_capture_bridge_init_once();
+    qemu_mutex_lock(&agfx_capture_bridge_mutex);
+    *out = agfx_capture_bridge_latest;
+    out->qmp_ordinal = agfx_capture_bridge_next_qmp_ordinal++;
+    qemu_mutex_unlock(&agfx_capture_bridge_mutex);
+    return out->host_apply_seq != 0;
+}
 
 static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
 {
@@ -788,6 +925,75 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                      height,
                      stride);
         }
+        agfx_capture_bridge_note_apply(s, job, pc);
+        /* AGFX_PRESENT_RECEIPT row (spec v2.2): same display_fb bytes as PPM. */
+        agfx_rcpt_init();
+        if (agfx_rcpt_file) {
+            char sha_hex[65] = "-";
+            if (s->display_fb && width >= AGFX_RCPT_ROI_X1 &&
+                height >= AGFX_RCPT_ROI_Y1) {
+                const uint32_t rw = AGFX_RCPT_ROI_X1 - AGFX_RCPT_ROI_X0;
+                const uint32_t rh = AGFX_RCPT_ROI_Y1 - AGFX_RCPT_ROI_Y0;
+                uint8_t *roi = g_malloc((size_t)rw * rh * 3);
+                const uint8_t *fb = (const uint8_t *)s->display_fb;
+                for (uint32_t ry = 0; ry < rh; ry++) {
+                    const uint8_t *row =
+                        fb + (size_t)(AGFX_RCPT_ROI_Y0 + ry) * stride +
+                        (size_t)AGFX_RCPT_ROI_X0 * 4;
+                    uint8_t *dst = roi + (size_t)ry * rw * 3;
+                    for (uint32_t rx = 0; rx < rw; rx++) {
+                        dst[rx * 3 + 0] = row[rx * 4 + 2]; /* R */
+                        dst[rx * 3 + 1] = row[rx * 4 + 1]; /* G */
+                        dst[rx * 3 + 2] = row[rx * 4 + 0]; /* B */
+                    }
+                }
+                {
+                    agfx_sha256 hc;
+                    uint8_t digest[32];
+                    agfx_sha256_init(&hc);
+                    agfx_sha256_update(&hc, roi, (size_t)rw * rh * 3);
+                    agfx_sha256_final(&hc, digest);
+                    for (int di = 0; di < 32; di++) {
+                        snprintf(sha_hex + di * 2, 3, "%02x", digest[di]);
+                    }
+                }
+                g_free(roi);
+            }
+            if (agfx_rcpt_fp) {
+                fprintf(agfx_rcpt_fp,
+                    "%" PRIu64 "\t%" PRIu64 "\t%d\t%" PRIu64 "\t%" PRIu64
+                    "\t%u\t0x%" PRIx64 "\t0x%" PRIx64 "\t%" PRIu64
+                    "\t%u\t%" PRIu64 "\t0x%" PRIx64 "\t%u\t%u"
+                    "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
+                    "\t%" PRIu64 "\t0x%" PRIx64 "\t0x%" PRIx64 "\t%s\tframe_%06lu.ppm\n",
+                    pc,
+                    (uint64_t)0 /* host_apply_seq in bridge_latest */,
+                    job->bridge.valid ? 1 : 0,
+                    job->bridge.qmetal_host_delivery_seq,
+                    job->bridge.display_cookie,
+                    job->bridge.source_texture_id,
+                    (uint64_t)job->bridge.source_vk_image,
+                    (uint64_t)job->bridge.source_vk_image_view,
+                    job->bridge.image_lifetime_generation,
+                    job->bridge.backing_id,
+                    job->bridge.backing_generation,
+                    (uint64_t)job->bridge.backing_va,
+                    job->bridge.backing_task,
+                    job->bridge.backing_resource,
+                    job->bridge.writer_seq,
+                    job->bridge.queue_submit_seq,
+                    job->bridge.request_epoch,
+                    job->bridge.frame_serial,
+                    job->bridge.txn3_seq,
+                    job->bridge.txn3_digest_lo,
+                    job->bridge.txn3_digest_hi,
+                    sha_hex,
+                    (unsigned long)s->frame_count);
+                if ((++agfx_rcpt_rowcount & 127) == 0) {
+                    fflush(agfx_rcpt_fp);
+                }
+            }
+        }
     }
     if (s->frame_count <= AGFX_LOG_INITIAL_COUNT || (s->frame_count % AGFX_LOG_INTERVAL) == 0) {
         agfx_log(s, "[apple-gfx-ml] frame_completed_bh: present #%lu %ux%u stride=%u\n",
@@ -861,6 +1067,31 @@ static void qemu_render_frame_complete(void *ctx,
     job = g_new0(AppleGfxMLFrameCompletionJob, 1);
     job->state = s;
     job->frame_expected = completion->frame_expected != 0;
+    job->bridge.valid = completion->seq_metadata_version != 0;
+    job->bridge.qmetal_host_delivery_seq = completion->host_delivery_seq;
+    job->bridge.display_cookie = completion->display_submit_seq;
+    job->bridge.txn3_seq = completion->txn3_seq;
+    job->bridge.txn3_digest_lo = completion->txn3_digest_lo;
+    job->bridge.txn3_digest_hi = completion->txn3_digest_hi;
+    job->bridge.source_texture_id = completion->source_texture_id;
+    job->bridge.source_vk_image = completion->source_vk_image;
+    job->bridge.source_vk_image_view = completion->source_vk_image_view;
+    job->bridge.source_aspect = completion->source_aspect;
+    job->bridge.source_mip = completion->source_mip;
+    job->bridge.source_layer = completion->source_layer;
+    job->bridge.image_lifetime_generation =
+        completion->image_lifetime_generation;
+    job->bridge.backing_id = completion->backing_id;
+    job->bridge.backing_generation = completion->backing_generation;
+    job->bridge.backing_va = completion->backing_va;
+    job->bridge.backing_span = completion->backing_span;
+    job->bridge.backing_task = completion->backing_task;
+    job->bridge.backing_resource = completion->backing_resource;
+    job->bridge.backing_plane = completion->backing_plane;
+    job->bridge.writer_seq = completion->writer_seq;
+    job->bridge.queue_submit_seq = completion->queue_submit_seq;
+    job->bridge.request_epoch = completion->request_epoch;
+    job->bridge.frame_serial = completion->frame_serial;
     if (job->frame_expected && completion->pixels &&
         completion->width != 0 && completion->height != 0 &&
         completion->stride != 0) {

@@ -53,6 +53,39 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleGfxMLState, APPLE_GFX_ML)
 #define APPLE_GFX_ML_MSI_CAP_AUTO       0x0   /* Let QEMU auto-select capability offset */
 #define APPLE_GFX_ML_DEFAULT_VRAM_MB    512
 
+typedef struct AppleGfxMLCaptureBridge {
+    uint64_t qmp_ordinal;
+    uint64_t host_apply_seq;
+    uint64_t qmetal_host_delivery_seq;
+    uint64_t display_cookie;
+    uint64_t txn3_seq;
+    uint64_t txn3_digest_lo;
+    uint64_t txn3_digest_hi;
+    uint32_t source_texture_id;
+    uint64_t source_vk_image;
+    uint64_t source_vk_image_view;
+    uint32_t source_aspect;
+    uint32_t source_mip;
+    uint32_t source_layer;
+    uint64_t image_lifetime_generation;
+    uint32_t backing_id;
+    uint64_t backing_generation;
+    uint64_t backing_va;
+    uint64_t backing_span;
+    uint32_t backing_task;
+    uint32_t backing_resource;
+    uint32_t backing_plane;
+    uint64_t writer_seq;
+    uint64_t queue_submit_seq;
+    uint64_t request_epoch;
+    uint64_t frame_serial;
+    uint64_t qemu_frame_count;
+    uint64_t qemu_present_count;
+    int valid;
+} AppleGfxMLCaptureBridge;
+
+bool apple_gfx_ml_get_qmp_capture_bridge(AppleGfxMLCaptureBridge *out);
+
 /* Device state - minimal, all logic in qmetal */
 struct AppleGfxMLState {
     /*< private >*/
