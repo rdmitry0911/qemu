@@ -165,8 +165,10 @@ static void agfx_rcpt_init(void)
 }
 
 /* Probe #5 QEMU delivery side of the immutable GFXR bridge.  This ring is
- * intentionally fixed-size and flushes only once at process exit: individual
- * display applies perform no bridge-side file I/O, allocation, or logging.
+ * intentionally fixed-size and flushes once when the explicitly armed window
+ * closes (or, when no bounded window was requested, at process exit).
+ * Individual display applies perform no bridge-side file I/O, allocation, or
+ * logging.
  * It begins only with AGFX_FRAME_CAPTURE_DIR_ALL's explicitly armed capture
  * window; pre-window boot frames are outside the experiment, not rejects.
  * Within that window a missing PPM/hash/token is rejected evidence, never
@@ -185,7 +187,9 @@ static uint64_t agfx_clockab_count;
 static uint64_t agfx_clockab_dropped;
 static uint64_t agfx_clockab_rejected;
 static uint64_t agfx_clockab_next_present_seq = 1;
+static uint64_t agfx_clockab_capture_count;
 static int agfx_clockab_init_done;
+static bool agfx_clockab_window_flushed;
 
 static void agfx_clockab_flush(void)
 {
@@ -259,7 +263,35 @@ static void agfx_clockab_init(void)
         agfx_clockab_file = NULL;
         return;
     }
+    const char *count_env = getenv("AGFX_CLOCKAB_GFXR_CAPTURE_COUNT");
+    if (count_env && count_env[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(count_env, &end, 10);
+        if (errno == 0 && end && *end == '\0' && parsed > 0 &&
+            parsed <= AGFX_CLOCKAB_BRIDGE_ROWS) {
+            agfx_clockab_capture_count = parsed;
+        }
+    }
     atexit(agfx_clockab_flush);
+}
+
+static void agfx_clockab_flush_armed_window_if_complete(void)
+{
+    if (!agfx_clockab_file || agfx_clockab_window_flushed ||
+        agfx_clockab_capture_count == 0) {
+        return;
+    }
+    const uint64_t observed = agfx_clockab_count + agfx_clockab_rejected +
+        agfx_clockab_dropped;
+    if (observed < agfx_clockab_capture_count) {
+        return;
+    }
+    /* This is the sole bounded-window write.  It runs after the exact PPM,
+     * ROI hash and immutable completion metadata are in the ring, before a
+     * controller-issued quit can discard process-exit handlers. */
+    agfx_clockab_flush();
+    agfx_clockab_window_flushed = true;
 }
 
 static bool agfx_clockab_roi_sha256(const uint8_t *fb, uint32_t width,
@@ -1127,7 +1159,8 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
          * If either side is absent, preserve rendering and mark diagnostic
          * evidence incomplete at final flush; never infer it by frame order. */
         agfx_clockab_init();
-        if (agfx_clockab_file && clockab_capture_armed) {
+        if (agfx_clockab_file && clockab_capture_armed &&
+            !agfx_clockab_window_flushed) {
             char roi_sha256[65] = { 0 };
             if (!clockab_ppm_written ||
                 !agfx_clockab_roi_sha256((const uint8_t *)s->display_fb,
@@ -1136,6 +1169,7 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
             } else {
                 agfx_clockab_append(&applied_bridge, roi_sha256, clockab_ppm);
             }
+            agfx_clockab_flush_armed_window_if_complete();
         }
 
         /* AGFX_PRESENT_RECEIPT row (spec v2.2): same display_fb bytes as PPM. */
