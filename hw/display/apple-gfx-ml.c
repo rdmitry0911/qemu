@@ -164,6 +164,179 @@ static void agfx_rcpt_init(void)
     }
 }
 
+/* Probe #5 QEMU delivery side of the immutable GFXR bridge.  This ring is
+ * intentionally fixed-size and flushes only once at process exit: individual
+ * display applies perform no bridge-side file I/O, allocation, or logging.
+ * It begins only with AGFX_FRAME_CAPTURE_DIR_ALL's explicitly armed capture
+ * window; pre-window boot frames are outside the experiment, not rejects.
+ * Within that window a missing PPM/hash/token is rejected evidence, never
+ * repaired by ordering or a later global framebuffer read. */
+#define AGFX_CLOCKAB_BRIDGE_ROWS 256
+typedef struct AgfxClockabBridgeRow {
+    AppleGfxMLCaptureBridge bridge;
+    uint64_t present_seq;
+    char roi_sha256[65];
+    char ppm[64];
+} AgfxClockabBridgeRow;
+
+static AgfxClockabBridgeRow agfx_clockab_rows[AGFX_CLOCKAB_BRIDGE_ROWS];
+static const char *agfx_clockab_file;
+static uint64_t agfx_clockab_count;
+static uint64_t agfx_clockab_dropped;
+static uint64_t agfx_clockab_rejected;
+static uint64_t agfx_clockab_next_present_seq = 1;
+static int agfx_clockab_init_done;
+
+static void agfx_clockab_flush(void)
+{
+    FILE *out;
+    g_autofree char *stats_path = NULL;
+    FILE *stats;
+
+    if (!agfx_clockab_file || !agfx_clockab_file[0]) {
+        return;
+    }
+    out = fopen(agfx_clockab_file, "w");
+    if (!out) {
+        return;
+    }
+    for (uint64_t index = 0; index < agfx_clockab_count; ++index) {
+        const AgfxClockabBridgeRow *row = &agfx_clockab_rows[index];
+        const AppleGfxMLCaptureBridge *b = &row->bridge;
+        fprintf(out,
+            "{\"schema\":\"CLOCKAB_GFXR_BRIDGE_V1\",\"kind\":\"qemu_apply\","
+            "\"boot_uuid\":\"%016" PRIx64 "%016" PRIx64 "\","
+            "\"bridge_token\":\"%016" PRIx64 "%016" PRIx64 "%016" PRIx64 "%016" PRIx64 "\","
+            "\"selection_seq\":%" PRIu64 ",\"present_seq\":%" PRIu64 ","
+            "\"qemu_present_count\":%" PRIu64 ",\"host_apply_seq\":%" PRIu64 ","
+            "\"qmetal_submit_seq\":%" PRIu64 ",\"qmetal_queue_submit_seq\":%" PRIu64 ","
+            "\"source\":{\"raw_id\":\"0x%" PRIx64 "\",\"generation\":%" PRIu64 ","
+            "\"extent\":{\"width\":%u,\"height\":%u},\"format\":\"BGRA8_UNORM\","
+            "\"source_rect\":{\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u},"
+            "\"destination_rect\":{\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u},"
+            "\"orientation\":\"IDENTITY\",\"filter\":\"NEAREST\","
+            "\"copy_path\":\"DISPLAY_COMPOSITE\",\"composite_flags\":%u},"
+            "\"roi_sha256\":\"%s\",\"ppm\":\"%s\"}\n",
+            b->clockab_boot_uuid_lo, b->clockab_boot_uuid_hi,
+            b->clockab_boot_uuid_lo, b->clockab_boot_uuid_hi,
+            b->clockab_selection_seq, b->clockab_qmetal_submit_seq,
+            b->clockab_selection_seq, row->present_seq,
+            b->qemu_present_count, b->host_apply_seq,
+            b->clockab_qmetal_submit_seq, b->clockab_qmetal_queue_submit_seq,
+            b->clockab_source_raw_image, b->clockab_source_generation,
+            b->clockab_source_width, b->clockab_source_height,
+            b->clockab_source_rect_x, b->clockab_source_rect_y,
+            b->clockab_source_rect_width, b->clockab_source_rect_height,
+            b->clockab_destination_rect_x, b->clockab_destination_rect_y,
+            b->clockab_destination_rect_width, b->clockab_destination_rect_height,
+            b->clockab_composite_flags, row->roi_sha256, row->ppm);
+    }
+    fclose(out);
+
+    stats_path = g_strdup_printf("%s.stats.json", agfx_clockab_file);
+    stats = fopen(stats_path, "w");
+    if (stats) {
+        fprintf(stats,
+            "{\"schema\":\"CLOCKAB_GFXR_BRIDGE_V1\","
+            "\"kind\":\"qemu_apply_stats\",\"rows\":%" PRIu64 ","
+            "\"dropped\":%" PRIu64 ",\"rejected\":%" PRIu64 ","
+            "\"result\":\"%s\"}\n",
+            agfx_clockab_count, agfx_clockab_dropped, agfx_clockab_rejected,
+            (agfx_clockab_dropped == 0 && agfx_clockab_rejected == 0)
+                ? "COMPLETE" : "INCOMPLETE");
+        fclose(stats);
+    }
+}
+
+static void agfx_clockab_init(void)
+{
+    if (agfx_clockab_init_done) {
+        return;
+    }
+    agfx_clockab_init_done = 1;
+    agfx_clockab_file = getenv("AGFX_CLOCKAB_GFXR_SIDECAR");
+    if (!agfx_clockab_file || !agfx_clockab_file[0]) {
+        agfx_clockab_file = NULL;
+        return;
+    }
+    atexit(agfx_clockab_flush);
+}
+
+static bool agfx_clockab_roi_sha256(const uint8_t *fb, uint32_t width,
+                                    uint32_t height, uint32_t stride,
+                                    char out_hex[65])
+{
+    const uint32_t rw = AGFX_RCPT_ROI_X1 - AGFX_RCPT_ROI_X0;
+    const uint32_t rh = AGFX_RCPT_ROI_Y1 - AGFX_RCPT_ROI_Y0;
+    uint8_t *roi;
+    agfx_sha256 hash;
+    uint8_t digest[32];
+
+    if (!fb || !out_hex || width < AGFX_RCPT_ROI_X1 ||
+        height < AGFX_RCPT_ROI_Y1 || stride < width * 4) {
+        return false;
+    }
+    roi = g_malloc((size_t)rw * rh * 3);
+    for (uint32_t ry = 0; ry < rh; ++ry) {
+        const uint8_t *src = fb + (size_t)(AGFX_RCPT_ROI_Y0 + ry) * stride +
+            (size_t)AGFX_RCPT_ROI_X0 * 4;
+        uint8_t *dst = roi + (size_t)ry * rw * 3;
+        for (uint32_t rx = 0; rx < rw; ++rx) {
+            dst[rx * 3 + 0] = src[rx * 4 + 2];
+            dst[rx * 3 + 1] = src[rx * 4 + 1];
+            dst[rx * 3 + 2] = src[rx * 4 + 0];
+        }
+    }
+    agfx_sha256_init(&hash);
+    agfx_sha256_update(&hash, roi, (size_t)rw * rh * 3);
+    agfx_sha256_final(&hash, digest);
+    g_free(roi);
+    for (int index = 0; index < 32; ++index) {
+        snprintf(out_hex + index * 2, 3, "%02x", digest[index]);
+    }
+    return true;
+}
+
+static void agfx_clockab_append(const AppleGfxMLCaptureBridge *bridge,
+                                const char *roi_sha256, const char *ppm)
+{
+    if (!agfx_clockab_file) {
+        return;
+    }
+    if (!bridge || !roi_sha256 || !ppm || !ppm[0] ||
+        bridge->clockab_metadata_version != 1 ||
+        bridge->clockab_boot_uuid_lo == 0 || bridge->clockab_boot_uuid_hi == 0 ||
+        bridge->clockab_selection_seq == 0 ||
+        bridge->clockab_qmetal_submit_seq == 0 ||
+        bridge->clockab_qmetal_queue_submit_seq == 0 ||
+        bridge->clockab_source_raw_image == 0 ||
+        bridge->clockab_source_generation == 0 ||
+        bridge->clockab_source_kind != 1 ||
+        bridge->clockab_source_format != 1 ||
+        bridge->clockab_source_width == 0 || bridge->clockab_source_height == 0 ||
+        bridge->clockab_source_rect_x != 0 || bridge->clockab_source_rect_y != 0 ||
+        bridge->clockab_destination_rect_x != 0 || bridge->clockab_destination_rect_y != 0 ||
+        bridge->clockab_source_rect_width != bridge->clockab_source_width ||
+        bridge->clockab_source_rect_height != bridge->clockab_source_height ||
+        bridge->clockab_destination_rect_width != bridge->clockab_source_width ||
+        bridge->clockab_destination_rect_height != bridge->clockab_source_height ||
+        bridge->clockab_orientation != 0 || bridge->clockab_filter != 1 ||
+        bridge->clockab_copy_path != 1 || bridge->host_apply_seq == 0 ||
+        bridge->qemu_present_count == 0) {
+        agfx_clockab_rejected++;
+        return;
+    }
+    if (agfx_clockab_count >= AGFX_CLOCKAB_BRIDGE_ROWS) {
+        agfx_clockab_dropped++;
+        return;
+    }
+    AgfxClockabBridgeRow *row = &agfx_clockab_rows[agfx_clockab_count++];
+    row->bridge = *bridge;
+    row->present_seq = agfx_clockab_next_present_seq++;
+    pstrcpy(row->roi_sha256, sizeof(row->roi_sha256), roi_sha256);
+    pstrcpy(row->ppm, sizeof(row->ppm), ppm);
+}
+
 static void agfx_capture_bridge_init_once(void)
 {
     if (g_once_init_enter(&agfx_capture_bridge_inited)) {
@@ -175,14 +348,15 @@ static void agfx_capture_bridge_init_once(void)
     }
 }
 
-static void agfx_capture_bridge_note_apply(AppleGfxMLState *s,
-                                           const AppleGfxMLFrameCompletionJob *job,
-                                           uint64_t present_count)
+static AppleGfxMLCaptureBridge
+agfx_capture_bridge_note_apply(AppleGfxMLState *s,
+                               const AppleGfxMLFrameCompletionJob *job,
+                               uint64_t present_count)
 {
-    AppleGfxMLCaptureBridge bridge;
+    AppleGfxMLCaptureBridge bridge = { 0 };
 
     if (!s || !job) {
-        return;
+        return bridge;
     }
 
     agfx_capture_bridge_init_once();
@@ -193,6 +367,7 @@ static void agfx_capture_bridge_note_apply(AppleGfxMLState *s,
     bridge.qemu_present_count = present_count;
     agfx_capture_bridge_latest = bridge;
     qemu_mutex_unlock(&agfx_capture_bridge_mutex);
+    return bridge;
 }
 
 bool apple_gfx_ml_get_qmp_capture_bridge(AppleGfxMLCaptureBridge *out)
@@ -824,6 +999,10 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
     uint32_t height = 0;
     uint32_t stride = 0;
     size_t frame_size = 0;
+    AppleGfxMLCaptureBridge applied_bridge = { 0 };
+    bool clockab_capture_armed = false;
+    bool clockab_ppm_written = false;
+    char clockab_ppm[64] = { 0 };
 
     if (!s || !job || !s->qmu_dev) {
         return false;
@@ -891,12 +1070,14 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
         }
         if (agfx_cap_ok && agfx_cap_dir &&
             (unsigned long)s->frame_count >= agfx_cap_start) {
+            clockab_capture_armed = true;
             char ppm_path[PATH_MAX];
             int pn = snprintf(ppm_path, sizeof(ppm_path), "%s/frame_%06lu.ppm",
                               agfx_cap_dir, (unsigned long)s->frame_count);
             if (pn > 0 && pn < (int)sizeof(ppm_path)) {
                 FILE *cf = fopen(ppm_path, "wb");
                 if (cf) {
+                    bool complete = true;
                     fprintf(cf, "P6\n%u %u\n255\n", width, height);
                     const uint8_t *csrc = (const uint8_t *)s->display_fb;
                     uint8_t *rgb_row = g_malloc((size_t)width * 3);
@@ -907,10 +1088,23 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                             rgb_row[cx * 3 + 1] = crow[cx * 4 + 1];
                             rgb_row[cx * 3 + 2] = crow[cx * 4 + 0];
                         }
-                        fwrite(rgb_row, 1, (size_t)width * 3, cf);
+                        if (fwrite(rgb_row, 1, (size_t)width * 3, cf) !=
+                            (size_t)width * 3) {
+                            complete = false;
+                            break;
+                        }
                     }
                     g_free(rgb_row);
-                    fclose(cf);
+                    if (fclose(cf) != 0) {
+                        complete = false;
+                    }
+                    if (complete) {
+                        int nn = snprintf(clockab_ppm, sizeof(clockab_ppm),
+                                          "frame_%06lu.ppm",
+                                          (unsigned long)s->frame_count);
+                        clockab_ppm_written = nn > 0 &&
+                            nn < (int)sizeof(clockab_ppm);
+                    }
                 }
             }
         }
@@ -925,7 +1119,24 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                      height,
                      stride);
         }
-        agfx_capture_bridge_note_apply(s, job, pc);
+        applied_bridge = agfx_capture_bridge_note_apply(s, job, pc);
+
+        /* The bridge joins only the PPM written from this exact BH payload
+         * with the completion metadata QMetal attached to this exact apply.
+         * If either side is absent, preserve rendering and mark diagnostic
+         * evidence incomplete at final flush; never infer it by frame order. */
+        agfx_clockab_init();
+        if (agfx_clockab_file && clockab_capture_armed) {
+            char roi_sha256[65] = { 0 };
+            if (!clockab_ppm_written ||
+                !agfx_clockab_roi_sha256((const uint8_t *)s->display_fb,
+                                          width, height, stride, roi_sha256)) {
+                agfx_clockab_rejected++;
+            } else {
+                agfx_clockab_append(&applied_bridge, roi_sha256, clockab_ppm);
+            }
+        }
+
         /* AGFX_PRESENT_RECEIPT row (spec v2.2): same display_fb bytes as PPM. */
         agfx_rcpt_init();
         if (agfx_rcpt_file) {
@@ -967,7 +1178,7 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                     "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
                     "\t%" PRIu64 "\t0x%" PRIx64 "\t0x%" PRIx64 "\t%s\tframe_%06lu.ppm\n",
                     pc,
-                    (uint64_t)0 /* host_apply_seq in bridge_latest */,
+                    applied_bridge.host_apply_seq,
                     job->bridge.valid ? 1 : 0,
                     job->bridge.qmetal_host_delivery_seq,
                     job->bridge.display_cookie,
@@ -1092,6 +1303,39 @@ static void qemu_render_frame_complete(void *ctx,
     job->bridge.queue_submit_seq = completion->queue_submit_seq;
     job->bridge.request_epoch = completion->request_epoch;
     job->bridge.frame_serial = completion->frame_serial;
+    job->bridge.clockab_metadata_version = completion->clockab_metadata_version;
+    job->bridge.clockab_source_kind = completion->clockab_source_kind;
+    job->bridge.clockab_boot_uuid_lo = completion->clockab_boot_uuid_lo;
+    job->bridge.clockab_boot_uuid_hi = completion->clockab_boot_uuid_hi;
+    job->bridge.clockab_selection_seq = completion->clockab_selection_seq;
+    job->bridge.clockab_qmetal_submit_seq =
+        completion->clockab_qmetal_submit_seq;
+    job->bridge.clockab_qmetal_queue_submit_seq =
+        completion->clockab_qmetal_queue_submit_seq;
+    job->bridge.clockab_source_raw_image = completion->clockab_source_raw_image;
+    job->bridge.clockab_source_generation =
+        completion->clockab_source_generation;
+    job->bridge.clockab_source_format = completion->clockab_source_format;
+    job->bridge.clockab_source_width = completion->clockab_source_width;
+    job->bridge.clockab_source_height = completion->clockab_source_height;
+    job->bridge.clockab_source_rect_x = completion->clockab_source_rect_x;
+    job->bridge.clockab_source_rect_y = completion->clockab_source_rect_y;
+    job->bridge.clockab_source_rect_width =
+        completion->clockab_source_rect_width;
+    job->bridge.clockab_source_rect_height =
+        completion->clockab_source_rect_height;
+    job->bridge.clockab_destination_rect_x =
+        completion->clockab_destination_rect_x;
+    job->bridge.clockab_destination_rect_y =
+        completion->clockab_destination_rect_y;
+    job->bridge.clockab_destination_rect_width =
+        completion->clockab_destination_rect_width;
+    job->bridge.clockab_destination_rect_height =
+        completion->clockab_destination_rect_height;
+    job->bridge.clockab_orientation = completion->clockab_orientation;
+    job->bridge.clockab_filter = completion->clockab_filter;
+    job->bridge.clockab_copy_path = completion->clockab_copy_path;
+    job->bridge.clockab_composite_flags = completion->clockab_composite_flags;
     if (job->frame_expected && completion->pixels &&
         completion->width != 0 && completion->height != 0 &&
         completion->stride != 0) {
