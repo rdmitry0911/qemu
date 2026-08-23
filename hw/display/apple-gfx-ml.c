@@ -268,7 +268,7 @@ static bool agfx_clockab_roi_sha256(const uint8_t *fb, uint32_t width,
 {
     const uint32_t rw = AGFX_RCPT_ROI_X1 - AGFX_RCPT_ROI_X0;
     const uint32_t rh = AGFX_RCPT_ROI_Y1 - AGFX_RCPT_ROI_Y0;
-    uint8_t *roi;
+    uint8_t rgb_row[(AGFX_RCPT_ROI_X1 - AGFX_RCPT_ROI_X0) * 3];
     agfx_sha256 hash;
     uint8_t digest[32];
 
@@ -276,21 +276,22 @@ static bool agfx_clockab_roi_sha256(const uint8_t *fb, uint32_t width,
         height < AGFX_RCPT_ROI_Y1 || stride < width * 4) {
         return false;
     }
-    roi = g_malloc((size_t)rw * rh * 3);
+    /* This probe runs on the present BH.  Hash one canonical RGB row at a
+     * time instead of allocating a whole ROI per present: the PPM capture is
+     * already explicitly armed, but the bridge must not add a heap-allocation
+     * timing source that could perturb the observed A/B cadence. */
+    agfx_sha256_init(&hash);
     for (uint32_t ry = 0; ry < rh; ++ry) {
         const uint8_t *src = fb + (size_t)(AGFX_RCPT_ROI_Y0 + ry) * stride +
             (size_t)AGFX_RCPT_ROI_X0 * 4;
-        uint8_t *dst = roi + (size_t)ry * rw * 3;
         for (uint32_t rx = 0; rx < rw; ++rx) {
-            dst[rx * 3 + 0] = src[rx * 4 + 2];
-            dst[rx * 3 + 1] = src[rx * 4 + 1];
-            dst[rx * 3 + 2] = src[rx * 4 + 0];
+            rgb_row[rx * 3 + 0] = src[rx * 4 + 2];
+            rgb_row[rx * 3 + 1] = src[rx * 4 + 1];
+            rgb_row[rx * 3 + 2] = src[rx * 4 + 0];
         }
+        agfx_sha256_update(&hash, rgb_row, (size_t)rw * 3);
     }
-    agfx_sha256_init(&hash);
-    agfx_sha256_update(&hash, roi, (size_t)rw * rh * 3);
     agfx_sha256_final(&hash, digest);
-    g_free(roi);
     for (int index = 0; index < 32; ++index) {
         snprintf(out_hex + index * 2, 3, "%02x", digest[index]);
     }
