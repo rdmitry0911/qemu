@@ -17,5 +17,6 @@ struct qmu_vulkan_ctx;
 void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
 int qmu_vk_capture_display_frame_request(struct qmu_vulkan_ctx *ctx);
 int qmu_vk_submit_captured_display_frame(struct qmu_vulkan_ctx *ctx);
+int qmu_vk_clockab_runtime_texel_flush_window(struct qmu_vulkan_ctx *ctx);
 
 #endif /* HW_DISPLAY_APPLE_VIRGL_QMETAL_ABI_H */

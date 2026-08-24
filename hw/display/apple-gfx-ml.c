@@ -45,6 +45,7 @@ struct qmu_vulkan_ctx;
 int qmu_vk_request_display_frame(struct qmu_vulkan_ctx *ctx);
 int qmu_vk_capture_display_frame_request(struct qmu_vulkan_ctx *ctx);
 int qmu_vk_submit_captured_display_frame(struct qmu_vulkan_ctx *ctx);
+int qmu_vk_clockab_runtime_texel_flush_window(struct qmu_vulkan_ctx *ctx);
 void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
 typedef struct AgfxLogEntry AgfxLogEntry;
@@ -276,7 +277,28 @@ static void agfx_clockab_init(void)
     atexit(agfx_clockab_flush);
 }
 
-static void agfx_clockab_flush_armed_window_if_complete(void)
+static bool agfx_clockab_runtime_texel_bridge_requested(void)
+{
+    const char *value = getenv("QMU_CLOCKAB_RUNTIME_TEXEL_BRIDGE");
+    return value && (strcmp(value, "1") == 0 || strcmp(value, "yes") == 0 ||
+                     strcmp(value, "true") == 0);
+}
+
+static int agfx_clockab_runtime_texel_flush_window(AppleGfxMLState *s)
+{
+    struct qmu_vulkan_ctx *vk;
+
+    if (!s || !s->qmu_dev) {
+        return -1;
+    }
+    vk = qmu_session_get_vulkan(s->qmu_dev);
+    if (!vk) {
+        return -1;
+    }
+    return qmu_vk_clockab_runtime_texel_flush_window(vk);
+}
+
+static void agfx_clockab_flush_armed_window_if_complete(AppleGfxMLState *s)
 {
     if (!agfx_clockab_file || agfx_clockab_window_flushed ||
         agfx_clockab_capture_count == 0) {
@@ -287,9 +309,14 @@ static void agfx_clockab_flush_armed_window_if_complete(void)
     if (observed < agfx_clockab_capture_count) {
         return;
     }
-    /* This is the sole bounded-window write.  It runs after the exact PPM,
-     * ROI hash and immutable completion metadata are in the ring, before a
-     * controller-issued quit can discard process-exit handlers. */
+    /* These are the sole bounded-window writes.  The runtime texel snapshot
+     * precedes the sidecar/stats flush, so the controller cannot observe a
+     * complete QEMU window and issue QMP quit while the pixel witness is still
+     * only process-local memory. */
+    if (agfx_clockab_runtime_texel_bridge_requested() &&
+        agfx_clockab_runtime_texel_flush_window(s) != 1) {
+        agfx_clockab_rejected++;
+    }
     agfx_clockab_flush();
     agfx_clockab_window_flushed = true;
 }
@@ -1169,7 +1196,7 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
             } else {
                 agfx_clockab_append(&applied_bridge, roi_sha256, clockab_ppm);
             }
-            agfx_clockab_flush_armed_window_if_complete();
+            agfx_clockab_flush_armed_window_if_complete(s);
         }
 
         /* AGFX_PRESENT_RECEIPT row (spec v2.2): same display_fb bytes as PPM. */
