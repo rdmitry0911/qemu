@@ -46,6 +46,8 @@ int qmu_vk_request_display_frame(struct qmu_vulkan_ctx *ctx);
 int qmu_vk_capture_display_frame_request(struct qmu_vulkan_ctx *ctx);
 int qmu_vk_submit_captured_display_frame(struct qmu_vulkan_ctx *ctx);
 int qmu_vk_clockab_runtime_texel_flush_window(struct qmu_vulkan_ctx *ctx);
+int qmu_vk_clockab_terminal_operand_begin_window(struct qmu_vulkan_ctx *ctx);
+int qmu_vk_clockab_terminal_operand_flush_window(struct qmu_vulkan_ctx *ctx);
 void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
 typedef struct AgfxLogEntry AgfxLogEntry;
@@ -191,6 +193,7 @@ static uint64_t agfx_clockab_next_present_seq = 1;
 static uint64_t agfx_clockab_capture_count;
 static int agfx_clockab_init_done;
 static bool agfx_clockab_window_flushed;
+static bool agfx_clockab_terminal_operand_window_started;
 
 static void agfx_clockab_flush(void)
 {
@@ -284,6 +287,13 @@ static bool agfx_clockab_runtime_texel_bridge_requested(void)
                      strcmp(value, "true") == 0);
 }
 
+static bool agfx_clockab_terminal_operand_bridge_requested(void)
+{
+    const char *value = getenv("QMU_CLOCKAB_TERMINAL_OPERAND_BRIDGE");
+    return value && (strcmp(value, "1") == 0 || strcmp(value, "yes") == 0 ||
+                     strcmp(value, "true") == 0);
+}
+
 static int agfx_clockab_runtime_texel_flush_window(AppleGfxMLState *s)
 {
     struct qmu_vulkan_ctx *vk;
@@ -296,6 +306,34 @@ static int agfx_clockab_runtime_texel_flush_window(AppleGfxMLState *s)
         return -1;
     }
     return qmu_vk_clockab_runtime_texel_flush_window(vk);
+}
+
+static int agfx_clockab_terminal_operand_flush_window(AppleGfxMLState *s)
+{
+    struct qmu_vulkan_ctx *vk;
+
+    if (!s || !s->qmu_dev) {
+        return -1;
+    }
+    vk = qmu_session_get_vulkan(s->qmu_dev);
+    if (!vk) {
+        return -1;
+    }
+    return qmu_vk_clockab_terminal_operand_flush_window(vk);
+}
+
+static int agfx_clockab_terminal_operand_begin_window(AppleGfxMLState *s)
+{
+    struct qmu_vulkan_ctx *vk;
+
+    if (!s || !s->qmu_dev) {
+        return -1;
+    }
+    vk = qmu_session_get_vulkan(s->qmu_dev);
+    if (!vk) {
+        return -1;
+    }
+    return qmu_vk_clockab_terminal_operand_begin_window(vk);
 }
 
 static void agfx_clockab_flush_armed_window_if_complete(AppleGfxMLState *s)
@@ -315,6 +353,10 @@ static void agfx_clockab_flush_armed_window_if_complete(AppleGfxMLState *s)
      * only process-local memory. */
     if (agfx_clockab_runtime_texel_bridge_requested() &&
         agfx_clockab_runtime_texel_flush_window(s) != 1) {
+        agfx_clockab_rejected++;
+    }
+    if (agfx_clockab_terminal_operand_bridge_requested() &&
+        agfx_clockab_terminal_operand_flush_window(s) != 1) {
         agfx_clockab_rejected++;
     }
     agfx_clockab_flush();
@@ -1193,7 +1235,14 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                 !agfx_clockab_roi_sha256((const uint8_t *)s->display_fb,
                                           width, height, stride, roi_sha256)) {
                 agfx_clockab_rejected++;
+            } else if (agfx_clockab_terminal_operand_bridge_requested() &&
+                       !agfx_clockab_terminal_operand_window_started &&
+                       agfx_clockab_terminal_operand_begin_window(s) != 1) {
+                agfx_clockab_rejected++;
             } else {
+                if (agfx_clockab_terminal_operand_bridge_requested()) {
+                    agfx_clockab_terminal_operand_window_started = true;
+                }
                 agfx_clockab_append(&applied_bridge, roi_sha256, clockab_ppm);
             }
             agfx_clockab_flush_armed_window_if_complete(s);
