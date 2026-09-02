@@ -752,6 +752,60 @@ static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
     }
 }
 
+/* A direct shared MTLBuffer is imported over a pinned guest-RAM HVA.  The GPU
+ * can write that allocation without a later CPU copy, but QEMU still needs a
+ * main-loop/BQL dirty-accounting edge before the guest observes completion.
+ * This deliberately does not release the mapping: Buffer::importGuestPages
+ * owns that lifetime and qemu_unmap_gpa remains its sole unpin path. */
+typedef struct AgfxMappedDirtyJob {
+    void *hva;
+    size_t size;
+    int result;
+    QemuEvent event;
+} AgfxMappedDirtyJob;
+
+static void agfx_mark_mapped_dirty_bh(void *opaque)
+{
+    AgfxMappedDirtyJob *job = opaque;
+    if (!job || !job->hva || job->size == 0) {
+        if (job) {
+            job->result = -1;
+            qemu_event_set(&job->event);
+        }
+        return;
+    }
+
+    ram_addr_t offset;
+    MemoryRegion *mr = memory_region_from_host(job->hva, &offset);
+    if (!mr) {
+        job->result = -1;
+    } else {
+        memory_region_set_dirty(mr, offset, job->size);
+        memory_region_unref(mr);
+        job->result = 0;
+    }
+    qemu_event_set(&job->event);
+}
+
+static int qemu_mark_mapped_memory_dirty(void *ctx, void *hva, size_t size)
+{
+    AppleGfxMLState *s = ctx;
+    if (!s || !hva || size == 0) {
+        return -1;
+    }
+    AgfxMappedDirtyJob job = {
+        .hva = hva,
+        .size = size,
+        .result = -1,
+    };
+    qemu_event_init(&job.event, false);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            agfx_mark_mapped_dirty_bh, &job);
+    qemu_event_wait(&job.event);
+    qemu_event_destroy(&job.event);
+    return job.result;
+}
+
 /* ============================================================
  * DMA via BH+QemuEvent (reference: apple-gfx.m:2135-2168)
  * "Performing DMA requires BQL, so do it in a BH"
@@ -2429,6 +2483,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .user_ctx = s,
         .map_gpa = qemu_map_gpa,
         .unmap_gpa = qemu_unmap_gpa,
+        .mark_mapped_memory_dirty = qemu_mark_mapped_memory_dirty,
         .read_memory = qemu_read_memory,
         .write_memory = qemu_write_memory,
         .raise_irq = qemu_raise_irq,
