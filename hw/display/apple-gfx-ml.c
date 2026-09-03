@@ -2480,6 +2480,9 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     
     /* Create qmetal device with callbacks */
     qmu_extended_callbacks qmu_callbacks = {
+        .abi_magic = QMU_EXTENDED_CALLBACKS_ABI_MAGIC,
+        .abi_version = QMU_EXTENDED_ABI_VERSION,
+        .struct_size = sizeof(qmu_extended_callbacks),
         .user_ctx = s,
         .map_gpa = qemu_map_gpa,
         .unmap_gpa = qemu_unmap_gpa,
@@ -2510,6 +2513,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     };
 
     qmu_extended_config qmu_config = {
+        .abi_magic = QMU_EXTENDED_CONFIG_ABI_MAGIC,
+        .abi_version = QMU_EXTENDED_ABI_VERSION,
         .struct_size = sizeof(qmu_extended_config),
         .ram_base = 0,
         .ram_size = 0,  /* No restriction */
