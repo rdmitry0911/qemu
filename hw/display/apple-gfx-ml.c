@@ -36,6 +36,7 @@
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "system/hw_accel.h"
+#include "system/ramblock.h"
 #include "system/runstate.h"
 #include "gdbstub/enums.h"
 #include "ui/console.h"
@@ -526,8 +527,8 @@ static const char *agfx_mmio_offset_name(uint64_t offset)
         return "DISPLAY_IRQ";
     case PVG_REG_PENDING_COMP:
         return "PENDING_COMP";
-    case PVG_REG_TRANSACTION_ID:
-        return "TRANSACTION_ID";
+    case PVG_REG_RESUME_CHILD_FIFO:
+        return "RESUME_CHILD_FIFO";
     case PVG_REG_FAULT_STATUS:
         return "FAULT_STATUS";
     case PVG_REG_FIFO_PFN:
@@ -576,7 +577,7 @@ static bool agfx_mmio_roundtrip_interesting(uint64_t offset)
     case PVG_REG_EVENT_STAMPS:
     case PVG_REG_DISPLAY_IRQ:
     case PVG_REG_PENDING_COMP:
-    case PVG_REG_TRANSACTION_ID:
+    case PVG_REG_RESUME_CHILD_FIFO:
         return true;
     default:
         return false;
@@ -16797,6 +16798,563 @@ static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* EEEE persistent selected-task VA provider                                 */
+/* ------------------------------------------------------------------------- */
+
+/* These records model the reference host task address space, not a transient
+ * generic GPA mapping.  An allocation reserves one contiguous host VA range;
+ * aliases replace subranges of it with the exact shared QEMU RAM backing.
+ * Each alias owns one MemoryRegion reference independently of the QMetal
+ * provider's unique-region reference, so the provider may release its own
+ * region set before it asks us to deallocate the task. */
+typedef struct AgfxEeeeTaskAllocation {
+    uint64_t address;
+    uint64_t requested_length;
+    uint64_t mapped_length;
+} AgfxEeeeTaskAllocation;
+
+typedef struct AgfxEeeeTaskAlias {
+    uint64_t address;
+    uint64_t length;
+    uint64_t region_offset;
+    MemoryRegion *region;
+} AgfxEeeeTaskAlias;
+
+static G_NORETURN void agfx_eeee_task_contract_violation(const char *operation,
+                                                         const char *detail)
+{
+    error_report("apple-gfx-ml EEEE task provider %s: %s", operation, detail);
+    abort();
+}
+
+static AppleGfxMLState *agfx_eeee_task_state(void *ctx, const char *operation)
+{
+    AppleGfxMLState *s = ctx;
+
+    if (!s || !s->eeee_task_registry || !s->eeee_task_allocations ||
+        !s->eeee_task_aliases) {
+        agfx_eeee_task_contract_violation(operation,
+                                          "uninitialized provider state");
+    }
+    return s;
+}
+
+static bool agfx_eeee_task_round_length(uint64_t length, uint64_t page_size,
+                                        uint64_t *rounded)
+{
+    const uint64_t mask = page_size - 1;
+
+    if (!length || !page_size || (page_size & mask) ||
+        length > UINT64_MAX - mask) {
+        return false;
+    }
+    *rounded = (length + mask) & ~mask;
+    return *rounded <= SIZE_MAX;
+}
+
+static bool agfx_eeee_task_range_contains(const AgfxEeeeTaskAllocation *range,
+                                          uint64_t address, uint64_t length)
+{
+    if (!length || address < range->address) {
+        return false;
+    }
+    const uint64_t offset = address - range->address;
+
+    return offset <= range->requested_length &&
+           length <= range->requested_length - offset;
+}
+
+static AgfxEeeeTaskAllocation *
+agfx_eeee_task_find_containing_locked(AppleGfxMLState *s, uint64_t address,
+                                      uint64_t length)
+{
+    for (guint i = 0; i < s->eeee_task_allocations->len; ++i) {
+        AgfxEeeeTaskAllocation *range =
+            g_ptr_array_index(s->eeee_task_allocations, i);
+        if (agfx_eeee_task_range_contains(range, address, length)) {
+            return range;
+        }
+    }
+    return NULL;
+}
+
+static AgfxEeeeTaskAllocation *
+agfx_eeee_task_find_exact_locked(AppleGfxMLState *s, uint64_t address,
+                                 uint64_t requested_length)
+{
+    for (guint i = 0; i < s->eeee_task_allocations->len; ++i) {
+        AgfxEeeeTaskAllocation *range =
+            g_ptr_array_index(s->eeee_task_allocations, i);
+        if (range->address == address &&
+            range->requested_length == requested_length) {
+            return range;
+        }
+    }
+    return NULL;
+}
+
+static AgfxEeeeTaskAlias *
+agfx_eeee_task_find_alias_locked(AppleGfxMLState *s, uint64_t address)
+{
+    for (guint i = 0; i < s->eeee_task_aliases->len; ++i) {
+        AgfxEeeeTaskAlias *alias =
+            g_ptr_array_index(s->eeee_task_aliases, i);
+        if (address >= alias->address &&
+            address - alias->address < alias->length) {
+            return alias;
+        }
+    }
+    return NULL;
+}
+
+/* Replace [address, address + length) in the task alias ledger.  The caller
+ * holds eeee_task_mutex.  A NULL replacement represents the reference fresh
+ * zero-page overwrite after unmap.  replacement_ref_owned means the caller
+ * has already retained replacement_region while it was RCU-protected. */
+static void
+agfx_eeee_task_replace_alias_locked(AppleGfxMLState *s, uint64_t address,
+                                    uint64_t length,
+                                    MemoryRegion *replacement_region,
+                                    uint64_t replacement_offset,
+                                    bool replacement_ref_owned)
+{
+    const uint64_t end = address + length;
+
+    g_assert(end > address);
+    for (guint i = s->eeee_task_aliases->len; i > 0; --i) {
+        const guint index = i - 1;
+        AgfxEeeeTaskAlias *old = g_ptr_array_index(s->eeee_task_aliases,
+                                                    index);
+        const uint64_t old_end = old->address + old->length;
+
+        g_assert(old_end > old->address);
+        if (old_end <= address || old->address >= end) {
+            continue;
+        }
+
+        const bool has_prefix = old->address < address;
+        const bool has_suffix = old_end > end;
+        if (has_prefix && has_suffix) {
+            AgfxEeeeTaskAlias *suffix = g_new(AgfxEeeeTaskAlias, 1);
+
+            *suffix = (AgfxEeeeTaskAlias) {
+                .address = end,
+                .length = old_end - end,
+                .region_offset = old->region_offset + (end - old->address),
+                .region = old->region,
+            };
+            /* The original record retains one reference; the split creates
+             * one further independently-live alias. */
+            memory_region_ref(suffix->region);
+            old->length = address - old->address;
+            g_ptr_array_add(s->eeee_task_aliases, suffix);
+        } else if (has_prefix) {
+            old->length = address - old->address;
+        } else if (has_suffix) {
+            old->region_offset += end - old->address;
+            old->address = end;
+            old->length = old_end - end;
+        } else {
+            memory_region_unref(old->region);
+            g_free(old);
+            g_ptr_array_remove_index_fast(s->eeee_task_aliases, index);
+        }
+    }
+
+    if (replacement_region) {
+        AgfxEeeeTaskAlias *replacement = g_new(AgfxEeeeTaskAlias, 1);
+
+        if (!replacement_ref_owned) {
+            memory_region_ref(replacement_region);
+        }
+        *replacement = (AgfxEeeeTaskAlias) {
+            .address = address,
+            .length = length,
+            .region_offset = replacement_offset,
+            .region = replacement_region,
+        };
+        g_ptr_array_add(s->eeee_task_aliases, replacement);
+    }
+}
+
+static int qemu_eeee_task_allocate(void *ctx, uint64_t *address,
+                                   uint64_t length, uint32_t placement)
+{
+    AppleGfxMLState *s = agfx_eeee_task_state(ctx, "allocate");
+    const uint64_t page_size = qemu_real_host_page_size();
+    uint64_t mapped_length;
+    void *mapping;
+
+    if (!address || !agfx_eeee_task_round_length(length, page_size,
+                                                  &mapped_length)) {
+        return 0; /* Source VM allocation failure. */
+    }
+
+    switch (placement) {
+    case QMU_EEEE_TASK_ALLOCATE_ANYWHERE: {
+        AgfxEeeeTaskAllocation *range;
+
+        mapping = mmap(NULL, mapped_length, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) {
+            return 0;
+        }
+        range = g_new(AgfxEeeeTaskAllocation, 1);
+        *range = (AgfxEeeeTaskAllocation) {
+            .address = (uint64_t)(uintptr_t)mapping,
+            .requested_length = length,
+            .mapped_length = mapped_length,
+        };
+        qemu_mutex_lock(&s->eeee_task_mutex);
+        g_ptr_array_add(s->eeee_task_allocations, range);
+        qemu_mutex_unlock(&s->eeee_task_mutex);
+        *address = range->address;
+        return 1;
+    }
+    case QMU_EEEE_TASK_ALLOCATE_FIXED_OVERWRITE:
+        if (*address & (page_size - 1) || length & (page_size - 1) ||
+            *address > UINT64_MAX - length) {
+            return 0;
+        }
+        qemu_mutex_lock(&s->eeee_task_mutex);
+        if (!agfx_eeee_task_find_containing_locked(s, *address, length)) {
+            qemu_mutex_unlock(&s->eeee_task_mutex);
+            return 0;
+        }
+        mapping = mmap((void *)(uintptr_t)*address, length,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (mapping == MAP_FAILED || (uint64_t)(uintptr_t)mapping != *address) {
+            qemu_mutex_unlock(&s->eeee_task_mutex);
+            return 0;
+        }
+        agfx_eeee_task_replace_alias_locked(s, *address, length, NULL, 0,
+                                            false);
+        qemu_mutex_unlock(&s->eeee_task_mutex);
+        return 1;
+    default:
+        agfx_eeee_task_contract_violation("allocate", "unknown placement");
+    }
+    return 0; /* agfx_eeee_task_contract_violation() does not return. */
+}
+
+static int qemu_eeee_task_remap_shared_fixed_overwrite(
+    void *ctx, uint64_t *address, uint64_t length, uint64_t mask,
+    uint64_t source, int *current_protection, int *maximum_protection)
+{
+    AppleGfxMLState *s = agfx_eeee_task_state(ctx, "remap");
+    const uint64_t page_size = qemu_real_host_page_size();
+    ram_addr_t ram_offset;
+    MemoryRegion *region;
+    RAMBlock *ram_block;
+    uint64_t file_offset;
+    int fd;
+    void *mapping;
+
+    /* The QMetal provider calls this while it owns eeee_task_mutex through
+     * task_lock(), exactly as the reference task mapper owns task_mutex. */
+    if (!address || !length || mask != page_size - 1 ||
+        (*address & mask) || (length & mask) || (*address > UINT64_MAX - length) ||
+        source > UINTPTR_MAX || (source & mask)) {
+        return 0;
+    }
+    if (!agfx_eeee_task_find_containing_locked(s, *address, length)) {
+        return 0;
+    }
+
+    rcu_read_lock();
+    region = memory_region_from_host((void *)(uintptr_t)source, &ram_offset);
+    ram_block = qemu_ram_block_from_host((void *)(uintptr_t)source, false,
+                                         &ram_offset);
+    if (!region || !ram_block || region != ram_block->mr ||
+        !memory_access_is_direct(region, true, MEMTXATTRS_UNSPECIFIED) ||
+        !qemu_ram_is_shared(ram_block) ||
+        ram_offset > qemu_ram_get_used_length(ram_block) ||
+        length > qemu_ram_get_used_length(ram_block) - ram_offset ||
+        qemu_ram_get_fd_offset(ram_block) > UINT64_MAX - ram_offset) {
+        rcu_read_unlock();
+        return 0;
+    }
+    fd = memory_region_get_fd(region);
+    file_offset = qemu_ram_get_fd_offset(ram_block) + ram_offset;
+    if (fd < 0 || fd != qemu_ram_get_fd(ram_block) ||
+        file_offset > INT64_MAX || (file_offset & mask)) {
+        rcu_read_unlock();
+        return 0;
+    }
+    mapping = mmap((void *)(uintptr_t)*address, length,
+                   PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd,
+                   (off_t)file_offset);
+    if (mapping == MAP_FAILED || (uint64_t)(uintptr_t)mapping != *address) {
+        rcu_read_unlock();
+        return 0;
+    }
+    /* This is the alias ledger's own reference.  It must be acquired while
+     * the RAMBlock lookup is RCU-protected and outlive QMetal's later release
+     * of its unique region set. */
+    memory_region_ref(region);
+    rcu_read_unlock();
+
+    agfx_eeee_task_replace_alias_locked(s, *address, length, region,
+                                        ram_offset, true);
+    if (current_protection) {
+        *current_protection = PROT_READ | PROT_WRITE;
+    }
+    if (maximum_protection) {
+        *maximum_protection = PROT_READ | PROT_WRITE;
+    }
+    return 1;
+}
+
+static int qemu_eeee_task_deallocate(void *ctx, uint64_t address,
+                                     uint64_t length)
+{
+    AppleGfxMLState *s = agfx_eeee_task_state(ctx, "deallocate");
+    AgfxEeeeTaskAllocation *range;
+
+    qemu_mutex_lock(&s->eeee_task_mutex);
+    range = agfx_eeee_task_find_exact_locked(s, address, length);
+    if (!range) {
+        qemu_mutex_unlock(&s->eeee_task_mutex);
+        agfx_eeee_task_contract_violation("deallocate",
+                                          "unknown task allocation");
+    }
+    for (guint i = s->eeee_task_aliases->len; i > 0; --i) {
+        const guint index = i - 1;
+        AgfxEeeeTaskAlias *alias = g_ptr_array_index(s->eeee_task_aliases,
+                                                      index);
+        const uint64_t allocation_end = range->address + range->mapped_length;
+        const uint64_t alias_end = alias->address + alias->length;
+
+        if (alias->address < allocation_end && alias_end > range->address) {
+            memory_region_unref(alias->region);
+            g_free(alias);
+            g_ptr_array_remove_index_fast(s->eeee_task_aliases, index);
+        }
+    }
+    if (munmap((void *)(uintptr_t)range->address, range->mapped_length) != 0) {
+        qemu_mutex_unlock(&s->eeee_task_mutex);
+        agfx_eeee_task_contract_violation("deallocate", "munmap failed");
+    }
+    for (guint i = 0; i < s->eeee_task_allocations->len; ++i) {
+        if (g_ptr_array_index(s->eeee_task_allocations, i) == range) {
+            g_ptr_array_remove_index_fast(s->eeee_task_allocations, i);
+            break;
+        }
+    }
+    qemu_mutex_unlock(&s->eeee_task_mutex);
+    g_free(range);
+    return 0;
+}
+
+static uint64_t qemu_eeee_task_host_page_size(void *ctx)
+{
+    (void)agfx_eeee_task_state(ctx, "host_page_size");
+    return qemu_real_host_page_size();
+}
+
+static void qemu_eeee_task_rcu_enter(void *ctx)
+{
+    (void)agfx_eeee_task_state(ctx, "rcu_enter");
+    rcu_read_lock();
+}
+
+static void qemu_eeee_task_rcu_leave(void *ctx)
+{
+    (void)agfx_eeee_task_state(ctx, "rcu_leave");
+    rcu_read_unlock();
+}
+
+static void qemu_eeee_task_lock(void *ctx)
+{
+    AppleGfxMLState *s = agfx_eeee_task_state(ctx, "task_lock");
+    qemu_mutex_lock(&s->eeee_task_mutex);
+}
+
+static void qemu_eeee_task_unlock(void *ctx)
+{
+    AppleGfxMLState *s = agfx_eeee_task_state(ctx, "task_unlock");
+    qemu_mutex_unlock(&s->eeee_task_mutex);
+}
+
+static int qemu_eeee_task_translate(void *ctx, uint64_t gpa, uint64_t length,
+                                    int write, void **region_out,
+                                    uint64_t *region_offset,
+                                    uint64_t *covered)
+{
+    MemoryRegion *region;
+    hwaddr translated = 0;
+    hwaddr translated_length = length;
+
+    (void)agfx_eeee_task_state(ctx, "translate");
+    if (!length || !region_out || !region_offset || !covered) {
+        return 0;
+    }
+    rcu_read_lock();
+    region = address_space_translate(&address_space_memory, gpa, &translated,
+                                     &translated_length, write != 0,
+                                     MEMTXATTRS_UNSPECIFIED);
+    if (!region || !memory_access_is_direct(region, write != 0,
+                                             MEMTXATTRS_UNSPECIFIED)) {
+        rcu_read_unlock();
+        return 0;
+    }
+    *region_out = region;
+    *region_offset = translated;
+    *covered = translated_length;
+    rcu_read_unlock();
+    return 1;
+}
+
+static int qemu_eeee_task_direct(void *ctx, void *opaque_region, int write)
+{
+    MemoryRegion *region = opaque_region;
+
+    (void)agfx_eeee_task_state(ctx, "direct");
+    return region && memory_access_is_direct(region, write != 0,
+                                             MEMTXATTRS_UNSPECIFIED);
+}
+
+static void *qemu_eeee_task_ram_pointer(void *ctx, void *opaque_region)
+{
+    MemoryRegion *region = opaque_region;
+
+    (void)agfx_eeee_task_state(ctx, "ram_pointer");
+    if (!region) {
+        agfx_eeee_task_contract_violation("ram_pointer", "NULL region token");
+    }
+    return memory_region_get_ram_ptr(region);
+}
+
+static void qemu_eeee_task_region_ref(void *ctx, void *opaque_region)
+{
+    MemoryRegion *region = opaque_region;
+
+    (void)agfx_eeee_task_state(ctx, "region_ref");
+    if (!region) {
+        agfx_eeee_task_contract_violation("region_ref", "NULL region token");
+    }
+    memory_region_ref(region);
+}
+
+static void qemu_eeee_task_region_unref(void *ctx, void *opaque_region)
+{
+    MemoryRegion *region = opaque_region;
+
+    (void)agfx_eeee_task_state(ctx, "region_unref");
+    if (!region) {
+        agfx_eeee_task_contract_violation("region_unref", "NULL region token");
+    }
+    memory_region_unref(region);
+}
+
+static void qemu_eeee_task_publish(void *ctx, void *task)
+{
+    AppleGfxMLState *s = agfx_eeee_task_state(ctx, "publish");
+
+    if (!task || !g_hash_table_add(s->eeee_task_registry, task)) {
+        agfx_eeee_task_contract_violation("publish", "duplicate or NULL task");
+    }
+}
+
+static void qemu_eeee_task_remove(void *ctx, void *task)
+{
+    AppleGfxMLState *s = agfx_eeee_task_state(ctx, "remove");
+
+    if (!task || !g_hash_table_remove(s->eeee_task_registry, task)) {
+        agfx_eeee_task_contract_violation("remove", "unknown or NULL task");
+    }
+}
+
+static void qemu_eeee_task_host_write(void *ctx, uint64_t address,
+                                      uint64_t length)
+{
+    AppleGfxMLState *s = agfx_eeee_task_state(ctx, "host_write");
+    uint64_t cursor;
+    const uint64_t end = address + length;
+
+    if (!length || end <= address) {
+        agfx_eeee_task_contract_violation("host_write", "invalid task range");
+    }
+    qemu_mutex_lock(&s->eeee_task_mutex);
+    if (!agfx_eeee_task_find_containing_locked(s, address, length)) {
+        qemu_mutex_unlock(&s->eeee_task_mutex);
+        agfx_eeee_task_contract_violation("host_write",
+                                          "range outside task allocation");
+    }
+    cursor = address;
+    while (cursor < end) {
+        AgfxEeeeTaskAlias *alias = agfx_eeee_task_find_alias_locked(s, cursor);
+
+        if (alias) {
+            const uint64_t alias_end = alias->address + alias->length;
+            const uint64_t chunk = MIN(alias_end - cursor, end - cursor);
+
+            memory_region_set_dirty(alias->region,
+                                    alias->region_offset +
+                                        (cursor - alias->address),
+                                    chunk);
+            cursor += chunk;
+        } else {
+            /* The reference fixed-overwrite unmap replaces this subrange with
+             * new zero pages.  It has no guest-RAM dirty edge. */
+            uint64_t next = end;
+            for (guint i = 0; i < s->eeee_task_aliases->len; ++i) {
+                AgfxEeeeTaskAlias *candidate =
+                    g_ptr_array_index(s->eeee_task_aliases, i);
+                if (candidate->address > cursor && candidate->address < next) {
+                    next = candidate->address;
+                }
+            }
+            cursor = next;
+        }
+    }
+    qemu_mutex_unlock(&s->eeee_task_mutex);
+}
+
+static void qemu_eeee_task_fatal(void *ctx, uint32_t reason)
+{
+    (void)agfx_eeee_task_state(ctx, "fatal");
+    switch (reason) {
+    case QMU_EEEE_TASK_FATAL_ALLOCATION:
+        agfx_eeee_task_contract_violation("fatal", "allocation failure");
+    case QMU_EEEE_TASK_FATAL_REMAP:
+        agfx_eeee_task_contract_violation("fatal", "shared remap failure");
+    case QMU_EEEE_TASK_FATAL_UNMAP:
+        agfx_eeee_task_contract_violation("fatal", "fixed unmap failure");
+    default:
+        agfx_eeee_task_contract_violation("fatal", "unknown fatal reason");
+    }
+}
+
+static void agfx_eeee_task_state_init(AppleGfxMLState *s)
+{
+    qemu_mutex_init(&s->eeee_task_mutex);
+    s->eeee_task_registry = g_hash_table_new(g_direct_hash, g_direct_equal);
+    s->eeee_task_allocations = g_ptr_array_new();
+    s->eeee_task_aliases = g_ptr_array_new();
+}
+
+static void agfx_eeee_task_state_destroy(AppleGfxMLState *s)
+{
+    qemu_mutex_lock(&s->eeee_task_mutex);
+    if (g_hash_table_size(s->eeee_task_registry) ||
+        s->eeee_task_allocations->len || s->eeee_task_aliases->len) {
+        qemu_mutex_unlock(&s->eeee_task_mutex);
+        agfx_eeee_task_contract_violation("destroy",
+                                          "live task, allocation or alias");
+    }
+    g_hash_table_destroy(s->eeee_task_registry);
+    g_ptr_array_free(s->eeee_task_allocations, true);
+    g_ptr_array_free(s->eeee_task_aliases, true);
+    s->eeee_task_registry = NULL;
+    s->eeee_task_allocations = NULL;
+    s->eeee_task_aliases = NULL;
+    qemu_mutex_unlock(&s->eeee_task_mutex);
+    qemu_mutex_destroy(&s->eeee_task_mutex);
+}
+
 /* ============================================================
  * DMA via BH+QemuEvent (reference: apple-gfx.m:2135-2168)
  * "Performing DMA requires BQL, so do it in a BH"
@@ -18702,6 +19260,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     
     qemu_mutex_init(&s->mmio_job_mutex);
     qemu_mutex_init(&s->session_mutex);
+    agfx_eeee_task_state_init(s);
     qemu_mutex_init(&s->completion_mutex);
     qemu_mutex_init(&s->bootstrap_present_mutex);
     qemu_cond_init(&s->bootstrap_present_cond);
@@ -18729,6 +19288,9 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     
     /* Create qmetal device with callbacks */
     qmu_extended_callbacks qmu_callbacks = {
+        .abi_magic = QMU_EXTENDED_CALLBACKS_ABI_MAGIC,
+        .abi_version = QMU_EXTENDED_ABI_VERSION,
+        .struct_size = sizeof(qmu_extended_callbacks),
         .user_ctx = s,
         .map_gpa = qemu_map_gpa,
         .unmap_gpa = qemu_unmap_gpa,
@@ -18755,9 +19317,31 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .new_frame_signal = qemu_new_frame_signal,
         .frame_completed = NULL,
         .render_frame_complete = qemu_render_frame_complete,
+        /* Complete persistent selected-task provider bridge.  QMetal may
+         * construct its adapter only after it has verified all 17 entries. */
+        .eeee_task_allocate = qemu_eeee_task_allocate,
+        .eeee_task_remap_shared_fixed_overwrite =
+            qemu_eeee_task_remap_shared_fixed_overwrite,
+        .eeee_task_deallocate = qemu_eeee_task_deallocate,
+        .eeee_task_host_page_size = qemu_eeee_task_host_page_size,
+        .eeee_task_rcu_enter = qemu_eeee_task_rcu_enter,
+        .eeee_task_rcu_leave = qemu_eeee_task_rcu_leave,
+        .eeee_task_lock = qemu_eeee_task_lock,
+        .eeee_task_unlock = qemu_eeee_task_unlock,
+        .eeee_task_translate = qemu_eeee_task_translate,
+        .eeee_task_direct = qemu_eeee_task_direct,
+        .eeee_task_ram_pointer = qemu_eeee_task_ram_pointer,
+        .eeee_task_region_ref = qemu_eeee_task_region_ref,
+        .eeee_task_region_unref = qemu_eeee_task_region_unref,
+        .eeee_task_publish = qemu_eeee_task_publish,
+        .eeee_task_remove = qemu_eeee_task_remove,
+        .eeee_task_host_write = qemu_eeee_task_host_write,
+        .eeee_task_fatal = qemu_eeee_task_fatal,
     };
 
     qmu_extended_config qmu_config = {
+        .abi_magic = QMU_EXTENDED_CONFIG_ABI_MAGIC,
+        .abi_version = QMU_EXTENDED_ABI_VERSION,
         .struct_size = sizeof(qmu_extended_config),
         .ram_base = 0,
         .ram_size = 0,  /* No restriction */
@@ -18872,6 +19456,10 @@ static void agfx_exit(PCIDevice *pci_dev)
         qmu_destroy(s->qmu_dev);
         s->qmu_dev = NULL;
     }
+    /* qmu_destroy must have torn down every selected-task provider before its
+     * host state can disappear.  The helper fail-closes instead of letting a
+     * stale direct alias or region reference escape device teardown. */
+    agfx_eeee_task_state_destroy(s);
 
     if (s->completion_bh) {
         qemu_bh_delete(s->completion_bh);

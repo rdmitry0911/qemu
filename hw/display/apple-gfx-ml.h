@@ -352,6 +352,16 @@ struct AppleGfxMLState {
     QemuMutex session_mutex;   /* Serializes wrapper-owned owner-render capture/submit */
     int mmio_wait_active;      /* Main thread is inside AIO_WAIT_WHILE for MMIO */
 
+    /* EEEE selected-task provider state.  The task VA ledger is deliberately
+     * separate from generic map_gpa(): a task VA remains valid through its
+     * allocation lifetime and each alias retains its QEMU MemoryRegion until
+     * the exact fixed-overwrite/deallocation edge removes it.  The concrete
+     * GLib types stay private to apple-gfx-ml.c. */
+    QemuMutex eeee_task_mutex;
+    struct _GHashTable *eeee_task_registry;
+    struct _GPtrArray *eeee_task_allocations;
+    struct _GPtrArray *eeee_task_aliases;
+
     /* Reference PGDisplayDescriptor.queue publishes one callback item at a time
      * on a serial host queue. Keep FIFO ordering without collapsing several
      * queued items into one BH drain. */
