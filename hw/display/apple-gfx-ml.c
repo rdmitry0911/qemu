@@ -17107,6 +17107,44 @@ static int qemu_eeee_task_remap_shared_fixed_overwrite(
     return 1;
 }
 
+static int qemu_eeee_task_protect(void *ctx, uint64_t address,
+                                  uint64_t length, uint32_t protection)
+{
+    AppleGfxMLState *s = agfx_eeee_task_state(ctx, "protect");
+    const uint64_t page_size = qemu_real_host_page_size();
+    int native_protection;
+
+    /* QMetal performs this after all fixed remaps while it owns
+     * eeee_task_mutex through task_lock().  It must stay in the same provider
+     * transaction as the alias ledger; taking the non-recursive mutex again
+     * would deadlock that source order. */
+    switch (protection) {
+    case QMU_EEEE_TASK_PROTECT_NONE:
+        native_protection = PROT_NONE;
+        break;
+    case QMU_EEEE_TASK_PROTECT_READ_ONLY:
+        native_protection = PROT_READ;
+        break;
+    case QMU_EEEE_TASK_PROTECT_READ_WRITE:
+        native_protection = PROT_READ | PROT_WRITE;
+        break;
+    default:
+        agfx_eeee_task_contract_violation("protect", "unknown protection");
+    }
+    if (length == 0) {
+        /* PGMemoryMap still executes its final mach_vm_protect after a
+         * zero-total range list.  There is no Linux mapping side effect for
+         * a zero length, so preserve its successful no-op outcome. */
+        return 1;
+    }
+    if ((address & (page_size - 1)) || (length & (page_size - 1)) ||
+        address > UINT64_MAX - length ||
+        !agfx_eeee_task_find_containing_locked(s, address, length)) {
+        return 0;
+    }
+    return mprotect((void *)(uintptr_t)address, length, native_protection) == 0;
+}
+
 static int qemu_eeee_task_deallocate(void *ctx, uint64_t address,
                                      uint64_t length)
 {
@@ -19318,10 +19356,11 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .frame_completed = NULL,
         .render_frame_complete = qemu_render_frame_complete,
         /* Complete persistent selected-task provider bridge.  QMetal may
-         * construct its adapter only after it has verified all 17 entries. */
+         * construct its adapter only after it has verified all 18 entries. */
         .eeee_task_allocate = qemu_eeee_task_allocate,
         .eeee_task_remap_shared_fixed_overwrite =
             qemu_eeee_task_remap_shared_fixed_overwrite,
+        .eeee_task_protect = qemu_eeee_task_protect,
         .eeee_task_deallocate = qemu_eeee_task_deallocate,
         .eeee_task_host_page_size = qemu_eeee_task_host_page_size,
         .eeee_task_rcu_enter = qemu_eeee_task_rcu_enter,
