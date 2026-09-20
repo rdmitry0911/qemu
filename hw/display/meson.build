@@ -92,51 +92,47 @@ else
     cc = meson.get_compiler('c')
 
     # ──────────────── mlapi/qmetal unified ────────────────
-    # pvg-host removed — qmetal uses direct unified API (qmu_*)
-    mlapi_dep = dependency('mlapi', required: false, static: false)
+    # This device is valid only with the reviewed QMetal tree and its exact
+    # build output.  A host-installed mlapi or a neighboring source checkout
+    # would make the QEMU/QMetal ABI unprovable, so neither is a fallback.
+    qmetal_source_dir = get_option('apple_virgl_qmetal_source_dir')
+    qmetal_build_dir = get_option('apple_virgl_qmetal_build_dir')
 
-    if not mlapi_dep.found()
-        qmetal_source_dir = get_option('apple_virgl_qmetal_source_dir')
-        qmetal_build_dir = get_option('apple_virgl_qmetal_build_dir')
-
-        if qmetal_source_dir == ''
-            qmetal_source_dir = meson.current_source_dir() / '../../../qmetal'
-        endif
-        if qmetal_build_dir == ''
-            qmetal_build_dir = join_paths(qmetal_source_dir, 'build')
-        endif
-
-        # Include directories: qmetal unified API + pvg protocol headers
-        mlapi_inc = include_directories(
-            join_paths(qmetal_source_dir, 'include'),
-            join_paths(qmetal_source_dir, 'include/pvg')
-        )
-        mlapi_dir = qmetal_build_dir
-        mlapi_lib_so = mlapi_dir / 'libmlapi.so'
-
-        if not fs.exists(mlapi_lib_so)
-            error('mlapi shared library not found.\n' +
-                  'Expected: ' + mlapi_lib_so + '\n' +
-                  'Build it first, e.g.:\n' +
-                  '  cd qmetal && cmake -S . -B build && cmake --build build')
-        endif
-
-        vulkan_dep = dependency('vulkan', required: true)
-
-        mlapi_lib = cc.find_library(
-            'mlapi',
-            dirs: [mlapi_dir],
-            required: true,
-            static: false
-        )
-
-        mlapi_dep = declare_dependency(
-            include_directories: mlapi_inc,
-            dependencies: [mlapi_lib, vulkan_dep],
-            link_args: ['-Wl,-rpath,' + mlapi_dir],
-        )
-        message('Using mlapi/qmetal unified: ' + mlapi_lib_so)
+    if qmetal_source_dir == '' or qmetal_build_dir == ''
+        error('apple-gfx-ml requires explicit -Dapple_virgl_qmetal_source_dir ' +
+              'and -Dapple_virgl_qmetal_build_dir')
     endif
+
+    qmetal_header = qmetal_source_dir / 'include/qmu/qmetal_unified.h'
+    qmetal_pvg_header = qmetal_source_dir / 'include/pvg/pvg_fifo.h'
+    mlapi_lib_so = qmetal_build_dir / 'libmlapi.so'
+    if not fs.exists(qmetal_header)
+        error('reviewed QMetal unified header not found: ' + qmetal_header)
+    endif
+    if not fs.exists(qmetal_pvg_header)
+        error('reviewed QMetal PVG header not found: ' + qmetal_pvg_header)
+    endif
+    if not fs.exists(mlapi_lib_so)
+        error('reviewed QMetal shared library not found: ' + mlapi_lib_so)
+    endif
+
+    mlapi_inc = include_directories(
+        qmetal_source_dir / 'include',
+        qmetal_source_dir / 'include/pvg'
+    )
+    vulkan_dep = dependency('vulkan', required: true)
+    mlapi_lib = cc.find_library(
+        'mlapi',
+        dirs: [qmetal_build_dir],
+        required: true,
+        static: false
+    )
+    mlapi_dep = declare_dependency(
+        include_directories: mlapi_inc,
+        dependencies: [mlapi_lib, vulkan_dep],
+        link_args: ['-Wl,-rpath,' + qmetal_build_dir],
+    )
+    message('Using reviewed mlapi/qmetal unified: ' + mlapi_lib_so)
 
     apple_gfx_ml_ss.add(mlapi_dep)
 
