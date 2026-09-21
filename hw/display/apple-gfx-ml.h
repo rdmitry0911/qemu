@@ -20,6 +20,7 @@
 
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
+typedef struct AgfxEeeeProviderState AgfxEeeeProviderState;
 struct AppleGfxMLFrameCompletionJob;
 struct AgfxBootstrapPresentCommand;
 typedef struct ThreadPool ThreadPool;
@@ -65,6 +66,10 @@ struct AppleGfxMLState {
 
     /* QMetal unified library handle - contains ALL protocol logic */
     qmu_session *qmu_dev;
+
+    /* Reserved for the indivisible EEEE provider/session cutover.  It is not
+     * initialized or passed to QMetal by the legacy path. */
+    AgfxEeeeProviderState *eeee_provider_state;
 
     /* QEMU display */
     QemuConsole *con;
