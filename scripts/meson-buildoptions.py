@@ -28,6 +28,8 @@ import sys
 # Options with nonstandard names (e.g. --with/--without) or OS-dependent
 # defaults.  Try not to add any.
 SKIP_OPTIONS = {
+    "apple_virgl_qmetal_build_dir",
+    "apple_virgl_qmetal_source_dir",
     "default_devices",
     "fuzzing_engine",
 }

@@ -92,46 +92,42 @@ else
         'apple-gfx-eeee-process-vm.c',
     ))
 
-    cc = meson.get_compiler('c')
-
     # ──────────────── mlapi/qmetal unified ────────────────
-    # pvg-host removed — qmetal uses direct unified API (qmu_*)
-    mlapi_dep = dependency('mlapi', required: false, static: false)
-
-    if not mlapi_dep.found()
-        # Include directories: qmetal unified API + pvg protocol headers
-        mlapi_inc = include_directories(
-            '../../../qmetal/include',
-            '../../../qmetal/include/pvg'
-        )
-        mlapi_dir = meson.current_source_dir() / '../../../qmetal/build'
-        mlapi_lib_so = mlapi_dir / 'libmlapi.so'
-
-        if not fs.exists(mlapi_lib_so)
-            error('mlapi shared library not found.\n' +
-                  'Expected: ' + mlapi_lib_so + '\n' +
-                  'Build it first, e.g.:\n' +
-                  '  cd qmetal && cmake -S . -B build && cmake --build build')
+    # This device is valid only with the reviewed QMetal source and its exact
+    # build output.  A host-installed mlapi or a neighboring checkout would
+    # make the QEMU/QMetal ABI unprovable, so neither is a fallback.
+    if config_all_devices.has_key('CONFIG_APPLE_GFX_ML')
+        qmetal_source_dir = get_option('apple_virgl_qmetal_source_dir')
+        qmetal_build_dir = get_option('apple_virgl_qmetal_build_dir')
+        if qmetal_source_dir == '' or qmetal_build_dir == ''
+            error('apple-gfx-ml requires explicit -Dapple_virgl_qmetal_source_dir ' +
+                  'and -Dapple_virgl_qmetal_build_dir')
+        endif
+        if not qmetal_source_dir.startswith('/') or not qmetal_build_dir.startswith('/')
+            error('Apple GFX ML QMetal source and build directories must be absolute')
+        endif
+        qmetal_header = qmetal_source_dir / 'include/qmu/qmetal_unified.h'
+        qmetal_pvg_header = qmetal_source_dir / 'include/pvg/pvg_fifo.h'
+        mlapi_lib_so = qmetal_build_dir / 'libmlapi.so'
+        if not fs.is_dir(qmetal_source_dir) or not fs.is_dir(qmetal_build_dir) or \
+           not fs.exists(qmetal_header) or not fs.exists(qmetal_pvg_header) or not fs.exists(mlapi_lib_so)
+            error('Apple GFX ML reviewed QMetal tuple is incomplete: source=' +
+                  qmetal_source_dir + ' build=' + qmetal_build_dir)
         endif
 
         vulkan_dep = dependency('vulkan', required: true)
-
-        mlapi_lib = cc.find_library(
-            'mlapi',
-            dirs: [mlapi_dir],
-            required: true,
-            static: false
+        mlapi_inc = include_directories(
+            qmetal_source_dir / 'include',
+            qmetal_source_dir / 'include/pvg'
         )
-
         mlapi_dep = declare_dependency(
             include_directories: mlapi_inc,
-            dependencies: [mlapi_lib, vulkan_dep],
-            link_args: ['-Wl,-rpath,' + mlapi_dir],
+            dependencies: [vulkan_dep],
+            link_args: [mlapi_lib_so, '-Wl,-rpath,' + qmetal_build_dir],
         )
-        message('Using mlapi/qmetal unified: ' + mlapi_lib_so)
+        apple_gfx_ml_ss.add(mlapi_dep)
+        message('Using reviewed Apple GFX ML QMetal tuple: ' + mlapi_lib_so)
     endif
-
-    apple_gfx_ml_ss.add(mlapi_dep)
 
     system_ss.add_all(when: 'CONFIG_APPLE_GFX_ML', if_true: apple_gfx_ml_ss)
 
