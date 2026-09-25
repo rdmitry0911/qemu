@@ -58,8 +58,6 @@ void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
  * hides the per-target ioctl declaration. The diagnostic is x86/KVM-only and
  * calls the same exported helper used by target code. */
 int kvm_vcpu_ioctl(CPUState *cpu, unsigned long type, ...);
-qmu_status qmu_debug_translate_gpu_va(qmu_session *s, uint32_t task_id,
-                                      uint64_t gpu_va, uint64_t *out_gpa);
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
 typedef struct AgfxLogEntry AgfxLogEntry;
 typedef struct AppleGfxMLFrameCompletionJob AppleGfxMLFrameCompletionJob;
@@ -646,8 +644,8 @@ static const char *agfx_mmio_offset_name(uint64_t offset)
         return "DISPLAY_IRQ";
     case PVG_REG_PENDING_COMP:
         return "PENDING_COMP";
-    case PVG_REG_TRANSACTION_ID:
-        return "TRANSACTION_ID";
+    case PVG_REG_RESUME_CHILD_FIFO:
+        return "RESUME_CHILD_FIFO";
     case PVG_REG_FAULT_STATUS:
         return "FAULT_STATUS";
     case PVG_REG_FIFO_PFN:
@@ -696,7 +694,7 @@ static bool agfx_mmio_roundtrip_interesting(uint64_t offset)
     case PVG_REG_EVENT_STAMPS:
     case PVG_REG_DISPLAY_IRQ:
     case PVG_REG_PENDING_COMP:
-    case PVG_REG_TRANSACTION_ID:
+    case PVG_REG_RESUME_CHILD_FIFO:
         return true;
     default:
         return false;
