@@ -4379,6 +4379,18 @@ foreach target : target_dirs
       'sources': [main_rs, files('system/main.c')],
       'dependencies': [sdl]
     }]
+    # Isolated CPU/native-VM component: use the actual system memory/QOM
+    # objects and carrier, without realizing an apple-gfx device or GPU session.
+    if host_os == 'linux' and target_name == 'x86_64' and \
+       'CONFIG_APPLE_GFX_ML' in config_target
+      execs += [{
+        'name': 'test-apple-gfx-eeee-process-vm',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-eeee-process-vm.c'),
+        'dependencies': [],
+        'install': false,
+      }]
+    endif
     if host_os == 'windows' and (sdl.found() or gtk.found())
       execs += [{
         'name': 'qemu-system-' + target_name + 'w',
@@ -4411,13 +4423,19 @@ foreach target : target_dirs
     endif
 
     emulator = executable(exe_name, exe['sources'],
-               install: true,
+               install: exe.get('install', true),
                c_args: c_args,
                dependencies: arch_deps + exe['dependencies'],
                objects: lib.extract_all_objects(recursive: true),
                link_depends: [block_syms, qemu_syms],
                link_args: link_args,
                win_subsystem: exe['win_subsystem'])
+
+    if exe['name'] == 'test-apple-gfx-eeee-process-vm'
+      test('apple-gfx-eeee-process-vm', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
 
     if host_os == 'darwin'
       icon = 'pc-bios/qemu.rsrc'

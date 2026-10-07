@@ -23,6 +23,7 @@ typedef struct qmu_session qmu_session;
 struct AppleGfxMLFrameCompletionJob;
 struct AgfxBootstrapPresentCommand;
 typedef struct ThreadPool ThreadPool;
+typedef struct AgfxEeeeProviderState AgfxEeeeProviderState;
 
 typedef struct AgfxBootstrapPresentSource {
     bool pending;
@@ -122,6 +123,10 @@ struct AppleGfxMLState {
 
     /* QMetal unified library handle - contains ALL protocol logic */
     qmu_session *qmu_dev;
+
+    /* Native task facilities are constructed only by the complete owning
+     * session cutover.  The recovered carrier alone does not activate them. */
+    AgfxEeeeProviderState *eeee_provider_state;
 
     /* QEMU display */
     QemuConsole *con;

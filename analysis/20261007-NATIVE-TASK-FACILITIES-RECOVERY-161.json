@@ -1,0 +1,69 @@
+{
+  "status": "OPEN_NATIVE_OWNING_LAYER_ACTUAL_QEMU_COMPONENT_RECOVERED",
+  "recorded_utc": "2026-10-07 19:24:59 UTC",
+  "source_main_parent": "2e18af2c89740b6f68267c5e7228c71da3ae63f8",
+  "branch": "fix/native-task-facilities-recovery-20261007",
+  "fix_candidate": "/srv/project/apple-virgl/evidence/runs/20261004-air-source-byte-views/FIX_CANDIDATE-161.json",
+  "paired_QMetal_source": "b92a494a59a1d6ae12d9094058b62efacb0afb9c",
+  "paired_QMetal_library_sha256": "88dc5561aa57c4bb3069346c7c9eb159f8a5dee384083717e6c9d2f28fd0678d",
+  "AIR_dependency_provenance": "/srv/project/apple-virgl/evidence/runs/20261004-air-source-byte-views/qmetal-task-abi160.X326Sq/AIR-DEPENDENCY-PROVENANCE.json",
+  "reuse": {
+    "40f9dfa61ffc9d0926414b299edb96f25e17d7b6": "Independent complete 18-callback carrier, allocation/unique-region/task tables, alias interval clipping and RAM dirty propagation. Recovered exact c/h first and reconciled below; no wholesale old device source restore.",
+    "8ad0fc7aa44e37d9cfe1c2a03c762b53b9bf9e7f": "Earlier native bridge requested/mapped length separation and page rounding, checked contains, alias-owned region refs and split-ref foundation. Located in separate preserved QEMU Git store.",
+    "primary_reference": "apple-gfx.m:1589-1778 native PGTask allocator, shared remap, fresh-zero overwrite and region-unref/deallocate/remove order; selected captured PCI profile is legacy-local."
+  },
+  "reconciled_contracts": [
+    "Busy state_destroy(false) is non-destructive and does not latch destroying; allocations/tasks/region refs can drain normally.",
+    "ANYWHERE ignores initial address and maps rounded native pages while retaining literal requested length for ownership and deallocation; fresh pages remain RW/zero. No selected-legacy protect-NONE is introduced.",
+    "Containment checks the offset before unsigned subtraction; a different provider's higher native allocation cannot be overwritten.",
+    "Each native alias retains the exact canonical RAM MemoryRegion owner independently of the provider's unique region set. Split prefix/suffix remain shared and independently retained.",
+    "Removed alias refs retire until unlock/fixed-overwrite completion; final QOM owners release outside task mutex. Deallocation munmaps before releasing alias refs, also outside that mutex.",
+    "Retained generic protect ABI has the earlier zero-length no-op; this separately tested mapped-profile facility is not imposed on selected legacy."
+  ],
+  "actual_component_gate": {
+    "receipt": "/srv/project/apple-virgl/evidence/runs/20261004-air-source-byte-views/qemu-native161.af0vQb/BUILD-END.json",
+    "source_hashes": {
+      "hw/display/apple-gfx-eeee-process-vm.c": "34b63cf319237a73e39f909fd43234ef2ad7976432f3b8b600feb26da2de3b8f",
+      "hw/display/apple-gfx-eeee-process-vm.h": "d0f46844ae3bacf48a30fba6cc76e8b0d33bf4c8c2e50cf110c0b410de8e8792",
+      "hw/display/apple-gfx-ml.h": "4a96bbb520d8c30e4443480e2fff944132eda69c7d587ff1e76abda650c4492a",
+      "hw/display/meson.build": "fcaa2d43ae3fded5ff43a7c7e549932439f032e2a4a2c87a6ed7613676df95af",
+      "meson.build": "772976b6ca5905ad77c811ca83161f16199e02b79f9ec2dd71670e41b921d329",
+      "tests/unit/test-apple-gfx-eeee-process-vm.c": "0e6a2d991dae830173c0b5d02a9b01dc10b26185838fb3760fb065eb279804f4"
+    },
+    "full_QEMU_build": "Fresh 1858-action GCC14.2 Linux x86_64 system build with GTK/OpenGL/KVM/TCG and current QMetal b92 headers/library. Werror preserved; no warnings demoted. Carrier is a real system object, not a fake ABI fixture.",
+    "native_tests": "9/9 assertions-enabled TAP groups: complete18/prefix and published-state refusal; literal non-page-multiple/fresh-zero/busy drain; foreign higher-range containment; actual QEMU two-alias canonical region identity/clipped translation/exact shared bytes; nonzero RAM fd offset, prefix/suffix retention/fresh-zero center and VGA dirty bitmap; QOM reentrant finalizer after munmap, fixed overwrite and remap retirement; separate generic protect facility.",
+    "execution": "test-apple-gfx-eeee-process-vm links same actual system objects as qemu-system-x86_64; qemu_init machine none/TCG/display none/paused, no apple-gfx device or QMetal session factory, no guest disk or GPU commands. Direct run0.360s under hard45s ceiling; exits on test completion.",
+    "test_registration": "Meson native-component suite; non-installable executable, not listed as an emulator or added to production traceable targets.",
+    "sanitizer_claim": "None for this actual-QEMU gate. Prior QMetal sanitizer receipts remain separate and are not relabelled as sanitizing this C/system object graph."
+  },
+  "build_dependencies": {
+    "keycodemapdb": "f5772a62ec52591ff6870b7e8ef32482371f22c6",
+    "berkeley_softfloat": "b64af41c3276f97f0e181920400ee056b9c88037",
+    "berkeley_testfloat": "e7af9751d9f9fd3b47911f51a5cfd08af256a9ab",
+    "method": "Clean local worktrees at exact wrap revisions; soft/testfloat Meson package templates taken unchanged from QEMU main. --disable-download; no network dependency resolution or source provenance from dirty donor subproject files."
+  },
+  "component_negatives_preserved": [
+    "BUILD-ATTEMPT1/configure-attempt1: local softfloat dependency absent under nodownload; no network failure or guest/localization.",
+    "BUILD-ATTEMPT2/configure-attempt2: exact softfloat worktree lacked generated Meson package templates; supplied unchanged tracked packagefiles.",
+    "BUILD-ATTEMPT3/configure-attempt3/build-attempt3: full carrier/system objects compiled, but test's argv literals violated default Wwrite-strings/Werror. Corrected test mutable argument storage, no behavior or compiler-policy relaxation."
+  ],
+  "production_scope": "apple-gfx-ml.c unchanged and has no state_create/fill calls. No partial session activation; source-private state field/carrier/system compile and tests only. Current QMetal qmu_create_extended still does not construct these native facilities. Candidate binaries must not be deployed as a guest package.",
+  "performance_scope": "No AIR edit/regen/translation or shader workload. Whole native GPU/cost/non-regression acceptance unproved; mandatory alias refs/tails verified functionally, not marketed as a speedup. Necessary AMD/Intel/NVIDIA physical tests retained.",
+  "open_edges": [
+    "External owner must quiesce callbacks before freeing state; table emptiness is not a concurrent lifetime barrier. Full realize/session/shutdown owner graph remains unwired.",
+    "This tests canonical alias flattening for actual standard shared-fd RAM; it does not prove every IOMMU, readonly host mapping, exceptional literal VM operand or guest-generation route.",
+    "Join selected task/device facilities to existing native NoCopy producer/current a61 resource and pipeline owners, preserving literal spans/options/backing generations and actual GPU VA-remap semantics.",
+    "Join actual native executor to source main/post completion, output visibility/dirty notification, exact admission/wait/failure/device-loss/idle/quarantine/reset/shutdown and tails outside locks; selected emptyD remains necessary.",
+    "Universal native backing remains open: AMD /dev/udmabuf still absent (kernel exposes10:124), NVIDIA old DMA byte negatives and Intel component-only admission are not erased by these CPU tests.",
+    "AIR corpus/performance/SCF/threading, Intel MS-array, sparse0x2000, presentation and nativeeee1 driver contracts remain separate OPEN debts.",
+    "Four-main committed package; stockeeee host control first, then nativeeee1 UUID/AuxKC; stable Desktop/Finder/Screensaver A/B and reference pixels."
+  ],
+  "root_attempt_counter": {"total": 150, "latest_consultation": 150, "since_consultation": 0, "next_consultation_at": 154, "consultation_pending": false, "classification": "Three component-build negatives preserved separately; no intended graphics/root-localization run consumed, no guest/GPU/root-fix runtime attempt; counter not reset."},
+  "main_integrated": false,
+  "whole_causal_layer_closed": false,
+  "runtime_package": null,
+  "guest_run": false,
+  "graphics_acceptance": false,
+  "next_action": "Recover/reconcile the complete existing native NoCopy/device/encoder/completion graph on the current QMetal feature, retaining later a61 owners/8be observer/current header; use this real QEMU carrier as the endpoint foundation. Do not repeat passing CPU gates as a substitute for that integration.",
+  "whole_goal_state": "ACTIVE"
+}
