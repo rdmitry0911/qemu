@@ -25,6 +25,7 @@
 #include "qemu/thread.h"    /* QemuEvent for DMA BH synchronization */
 #include "qemu/cutils.h"
 #include "block/thread-pool.h"
+#include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci.h"
@@ -2422,6 +2423,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         agfx_log(s, "[apple-gfx-ml] msi_init OK, 1 vector\n");
     } else {
         agfx_log(s, "[apple-gfx-ml] msi_init FAILED: %d\n", msi_ret);
+        goto fail_log;
     }
     
     /* Setup MMIO BAR (BAR0) - Apple only uses this one BAR */
@@ -2430,10 +2432,9 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
     
     /* Setup host VRAM (not a PCI BAR - internal storage) */
-    memory_region_init_ram(&s->host_vram, OBJECT(s), "apple-gfx-vram",
-                           vram_size, errp);
-    if (*errp) {
-        return;
+    if (!memory_region_init_ram(&s->host_vram, OBJECT(s), "apple-gfx-vram",
+                                vram_size, errp)) {
+        goto fail_msi;
     }
     
     qemu_mutex_init(&s->mmio_job_mutex);
@@ -2515,7 +2516,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
     if (!s->qmu_dev) {
         error_setg(errp, "Failed to create qmetal device");
-        return;
+        goto fail_sync;
     }
 
     qmu_log_set_callback(agfx_qmu_log_callback, s);
@@ -2542,6 +2543,25 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->rendering_frame_height = s->fb_height;
     
     agfx_log(s, "[apple-gfx-ml] Device realized successfully\n");
+    return;
+
+fail_sync:
+    /* Returned factory failure has not acquired wrapper workers or Console.
+     * Retire only these initialized owners, in reverse acquisition order. */
+    qemu_cond_destroy(&s->bootstrap_present_cond);
+    qemu_mutex_destroy(&s->bootstrap_present_mutex);
+    qemu_mutex_destroy(&s->session_mutex);
+    qemu_mutex_destroy(&s->mmio_job_mutex);
+    /* Parent/MemoryRegion finalization reclaims RAM; its migration/CPR
+     * registration must retire separately while the RAMBlock is still live. */
+    vmstate_unregister_ram(&s->host_vram, DEVICE(s));
+fail_msi:
+    if (s->msi_used) {
+        msi_uninit(pci_dev);
+        s->msi_used = false;
+    }
+fail_log:
+    agfx_log_stop(s);
 }
 
 static void agfx_exit(PCIDevice *pci_dev)

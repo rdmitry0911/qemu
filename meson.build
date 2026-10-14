@@ -4418,6 +4418,23 @@ foreach target : target_dirs
           'link_args': ['-Wl,--wrap=qemu_memfd_alloc',
                         '-Wl,--wrap=qemu_memfd_free'],
           'install': false,
+        }, {
+          'name': 'test-apple-gfx-ml-realize-failure',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-realize-failure.c'),
+          'include_directories': target_inc,
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qmu_create_extended',
+                        '-Wl,--wrap=qemu_ram_alloc',
+                        '-Wl,--wrap=qemu_ram_free',
+                        '-Wl,--wrap=qemu_anon_ram_free',
+                        '-Wl,--wrap=vmstate_unregister_ram',
+                        '-Wl,--wrap=msi_uninit',
+                        '-Wl,--wrap=qemu_thread_create',
+                        '-Wl,--wrap=qemu_thread_join',
+                        '-Wl,--wrap=qemu_mutex_destroy',
+                        '-Wl,--wrap=qemu_cond_destroy'],
+          'install': false,
         }]
       endif
     endif
@@ -4513,6 +4530,11 @@ foreach target : target_dirs
     endif
     if exe['name'] == 'test-apple-gfx-ml-surface-backing'
       test('apple-gfx-ml-surface-backing', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-realize-failure'
+      test('apple-gfx-ml-realize-failure', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 45, suite: ['native-component'])
       continue
     endif
