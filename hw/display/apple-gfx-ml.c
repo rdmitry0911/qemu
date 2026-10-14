@@ -2262,20 +2262,43 @@ static void *agfx_mmio_worker_thread(void *opaque)
  * AIO_WAIT_WHILE blocks until the worker completes the job,
  * keeping the stack frame alive for the job's entire lifetime.
  */
+typedef struct AppleGfxMLIOReadJob {
+    AppleGfxMLState *state;
+    uint32_t offset;
+    uint64_t value;
+    unsigned size;
+    bool completed;
+} AppleGfxMLIOReadJob;
+
+static int apple_gfx_ml_do_mmio_read(void *opaque)
+{
+    AppleGfxMLIOReadJob *job = opaque;
+
+    job->value = qmu_mmio_read(job->state->qmu_dev, job->offset, job->size);
+    qatomic_set(&job->completed, true);
+    aio_wait_kick();
+    return 0;
+}
+
 static uint64_t agfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     AppleGfxMLState *s = opaque;
-    uint64_t value;
+    AppleGfxMLIOReadJob job = {
+        .state = s,
+        .offset = (uint32_t)offset,
+        .size = size,
+        .completed = false,
+    };
 
-    /* Reference: mmioReadAtOffset is synchronous — no serial queue, no mutex.
-     * Register values are atomic (event_stamps, display_irq) or aligned
-     * uint32_t written under mmio_mutex (atomic loads on x86_64).
-     * Synchronous reads avoid blocking behind waitStamps on the worker queue. */
-    value = qmu_mmio_read(s->qmu_dev, (uint32_t)offset, size);
+    /* Reference apple-gfx.m: dispatch the getter on the concurrent background
+     * queue while the caller services main AIO. Keep reads off the serial
+     * MMIO-write queue, and retain the caller's job until its result is ready. */
+    thread_pool_submit_aio(apple_gfx_ml_do_mmio_read, &job, NULL, NULL);
+    AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
     if (s->debug_level >= 5) {
-        trace_apple_gfx_ml_mmio_read(offset, value, size);
+        trace_apple_gfx_ml_mmio_read(offset, job.value, size);
     }
-    return value;
+    return job.value;
 }
 
 static void agfx_mmio_write(void *opaque, hwaddr offset,

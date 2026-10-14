@@ -4435,6 +4435,18 @@ foreach target : target_dirs
                         '-Wl,--wrap=qemu_mutex_destroy',
                         '-Wl,--wrap=qemu_cond_destroy'],
           'install': false,
+        }, {
+          'name': 'test-apple-gfx-ml-mmio-read',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-mmio-read.c',
+                           'tests/unit/apple-gfx-ml-mmio-read-baseline.c'),
+          'include_directories': target_inc,
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qmu_create_extended',
+                        '-Wl,--wrap=qmu_mmio_read',
+                        '-Wl,--wrap=thread_pool_submit_aio',
+                        '-Wl,--wrap=qemu_aio_unref'],
+          'install': false,
         }]
       endif
     endif
@@ -4535,6 +4547,11 @@ foreach target : target_dirs
     endif
     if exe['name'] == 'test-apple-gfx-ml-realize-failure'
       test('apple-gfx-ml-realize-failure', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-mmio-read'
+      test('apple-gfx-ml-mmio-read', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 45, suite: ['native-component'])
       continue
     endif
