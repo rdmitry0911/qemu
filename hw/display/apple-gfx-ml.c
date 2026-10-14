@@ -1060,30 +1060,35 @@ static void agfx_display_completion_bh(void *opaque)
     g_free(job);
 }
 
-static void agfx_publish_display_mode(AppleGfxMLState *s,
-                                      uint32_t width,
-                                      uint32_t height,
-                                      uint32_t iosurface_pixel_format,
-                                      uint64_t protection_requirements)
+void agfx_publish_display_mode(AppleGfxMLState *s,
+                               uint32_t width,
+                               uint32_t height,
+                               uint32_t iosurface_pixel_format,
+                               uint64_t protection_requirements)
 {
-    const uint32_t stride = width * 4u;
-    const size_t fb_size = (size_t)height * stride;
+    DisplaySurface *surface = NULL;
+    bool replace = false;
+    uint32_t stride = width * 4u;
 
     if (!s || width == 0 || height == 0) {
         return;
     }
 
-    if (fb_size > s->display_fb_size) {
-        s->display_fb = g_realloc(s->display_fb, fb_size);
-        s->display_fb_size = fb_size;
-        agfx_log(s, "[apple-gfx-ml] display_fb reallocated: %zu bytes\n", fb_size);
-    }
-
-    if (s->con &&
-        (width != s->fb_width || height != s->fb_height || stride != s->fb_stride)) {
-        DisplaySurface *surface = qemu_create_displaysurface_from(
-            width, height, PIXMAN_x8r8g8b8, stride, s->display_fb);
-        dpy_gfx_replace_surface(s->con, surface);
+    if (s->con) {
+        surface = qemu_console_surface(s->con);
+        /* The initial Console placeholder is not our framebuffer, even if
+         * its dimensions happen to match the requested initial mode. */
+        replace = !surface || !surface_is_allocated(surface) ||
+                  surface_is_placeholder(surface) ||
+                  surface_width(surface) != width ||
+                  surface_height(surface) != height ||
+                  surface_data(surface) != s->display_fb;
+        if (replace) {
+            surface = qemu_create_displaysurface(width, height);
+        }
+        stride = surface_stride(surface);
+        s->display_fb = surface_data(surface);
+        s->display_fb_size = (size_t)height * stride;
     }
 
     s->fb_width = width;
@@ -1091,6 +1096,12 @@ static void agfx_publish_display_mode(AppleGfxMLState *s,
     s->fb_stride = stride;
     s->fb_iosurface_pixel_format = iosurface_pixel_format;
     s->fb_protection_requirements = protection_requirements;
+
+    /* Bind the new borrow and metadata before synchronous listener switches.
+     * Console/pixman refs, not this Device, retire the old pixel allocation. */
+    if (replace) {
+        dpy_gfx_replace_surface(s->con, surface);
+    }
 }
 
 static void apple_gfx_ml_apply_mode_change(AppleGfxMLState *s,
@@ -2372,7 +2383,6 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
 {
     AppleGfxMLState *s = APPLE_GFX_ML(pci_dev);
     uint64_t vram_size = (uint64_t)s->vram_size_mb << 20;
-    size_t initial_fb_size;
     
     agfx_log_init(s);
     agfx_log(s, "[apple-gfx-ml] Realizing device: %ux%u, VRAM=%uMB\n",
@@ -2441,11 +2451,6 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->bootstrap_present_timer.active = false;
     s->bootstrap_present_timer.next_fire_us = 0;
     s->bootstrap_present_source.pending = false;
-    
-    /* Allocate display buffer published to the QEMU surface. */
-    initial_fb_size = (size_t)s->display_height * s->display_width * 4;
-    s->display_fb = g_malloc0(initial_fb_size);
-    s->display_fb_size = initial_fb_size;
     
     /* Create qmetal device with callbacks */
     qmu_extended_callbacks qmu_callbacks = {
@@ -2528,18 +2533,13 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     /* Create QEMU console */
     s->con = graphic_console_init(DEVICE(s), 0, &agfx_gfx_ops, s);
     
-    /* Initialize display parameters */
-    s->fb_width = s->display_width;
-    s->fb_height = s->display_height;
-    s->fb_stride = s->display_width * 4;
+    /* Before Console creation, callbacks can publish metadata only. Bind the
+     * initial owned pixel allocation through the same mode publication leaf. */
+    agfx_publish_display_mode(s, s->display_width, s->display_height,
+                             s->fb_iosurface_pixel_format,
+                             s->fb_protection_requirements);
     s->rendering_frame_width = s->fb_width;
     s->rendering_frame_height = s->fb_height;
-    
-    /* Create initial display surface using display_fb */
-    DisplaySurface *surface = qemu_create_displaysurface_from(
-        s->fb_width, s->fb_height, PIXMAN_x8r8g8b8,
-        s->fb_stride, s->display_fb);
-    dpy_gfx_replace_surface(s->con, surface);
     
     agfx_log(s, "[apple-gfx-ml] Device realized successfully\n");
 }
@@ -2596,9 +2596,8 @@ static void agfx_exit(PCIDevice *pci_dev)
     qmu_log_set_callback(NULL, NULL);
     agfx_log_stop(s);
 
-    /* Cleanup framebuffers */
-    g_free(s->display_fb);
-    s->display_fb = NULL;
+    /* Producers have stopped; Console/image refs still own the pixel memory. */
+    agfx_clear_display_surface_borrow(s);
     if (s->cursor) {
         cursor_unref(s->cursor);
         s->cursor = NULL;
@@ -2690,6 +2689,7 @@ static void agfx_instance_init(Object *obj)
     s->fb_iosurface_pixel_format = 0x42475241u;
     s->fb_protection_requirements = 0;
     s->display_fb = NULL;
+    s->display_fb_size = 0;
     s->cursor = NULL;
     qatomic_set(&s->cursor_show, true);
     s->cursor_display_id = 0;

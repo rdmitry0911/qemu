@@ -114,6 +114,10 @@ bool apple_gfx_ml_get_qmp_capture_bridge(AppleGfxMLCaptureBridge *out);
  * No QMetal session or physical GPU is needed to exercise the UI handoff. */
 void apple_gfx_ml_cursor_show(void *ctx, uint32_t display_id, int visible);
 void apple_gfx_ml_cursor_move(void *ctx, uint32_t display_id);
+void agfx_publish_display_mode(AppleGfxMLState *s,
+                               uint32_t width, uint32_t height,
+                               uint32_t iosurface_pixel_format,
+                               uint64_t protection_requirements);
 
 /* Device state - minimal, all logic in qmetal */
 struct AppleGfxMLState {
@@ -140,12 +144,10 @@ struct AppleGfxMLState {
     int32_t cursor_x;
     int32_t cursor_y;
 
-    /* display_fb is published to the QEMU surface from main-loop BHs only.
-     * Owner completion BH late-reads the latest mutable frame state from
-     * qmetal on the BH edge, mirroring reference frame_completed_bh reading
-     * from one shared display texture object instead of consuming immutable
-     * per-submit frame payload snapshots. */
-    uint8_t *display_fb;        /* Used by QEMU DisplaySurface */
+    /* Borrow of the current Console-owned surface data. Main-loop completion
+     * BHs copy their immutable per-submit payload here. Pixel memory is held
+     * by pixman image refs, never independently freed/reallocated by Device. */
+    uint8_t *display_fb;
     size_t display_fb_size;
     
     /* Current display parameters */
@@ -231,6 +233,14 @@ struct AppleGfxMLState {
     uint64_t render_worker_log_count;
     uint64_t bootstrap_present_log_count;
 };
+
+/* Only clear after the existing producer-stop sequence. Console and deferred
+ * image owners retain the allocation; clearing this borrow never frees it. */
+static inline void agfx_clear_display_surface_borrow(AppleGfxMLState *s)
+{
+    s->display_fb = NULL;
+    s->display_fb_size = 0;
+}
 
 /* Called at every actual render kickoff on the main-loop/BQL edge, including
  * completion-chain starts. A mode change invalidates only the already-started

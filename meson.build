@@ -4408,6 +4408,18 @@ foreach target : target_dirs
         'dependencies': [],
         'install': false,
       }]
+      if host_os == 'linux' and 'CONFIG_APPLE_GFX_ML' in config_target
+        execs += [{
+          'name': 'test-apple-gfx-ml-surface-backing',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-surface-backing.c',
+                           'tests/unit/apple-gfx-ml-surface-baseline.c'),
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qemu_memfd_alloc',
+                        '-Wl,--wrap=qemu_memfd_free'],
+          'install': false,
+        }]
+      endif
     endif
     # The only new native supplier gate calls the actual normally built
     # QMetal C++ adapter/provider, not a copied mock or its session factory.
@@ -4470,7 +4482,7 @@ foreach target : target_dirs
                dependencies: arch_deps + exe['dependencies'],
                objects: lib.extract_all_objects(recursive: true),
                link_depends: [block_syms, qemu_syms],
-               link_args: link_args,
+               link_args: link_args + exe.get('link_args', []),
                win_subsystem: exe['win_subsystem'])
 
     if exe['name'] == 'test-apple-gfx-eeee-qmetal-join'
@@ -4496,6 +4508,11 @@ foreach target : target_dirs
     endif
     if exe['name'] == 'test-apple-gfx-ml-cursor-visibility'
       test('apple-gfx-ml-cursor-visibility', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-surface-backing'
+      test('apple-gfx-ml-surface-backing', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 45, suite: ['native-component'])
       continue
     endif
