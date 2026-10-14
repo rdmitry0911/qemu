@@ -4409,6 +4409,29 @@ foreach target : target_dirs
         'install': false,
       }]
     endif
+    # The only new native supplier gate calls the actual normally built
+    # QMetal C++ adapter/provider, not a copied mock or its session factory.
+    if host_os == 'linux' and target_name == 'x86_64' and \
+       'CONFIG_APPLE_GFX_ML' in config_target
+      if 'cpp' not in all_languages
+        add_languages('cpp', required: true, native: false)
+        all_languages += ['cpp']
+        cxx = meson.get_compiler('cpp')
+      endif
+      qmetal_join_source_dir = get_option('apple_virgl_qmetal_source_dir')
+      if qmetal_join_source_dir == ''
+        qmetal_join_source_dir = meson.project_source_root() / '../qmetal'
+      endif
+      execs += [{
+        'name': 'test-apple-gfx-eeee-qmetal-join',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-eeee-qmetal-join.c',
+                         'tests/unit/apple-gfx-eeee-qmetal-test-bridge.cpp'),
+        'include_directories': include_directories(qmetal_join_source_dir / 'src/unified'),
+        'dependencies': [],
+        'install': false,
+      }]
+    endif
     if host_os == 'windows' and (sdl.found() or gtk.found())
       execs += [{
         'name': 'qemu-system-' + target_name + 'w',
@@ -4443,12 +4466,18 @@ foreach target : target_dirs
     emulator = executable(exe_name, exe['sources'],
                install: exe.get('install', true),
                c_args: c_args + exe.get('c_args', []),
+               include_directories: exe.get('include_directories', []),
                dependencies: arch_deps + exe['dependencies'],
                objects: lib.extract_all_objects(recursive: true),
                link_depends: [block_syms, qemu_syms],
                link_args: link_args,
                win_subsystem: exe['win_subsystem'])
 
+    if exe['name'] == 'test-apple-gfx-eeee-qmetal-join'
+      test('apple-gfx-eeee-qmetal-join', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
     if exe['name'] == 'test-apple-gfx-ml-memory'
       test('apple-gfx-ml-memory', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 45, suite: ['native-component'])
