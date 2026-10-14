@@ -1534,7 +1534,8 @@ static void apple_gfx_ml_update_cursor(AppleGfxMLState *s, uint32_t display_id)
         s->cursor_x = (int16_t)(packed & 0xffffu);
         s->cursor_y = (int16_t)((packed >> 16) & 0xffffu);
     }
-    dpy_mouse_set(s->con, s->cursor_x, s->cursor_y, s->cursor_show);
+    dpy_mouse_set(s->con, s->cursor_x, s->cursor_y,
+                  qatomic_read(&s->cursor_show));
 }
 
 static void apple_gfx_ml_cursor_glyph_bh(void *opaque)
@@ -1611,7 +1612,6 @@ static void apple_gfx_ml_cursor_show_bh(void *opaque)
         return;
     }
 
-    s->cursor_show = job->visible;
     s->cursor_display_id = job->display_id;
     agfx_log(s, "[apple-gfx-ml] cursor_show: display=%u visible=%d\n",
              job->display_id,
@@ -1672,7 +1672,7 @@ static void qemu_cursor_glyph(void *ctx,
                             apple_gfx_ml_cursor_glyph_bh, job);
 }
 
-static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
+void apple_gfx_ml_cursor_show(void *ctx, uint32_t display_id, int visible)
 {
     AppleGfxMLState *s = ctx;
     AppleGfxMLCursorShowJob *job;
@@ -1681,6 +1681,10 @@ static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
         return;
     }
 
+    /* Reference cursorShowHandler publishes before scheduling the UI update.
+     * A pending update reads the current flag; it must not replay an older
+     * visibility value after a newer callback has already published. */
+    qatomic_set(&s->cursor_show, visible != 0);
     job = g_new0(AppleGfxMLCursorShowJob, 1);
     job->state = s;
     job->display_id = display_id;
@@ -1689,8 +1693,7 @@ static void qemu_cursor_show(void *ctx, uint32_t display_id, int visible)
                             apple_gfx_ml_cursor_show_bh, job);
 }
 
-static void qemu_cursor_move(void *ctx,
-                             uint32_t display_id)
+void apple_gfx_ml_cursor_move(void *ctx, uint32_t display_id)
 {
     AppleGfxMLState *s = ctx;
     AppleGfxMLCursorMoveJob *job;
@@ -2457,8 +2460,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .write_memory = qemu_write_memory,
         .raise_irq = qemu_raise_irq,
         .cursor_glyph = qemu_cursor_glyph,
-        .cursor_move = qemu_cursor_move,
-        .cursor_show = qemu_cursor_show,
+        .cursor_move = apple_gfx_ml_cursor_move,
+        .cursor_show = apple_gfx_ml_cursor_show,
         .mode_change = qemu_mode_change,
         .display_live_takeover = qemu_display_live_takeover,
         .read_vram = qemu_read_vram,
@@ -2621,7 +2624,7 @@ static void agfx_reset(Object *obj, ResetType type)
     agfx_free_bootstrap_present_commands_locked(s);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
     qatomic_set(&s->iosfc_bootstrap_active, 0);
-    s->cursor_show = true;
+    qatomic_set(&s->cursor_show, true);
     s->cursor_display_id = 0;
     s->cursor_x = 0;
     s->cursor_y = 0;
@@ -2688,7 +2691,7 @@ static void agfx_instance_init(Object *obj)
     s->fb_protection_requirements = 0;
     s->display_fb = NULL;
     s->cursor = NULL;
-    s->cursor_show = true;
+    qatomic_set(&s->cursor_show, true);
     s->cursor_display_id = 0;
     s->cursor_x = 0;
     s->cursor_y = 0;

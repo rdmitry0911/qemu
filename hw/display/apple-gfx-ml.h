@@ -109,6 +109,10 @@ typedef struct AppleGfxMLCaptureBridge {
 } AppleGfxMLCaptureBridge;
 
 bool apple_gfx_ml_get_qmp_capture_bridge(AppleGfxMLCaptureBridge *out);
+/* Existing host callback entrypoints; also used by native console controls.
+ * No QMetal session or physical GPU is needed to exercise the UI handoff. */
+void apple_gfx_ml_cursor_show(void *ctx, uint32_t display_id, int visible);
+void apple_gfx_ml_cursor_move(void *ctx, uint32_t display_id);
 
 /* Device state - minimal, all logic in qmetal */
 struct AppleGfxMLState {

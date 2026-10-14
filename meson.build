@@ -4401,6 +4401,12 @@ foreach target : target_dirs
         'sources': files('tests/unit/test-apple-gfx-ml-render-mode.c'),
         'dependencies': [],
         'install': false,
+      }, {
+        'name': 'test-apple-gfx-ml-cursor-visibility',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-ml-cursor-visibility.c'),
+        'dependencies': [],
+        'install': false,
       }]
     endif
     if host_os == 'windows' and (sdl.found() or gtk.found())
@@ -4456,6 +4462,11 @@ foreach target : target_dirs
     endif
     if exe['name'] == 'test-apple-gfx-ml-render-mode'
       test('apple-gfx-ml-render-mode', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-cursor-visibility'
+      test('apple-gfx-ml-cursor-visibility', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 45, suite: ['native-component'])
       continue
     endif
