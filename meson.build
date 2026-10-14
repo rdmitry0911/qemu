@@ -4379,6 +4379,24 @@ foreach target : target_dirs
       'sources': [main_rs, files('system/main.c')],
       'dependencies': [sdl]
     }]
+    # Native memory controls reuse actual system/QOM objects and the exact
+    # production leaves, without realizing a graphics device or GPU session.
+    if target_name == 'x86_64'
+      execs += [{
+        'name': 'test-apple-gfx-ml-memory',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-ml-memory.c'),
+        'dependencies': [],
+        'install': false,
+      }, {
+        'name': 'test-apple-gfx-ml-memory-baseline',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-ml-memory.c'),
+        'dependencies': [],
+        'c_args': ['-DAGFX_MEMORY_BASELINE_CONTROL'],
+        'install': false,
+      }]
+    endif
     if host_os == 'windows' and (sdl.found() or gtk.found())
       execs += [{
         'name': 'qemu-system-' + target_name + 'w',
@@ -4411,13 +4429,25 @@ foreach target : target_dirs
     endif
 
     emulator = executable(exe_name, exe['sources'],
-               install: true,
-               c_args: c_args,
+               install: exe.get('install', true),
+               c_args: c_args + exe.get('c_args', []),
                dependencies: arch_deps + exe['dependencies'],
                objects: lib.extract_all_objects(recursive: true),
                link_depends: [block_syms, qemu_syms],
                link_args: link_args,
                win_subsystem: exe['win_subsystem'])
+
+    if exe['name'] == 'test-apple-gfx-ml-memory'
+      test('apple-gfx-ml-memory', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-memory-baseline'
+      test('apple-gfx-ml-memory-baseline', emulator,
+           args: ['--tap', '-p', '/agfx/memory/repeated-dirty-keeps-pin'],
+           should_fail: true, timeout: 45, suite: ['native-component'])
+      continue
+    endif
 
     if host_os == 'darwin'
       icon = 'pc-bios/qemu.rsrc'

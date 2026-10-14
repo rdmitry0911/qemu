@@ -31,6 +31,7 @@
 #include "hw/pci/msi.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/resettable.h"
+#include "hw/display/apple-gfx-ml-memory.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "ui/console.h"
@@ -708,32 +709,12 @@ void agfx_qmu_log_callback(void *ctx,
 static void *qemu_map_gpa(void *ctx, uint64_t gpa, size_t size, int writable)
 {
     AppleGfxMLState *s = ctx;
-    RCU_READ_LOCK_GUARD();   /* address_space_translate requires BQL or RCU */
-    MemoryRegion *mr = NULL;
-    hwaddr xlat = 0;
-    hwaddr xlat_len = size;
+    void *ptr = agfx_memory_map_gpa(gpa, size, writable);
 
-    mr = address_space_translate(&address_space_memory, gpa,
-                                  &xlat, &xlat_len, writable,
-                                  MEMTXATTRS_UNSPECIFIED);
-    if (!mr || xlat_len < size) {
-        return NULL;
+    if (ptr && s && s->debug_level >= 5) {
+        trace_apple_gfx_ml_map_gpa(gpa, size, ptr, writable);
     }
-
-    if (!memory_access_is_direct(mr, writable, MEMTXATTRS_UNSPECIFIED)) {
-        return NULL;
-    }
-
-    void *ptr = memory_region_get_ram_ptr(mr);
-    if (!ptr) {
-        return NULL;
-    }
-
-    memory_region_ref(mr);
-    if (s && s->debug_level >= 5) {
-        trace_apple_gfx_ml_map_gpa(gpa, size, ptr + xlat, writable);
-    }
-    return ptr + xlat;
+    return ptr;
 }
 
 static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
@@ -742,14 +723,7 @@ static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
     if (s && s->debug_level >= 5) {
         trace_apple_gfx_ml_unmap_gpa(hva, size);
     }
-    ram_addr_t offset;
-    MemoryRegion *mr = memory_region_from_host(hva, &offset);
-    if (mr) {
-        if (dirty) {
-            memory_region_set_dirty(mr, offset, size);
-        }
-        memory_region_unref(mr);
-    }
+    agfx_memory_unmap_gpa(hva, size, dirty);
 }
 
 /* A direct shared MTLBuffer is imported over a pinned guest-RAM HVA.  The GPU
@@ -775,15 +749,7 @@ static void agfx_mark_mapped_dirty_bh(void *opaque)
         return;
     }
 
-    ram_addr_t offset;
-    MemoryRegion *mr = memory_region_from_host(job->hva, &offset);
-    if (!mr) {
-        job->result = -1;
-    } else {
-        memory_region_set_dirty(mr, offset, job->size);
-        memory_region_unref(mr);
-        job->result = 0;
-    }
+    job->result = agfx_memory_mark_mapped_dirty(job->hva, job->size);
     qemu_event_set(&job->event);
 }
 
