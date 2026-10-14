@@ -4379,8 +4379,8 @@ foreach target : target_dirs
       'sources': [main_rs, files('system/main.c')],
       'dependencies': [sdl]
     }]
-    # Native memory controls reuse actual system/QOM objects and the exact
-    # production leaves, without realizing a graphics device or GPU session.
+    # Native controls reuse actual system/QOM objects and production leaves,
+    # without realizing a graphics device or GPU session.
     if target_name == 'x86_64'
       execs += [{
         'name': 'test-apple-gfx-ml-memory',
@@ -4394,6 +4394,12 @@ foreach target : target_dirs
         'sources': files('tests/unit/test-apple-gfx-ml-memory.c'),
         'dependencies': [],
         'c_args': ['-DAGFX_MEMORY_BASELINE_CONTROL'],
+        'install': false,
+      }, {
+        'name': 'test-apple-gfx-ml-render-mode',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-ml-render-mode.c'),
+        'dependencies': [],
         'install': false,
       }]
     endif
@@ -4446,6 +4452,11 @@ foreach target : target_dirs
       test('apple-gfx-ml-memory-baseline', emulator,
            args: ['--tap', '-p', '/agfx/memory/repeated-dirty-keeps-pin'],
            should_fail: true, timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-render-mode'
+      test('apple-gfx-ml-render-mode', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
       continue
     endif
 
