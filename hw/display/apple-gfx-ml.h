@@ -20,13 +20,20 @@
 
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
+typedef struct qmu_session_work qmu_session_work;
 struct AppleGfxMLFrameCompletionJob;
 struct AgfxBootstrapPresentCommand;
 typedef struct ThreadPool ThreadPool;
 typedef struct AgfxEeeeProviderState AgfxEeeeProviderState;
 
+typedef struct AgfxHostWork {
+    struct AppleGfxMLState *state;
+    qmu_session_work *work;
+} AgfxHostWork;
+
 typedef struct AgfxBootstrapPresentSource {
     bool pending;
+    AgfxHostWork owner;
 } AgfxBootstrapPresentSource;
 
 typedef struct AgfxBootstrapPresentTimer {
@@ -35,6 +42,8 @@ typedef struct AgfxBootstrapPresentTimer {
 } AgfxBootstrapPresentTimer;
 
 typedef struct AgfxCompletionJob {
+    struct AgfxCompletionJob *next;
+    AgfxHostWork owner;
     void (*fn)(void *);
     void *ctx;
 } AgfxCompletionJob;
@@ -161,6 +170,9 @@ struct AppleGfxMLState {
     bool new_frame_ready;       /* Frame copied to display_fb, awaiting gfx_update poll */
     bool gfx_update_requested;  /* gfx_update was called while frame was in-flight */
     int pending_frames;         /* Number of frames in flight (max 2, reference pattern) */
+    /* The second credit defers its render until the first completion. Keep
+     * that exact accepted lineage, not the first frame's operation. */
+    AgfxHostWork deferred_frame_owner;
 
     /* Configuration properties */
     uint32_t vram_size_mb;
@@ -196,6 +208,16 @@ struct AppleGfxMLState {
     QemuMutex session_mutex;   /* Serializes wrapper-owned owner-render capture/submit */
     int mmio_wait_active;      /* Main thread is inside AIO_WAIT_WHILE for MMIO */
 
+    /* One original Display callback per main-AIO dispatch, in publication
+     * order. Active covers the original fn's whole call, including nested AIO.
+     * Each envelope owns the SAME Session lineage and the actual State. */
+    QemuMutex completion_mutex;
+    AgfxCompletionJob *completion_head;
+    AgfxCompletionJob *completion_tail;
+    QEMUBH *completion_bh;
+    bool completion_scheduled;
+    bool completion_dispatch_active;
+
     int iosfc_bootstrap_active;
 
     /* Reference apple_gfx_render_new_frame dispatches one async owner-render
@@ -210,6 +232,7 @@ struct AppleGfxMLState {
     QemuMutex bootstrap_present_mutex;
     QemuCond bootstrap_present_cond;
     bool bootstrap_present_worker_stop;
+    bool bootstrap_present_roots_stopped;
     struct AgfxBootstrapPresentCommand *bootstrap_present_cmd_head;
     struct AgfxBootstrapPresentCommand *bootstrap_present_cmd_tail;
     AgfxBootstrapPresentTimer bootstrap_present_timer;
