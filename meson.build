@@ -4409,6 +4409,10 @@ foreach target : target_dirs
         'install': false,
       }]
       if host_os == 'linux' and 'CONFIG_APPLE_GFX_ML' in config_target
+        qmetal_import_source_dir = get_option('apple_virgl_qmetal_source_dir')
+        if qmetal_import_source_dir == ''
+          qmetal_import_source_dir = meson.project_source_root() / '../qmetal'
+        endif
         execs += [{
           'name': 'test-apple-gfx-ml-surface-backing',
           'win_subsystem': 'console',
@@ -4456,11 +4460,34 @@ foreach target : target_dirs
           'dependencies': [],
           'link_args': ['-Wl,--wrap=qmu_create_extended',
                         '-Wl,--wrap=qmu_vk_submit_captured_display_frame',
+                        '-Wl,--wrap=qmu_session_quiesce_host_callback_producers_deferred',
                         '-Wl,--wrap=thread_pool_submit_immediate',
                         '-Wl,--export-dynamic-symbol=vkCreateFence',
                         '-Wl,--export-dynamic-symbol=vkDestroyFence',
                         '-Wl,--export-dynamic-symbol=vkQueueSubmit',
                         '-Wl,--export-dynamic-symbol=vkWaitForFences'],
+          'install': false,
+        }, {
+          'name': 'test-apple-gfx-ml-imported-dirty',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-imported-dirty.c',
+                           'tests/unit/apple-gfx-ml-imported-dirty-bridge.cpp'),
+          'include_directories': target_inc + include_directories(
+            qmetal_import_source_dir / 'src',
+            qmetal_import_source_dir / 'include/vma'),
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qmu_create_extended',
+                        '-Wl,--wrap=aio_bh_schedule_oneshot_full',
+                        '-Wl,--wrap=qmu_session_invoke_host_work',
+                        '-Wl,--wrap=qmu_session_release_host_work',
+                        '-Wl,--export-dynamic-symbol=qmu_vk_set_direct_write_lease_callbacks',
+                        '-Wl,--export-dynamic-symbol=vkCreateFence',
+                        '-Wl,--export-dynamic-symbol=vkDestroyFence',
+                        '-Wl,--export-dynamic-symbol=vkQueueBindSparse',
+                        '-Wl,--export-dynamic-symbol=vkQueueSubmit',
+                        '-Wl,--export-dynamic-symbol=vkWaitForFences',
+                        '-Wl,--export-dynamic-symbol=vkAllocateMemory',
+                        '-Wl,--export-dynamic-symbol=vkFreeMemory'],
           'install': false,
         }]
       endif
@@ -4573,6 +4600,11 @@ foreach target : target_dirs
     if exe['name'] == 'test-apple-gfx-ml-frame-credit'
       test('apple-gfx-ml-frame-credit', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 90, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-imported-dirty'
+      test('apple-gfx-ml-imported-dirty', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 60, suite: ['native-component'])
       continue
     endif
 

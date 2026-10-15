@@ -55,6 +55,76 @@ typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
 typedef struct AgfxLogEntry AgfxLogEntry;
 typedef struct AppleGfxMLFrameCompletionJob AppleGfxMLFrameCompletionJob;
 
+/* An original callback or intentional child owns the same accepted Session
+ * operation before publication. The State hold alone would not protect its
+ * Session/maps/Console; the canonical work owner spans those handoffs. */
+static AgfxHostWork agfx_host_work_ref(AppleGfxMLState *s, bool root)
+{
+    AgfxHostWork owner = { .state = s };
+
+    if (s->qmu_dev) {
+        owner.work = root ? qmu_session_acquire_host_work(s->qmu_dev) :
+            qmu_session_retain_host_work(
+                qmu_session_current_host_work(s->qmu_dev));
+        /* External ingress has stopped before root admission closes. Actual
+         * callbacks must arrive in their SAME Session scope, never by creating
+         * a replacement root. Standalone Console controls have no Session. */
+        assert(owner.work);
+    }
+    object_ref(OBJECT(s));
+    return owner;
+}
+
+static void agfx_host_work_unref(AgfxHostWork *owner)
+{
+    AppleGfxMLState *s = owner->state;
+    qmu_session_work *work = owner->work;
+
+    owner->work = NULL;
+    owner->state = NULL;
+    object_unref(OBJECT(s));
+    qmu_session_release_host_work(work);
+    aio_wait_kick();
+}
+
+static void agfx_host_work_invoke(const AgfxHostWork *owner,
+                                  void (*fn)(void *), void *opaque)
+{
+    if (owner->work) {
+        /* The C++ trampoline restores TLS even when the source fn escapes.
+         * This C envelope remains owned unless that exact fn returns. */
+        qmu_session_invoke_host_work(owner->work, fn, opaque);
+    } else {
+        /* Standalone Console controls, not an admitted Session operation. */
+        fn(opaque);
+    }
+}
+
+typedef struct AgfxHostBH {
+    AgfxHostWork owner;
+    void (*fn)(void *);
+    void *opaque;
+} AgfxHostBH;
+
+static void agfx_host_bh(void *opaque)
+{
+    AgfxHostBH *job = opaque;
+    agfx_host_work_invoke(&job->owner, job->fn, job->opaque);
+    agfx_host_work_unref(&job->owner);
+    g_free(job);
+}
+
+static void agfx_schedule_host_bh(AppleGfxMLState *s,
+                                  void (*fn)(void *), void *opaque)
+{
+    AgfxHostBH *job = g_new0(AgfxHostBH, 1);
+
+    job->owner = agfx_host_work_ref(s, false);
+    job->fn = fn;
+    job->opaque = opaque;
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), agfx_host_bh, job);
+}
+
 /* Log throttling: show first N events, then every Mth */
 #define AGFX_LOG_INITIAL_COUNT  10
 #define AGFX_LOG_INTERVAL       60
@@ -499,6 +569,7 @@ static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
 
 typedef struct AgfxRenderSubmitJob {
     AppleGfxMLState *state;
+    AgfxHostWork owner;
 } AgfxRenderSubmitJob;
 
 static void agfx_log_write_direct(const char *text)
@@ -718,13 +789,67 @@ static void *qemu_map_gpa(void *ctx, uint64_t gpa, size_t size, int writable)
     return ptr;
 }
 
+typedef struct AgfxUnmapBqlCall {
+    void (*fn)(void *);
+    void *opaque;
+    QemuEvent completed;
+} AgfxUnmapBqlCall;
+
+static void agfx_unmap_bql_bh(void *opaque)
+{
+    AgfxUnmapBqlCall *call = opaque;
+
+    assert(bql_locked());
+    call->fn(call->opaque);
+    /* The original unpin leaf has RETURNED and consumed its mapping pin.
+     * This signal is the last access to the caller's stack, not a claim
+     * that this outer trampoline has already returned. */
+    qemu_event_set(&call->completed);
+}
+
+/* A matching unpin can destroy the canonical MR owner, whose finalizer
+ * requires BQL even after every alias/FlatView has gone. Ordinary accepted
+ * callers and the post-quiesce lifecycle worker both wait synchronously:
+ * their actual caller owns Session/State, while the original map pin owns
+ * RAM until the leaf consumes it. The BH itself needs neither Session/TLS
+ * nor any QMetal lock and cannot invent a new root after root-stop. */
+static void agfx_unmap_bql(void (*fn)(void *), void *opaque)
+{
+    if (bql_locked()) {
+        fn(opaque);
+        return;
+    }
+
+    AgfxUnmapBqlCall call = { .fn = fn, .opaque = opaque };
+
+    qemu_event_init(&call.completed, false);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), agfx_unmap_bql_bh, &call);
+    qemu_event_wait(&call.completed);
+    qemu_event_destroy(&call.completed);
+}
+
+typedef struct AgfxMappedUnmap {
+    void *hva;
+    size_t size;
+    int dirty;
+} AgfxMappedUnmap;
+
+static void agfx_unmap_gpa_call(void *opaque)
+{
+    AgfxMappedUnmap *unmap = opaque;
+
+    agfx_memory_unmap_gpa(unmap->hva, unmap->size, unmap->dirty);
+}
+
 static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
 {
     AppleGfxMLState *s = ctx;
+    AgfxMappedUnmap unmap = { .hva = hva, .size = size, .dirty = dirty };
+
     if (s && s->debug_level >= 5) {
         trace_apple_gfx_ml_unmap_gpa(hva, size);
     }
-    agfx_memory_unmap_gpa(hva, size, dirty);
+    agfx_unmap_bql(agfx_unmap_gpa_call, &unmap);
 }
 
 /* A direct shared MTLBuffer is imported over a pinned guest-RAM HVA.  The GPU
@@ -766,8 +891,7 @@ static int qemu_mark_mapped_memory_dirty(void *ctx, void *hva, size_t size)
         .result = -1,
     };
     qemu_event_init(&job.event, false);
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            agfx_mark_mapped_dirty_bh, &job);
+    agfx_schedule_host_bh(s, agfx_mark_mapped_dirty_bh, &job);
     qemu_event_wait(&job.event);
     qemu_event_destroy(&job.event);
     return job.result;
@@ -824,7 +948,7 @@ static int qemu_read_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
         trace_apple_gfx_ml_dma_read(gpa, size);
     }
     qemu_event_init(&job.event, false);
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), agfx_do_dma, &job);
+    agfx_schedule_host_bh(s, agfx_do_dma, &job);
     qemu_event_wait(&job.event);
     qemu_event_destroy(&job.event);
     return (job.result == MEMTX_OK) ? 0 : -1;
@@ -840,7 +964,7 @@ static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf,
         trace_apple_gfx_ml_dma_write(gpa, size);
     }
     qemu_event_init(&job.event, false);
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), agfx_do_dma, &job);
+    agfx_schedule_host_bh(s, agfx_do_dma, &job);
     qemu_event_wait(&job.event);
     qemu_event_destroy(&job.event);
     if (job.result != MEMTX_OK && s && s->debug_level >= 5) {
@@ -901,8 +1025,7 @@ static void qemu_raise_irq(void *ctx, uint32_t vector)
     job = g_malloc0(sizeof(*job));
     job->device = &s->parent_obj;
     job->vector = vector;
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_raise_interrupt_bh, job);
+    agfx_schedule_host_bh(s, apple_gfx_ml_raise_interrupt_bh, job);
 }
 
 /* ============================================================
@@ -915,8 +1038,10 @@ static void qemu_raise_irq(void *ctx, uint32_t vector)
  * This matches Apple's approach with newFrameEventHandler + BH.
  * ============================================================ */
 
-static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s);
-static bool agfx_take_bootstrap_present_source_locked(AppleGfxMLState *s);
+static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s,
+                                                       bool root);
+static bool agfx_take_bootstrap_present_source_locked(AppleGfxMLState *s,
+                                                      AgfxHostWork *owner);
 static struct AgfxBootstrapPresentCommand *
 agfx_take_bootstrap_present_command_locked(AppleGfxMLState *s);
 static void apple_gfx_ml_frame_completed_bh(void *opaque);
@@ -935,6 +1060,7 @@ static void qemu_render_frame_complete(void *ctx,
                                        const qmu_render_frame_completion *completion);
 static void qemu_frame_completed(void *ctx, int frame_expected);
 static int agfx_render_submit_job(void *opaque);
+static void agfx_render_submit_job_destroy(void *opaque);
 
 static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *vk)
 {
@@ -963,10 +1089,11 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
         }
         job = g_new0(AgfxRenderSubmitJob, 1);
         job->state = s;
+        job->owner = agfx_host_work_ref(s, false);
         thread_pool_submit_immediate(s->render_pool,
                                      agfx_render_submit_job,
                                      job,
-                                     g_free);
+                                     agfx_render_submit_job_destroy);
         return;
     }
 
@@ -981,7 +1108,7 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
     }
 }
 
-static int agfx_render_submit_job(void *opaque)
+static void agfx_render_submit_call(void *opaque)
 {
     AgfxRenderSubmitJob *job = opaque;
     AppleGfxMLState *s = job ? job->state : NULL;
@@ -989,13 +1116,13 @@ static int agfx_render_submit_job(void *opaque)
     int rc;
 
     if (!s || !s->qmu_dev) {
-        return 0;
+        return;
     }
 
     vk = qmu_session_get_vulkan(s->qmu_dev);
     if (!vk) {
         qemu_frame_completed(s, 0);
-        return 0;
+        return;
     }
 
     qemu_mutex_lock(&s->session_mutex);
@@ -1009,7 +1136,7 @@ static int agfx_render_submit_job(void *opaque)
                      __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
                      qatomic_read(&s->mmio_wait_active));
         }
-        return 0;
+        return;
     }
 
     if (agfx_log_should_emit(&s->render_worker_log_count)) {
@@ -1019,8 +1146,35 @@ static int agfx_render_submit_job(void *opaque)
                  __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
     }
     qemu_frame_completed(s, 0);
+}
 
+static int agfx_render_submit_job(void *opaque)
+{
+    AgfxRenderSubmitJob *job = opaque;
+
+    agfx_host_work_invoke(&job->owner, agfx_render_submit_call, job);
     return 0;
+}
+
+static void agfx_render_submit_job_destroy(void *opaque)
+{
+    AgfxRenderSubmitJob *job = opaque;
+
+    /* ThreadPool calls this only after its actual worker fn has returned. */
+    agfx_host_work_unref(&job->owner);
+    g_free(job);
+}
+
+typedef struct AgfxRenderKickoff {
+    AppleGfxMLState *state;
+    struct qmu_vulkan_ctx *vk;
+} AgfxRenderKickoff;
+
+static void agfx_render_kickoff_call(void *opaque)
+{
+    AgfxRenderKickoff *kick = opaque;
+
+    agfx_kick_display_render(kick->state, kick->vk);
 }
 
 typedef enum AgfxSessionJobKind {
@@ -1030,6 +1184,7 @@ typedef enum AgfxSessionJobKind {
 
 struct AppleGfxMLSessionJob {
     AppleGfxMLState *state;
+    AgfxHostWork owner;
     AppleGfxMLSessionJob *next;
     AgfxSessionJobKind kind;
     uint64_t offset;
@@ -1046,19 +1201,64 @@ typedef enum AgfxBootstrapPresentCommandKind {
 
 typedef struct AgfxBootstrapPresentCommand {
     struct AgfxBootstrapPresentCommand *next;
+    AgfxHostWork owner;
     AgfxBootstrapPresentCommandKind kind;
 } AgfxBootstrapPresentCommand;
 
 static void agfx_display_completion_bh(void *opaque)
 {
-    AgfxCompletionJob *job = opaque;
+    AppleGfxMLState *s = opaque;
+    AgfxCompletionJob *job;
 
-    if (!job) {
+    qemu_mutex_lock(&s->completion_mutex);
+    s->completion_scheduled = false;
+    if (s->completion_dispatch_active || !s->completion_head) {
+        qemu_mutex_unlock(&s->completion_mutex);
         return;
     }
+    job = s->completion_head;
+    s->completion_head = job->next;
+    if (!s->completion_head) {
+        s->completion_tail = NULL;
+    }
+    s->completion_dispatch_active = true;
+    qemu_mutex_unlock(&s->completion_mutex);
 
-    job->fn(job->ctx);
+    /* Do not admit another original during nested aio_poll in this fn. The
+     * actual typed context belongs to fn, never to this QEMU envelope. */
+    agfx_host_work_invoke(&job->owner, job->fn, job->ctx);
+
+    qemu_mutex_lock(&s->completion_mutex);
+    s->completion_dispatch_active = false;
+    if (s->completion_head && !s->completion_scheduled) {
+        s->completion_scheduled = true;
+        qemu_bh_schedule(s->completion_bh);
+    }
+    qemu_mutex_unlock(&s->completion_mutex);
+    agfx_host_work_unref(&job->owner);
     g_free(job);
+}
+
+static void agfx_completion_queue_init(AppleGfxMLState *s)
+{
+    qemu_mutex_init(&s->completion_mutex);
+    s->completion_head = NULL;
+    s->completion_tail = NULL;
+    s->completion_scheduled = false;
+    s->completion_dispatch_active = false;
+    s->completion_bh = aio_bh_new(qemu_get_aio_context(),
+                                agfx_display_completion_bh, s);
+}
+
+/* Only actual pre-publication factory NULL or the completed nondeleting
+ * Session owner barrier permits retirement. Queue emptiness is not that proof. */
+static void agfx_completion_queue_destroy(AppleGfxMLState *s)
+{
+    assert(!s->completion_head && !s->completion_tail);
+    assert(!s->completion_dispatch_active);
+    qemu_bh_delete(s->completion_bh);
+    s->completion_bh = NULL;
+    qemu_mutex_destroy(&s->completion_mutex);
 }
 
 void agfx_publish_display_mode(AppleGfxMLState *s,
@@ -1403,7 +1603,14 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
         if (!vk) {
             agfx_log(s, "[apple-gfx-ml] frame_completed_bh: vk=NULL\n");
         } else {
-            agfx_kick_display_render(s, vk);
+            AgfxHostWork owner = s->deferred_frame_owner;
+            AgfxRenderKickoff kick = { .state = s, .vk = vk };
+
+            assert(owner.state == s);
+            memset(&s->deferred_frame_owner, 0,
+                   sizeof(s->deferred_frame_owner));
+            agfx_host_work_invoke(&owner, agfx_render_kickoff_call, &kick);
+            agfx_host_work_unref(&owner);
         }
     }
 
@@ -1490,8 +1697,7 @@ static void qemu_render_frame_complete(void *ctx,
         job->height = completion->height;
         job->stride = completion->stride;
     }
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_frame_completed_bh, job);
+    agfx_schedule_host_bh(s, apple_gfx_ml_frame_completed_bh, job);
 }
 
 static void qemu_frame_completed(void *ctx, int frame_expected)
@@ -1506,8 +1712,7 @@ static void qemu_frame_completed(void *ctx, int frame_expected)
     job = g_new0(AppleGfxMLFrameCompletionJob, 1);
     job->state = s;
     job->frame_expected = frame_expected != 0;
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_frame_completed_bh, job);
+    agfx_schedule_host_bh(s, apple_gfx_ml_frame_completed_bh, job);
 }
 
 typedef struct AppleGfxMLCursorGlyphJob {
@@ -1680,8 +1885,7 @@ static void qemu_cursor_glyph(void *ctx,
     job->hot_x = hot_x;
     job->hot_y = hot_y;
     job->sum = sum;
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_cursor_glyph_bh, job);
+    agfx_schedule_host_bh(s, apple_gfx_ml_cursor_glyph_bh, job);
 }
 
 void apple_gfx_ml_cursor_show(void *ctx, uint32_t display_id, int visible)
@@ -1701,8 +1905,7 @@ void apple_gfx_ml_cursor_show(void *ctx, uint32_t display_id, int visible)
     job->state = s;
     job->display_id = display_id;
     job->visible = visible != 0;
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_cursor_show_bh, job);
+    agfx_schedule_host_bh(s, apple_gfx_ml_cursor_show_bh, job);
 }
 
 void apple_gfx_ml_cursor_move(void *ctx, uint32_t display_id)
@@ -1717,8 +1920,7 @@ void apple_gfx_ml_cursor_move(void *ctx, uint32_t display_id)
     job = g_new0(AppleGfxMLCursorMoveJob, 1);
     job->state = s;
     job->display_id = display_id;
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            apple_gfx_ml_cursor_move_bh, job);
+    agfx_schedule_host_bh(s, apple_gfx_ml_cursor_move_bh, job);
 }
 
 static void qemu_mode_change(void *ctx,
@@ -1755,21 +1957,26 @@ static void qemu_display_live_takeover(void *ctx)
     }
 }
 
-static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s)
+static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s,
+                                                       bool root)
 {
     if (!s->bootstrap_present_source.pending) {
+        s->bootstrap_present_source.owner = agfx_host_work_ref(s, root);
         s->bootstrap_present_source.pending = true;
         qemu_cond_signal(&s->bootstrap_present_cond);
     }
 }
 
-static bool agfx_take_bootstrap_present_source_locked(AppleGfxMLState *s)
+static bool agfx_take_bootstrap_present_source_locked(AppleGfxMLState *s,
+                                                      AgfxHostWork *owner)
 {
     if (!s || !s->bootstrap_present_source.pending) {
         return false;
     }
 
     s->bootstrap_present_source.pending = false;
+    *owner = s->bootstrap_present_source.owner;
+    memset(&s->bootstrap_present_source.owner, 0, sizeof(*owner));
     return true;
 }
 
@@ -1804,6 +2011,7 @@ static void agfx_free_bootstrap_present_commands_locked(AppleGfxMLState *s)
     s->bootstrap_present_cmd_tail = NULL;
     while (cmd) {
         AgfxBootstrapPresentCommand *next = cmd->next;
+        agfx_host_work_unref(&cmd->owner);
         g_free(cmd);
         cmd = next;
     }
@@ -1825,7 +2033,7 @@ static void agfx_schedule_frame_presents_locked(AppleGfxMLState *s, bool *starte
         return;
     }
 
-    agfx_merge_bootstrap_present_source_locked(s);
+    agfx_merge_bootstrap_present_source_locked(s, false);
 }
 
 static void agfx_schedule_frame_presents(AppleGfxMLState *s)
@@ -1840,6 +2048,7 @@ static void agfx_schedule_frame_presents(AppleGfxMLState *s)
      * Queue one control command instead of mutating timer/source state from
      * the MMIO caller thread. */
     cmd = g_new0(AgfxBootstrapPresentCommand, 1);
+    cmd->owner = agfx_host_work_ref(s, false);
     cmd->kind = AGFX_BOOTSTRAP_PRESENT_CMD_SCHEDULE;
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     if (s->bootstrap_present_cmd_tail) {
@@ -1860,7 +2069,10 @@ static void agfx_cancel_frame_presents_locked(AppleGfxMLState *s)
 
     s->bootstrap_present_timer.active = false;
     s->bootstrap_present_timer.next_fire_us = 0;
-    s->bootstrap_present_source.pending = false;
+    if (s->bootstrap_present_source.pending) {
+        s->bootstrap_present_source.pending = false;
+        agfx_host_work_unref(&s->bootstrap_present_source.owner);
+    }
 }
 
 static void agfx_cancel_frame_presents(AppleGfxMLState *s)
@@ -1874,6 +2086,7 @@ static void agfx_cancel_frame_presents(AppleGfxMLState *s)
     /* Reference cancelFramePresents is also queue-owned. Keep cancellation
      * ordered against any already queued schedule/merge work. */
     cmd = g_new0(AgfxBootstrapPresentCommand, 1);
+    cmd->owner = agfx_host_work_ref(s, false);
     cmd->kind = AGFX_BOOTSTRAP_PRESENT_CMD_CANCEL;
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     if (s->bootstrap_present_cmd_tail) {
@@ -1886,8 +2099,10 @@ static void agfx_cancel_frame_presents(AppleGfxMLState *s)
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
 }
 
-static void agfx_bootstrap_present_on_queue(AppleGfxMLState *s)
+static void agfx_bootstrap_present_on_queue(void *opaque)
 {
+    AppleGfxMLState *s = opaque;
+
     if (!s || !s->qmu_dev || !qatomic_read(&s->iosfc_bootstrap_active)) {
         return;
     }
@@ -1902,6 +2117,31 @@ static void agfx_bootstrap_present_on_queue(AppleGfxMLState *s)
     (void)qmu_iosfc_present_tick(s->qmu_dev);
 }
 
+static void agfx_bootstrap_present_command_call(void *opaque)
+{
+    AgfxBootstrapPresentCommand *cmd = opaque;
+    AppleGfxMLState *s = cmd->owner.state;
+
+    switch (cmd->kind) {
+    case AGFX_BOOTSTRAP_PRESENT_CMD_SCHEDULE: {
+        bool started = false;
+
+        qatomic_set(&s->iosfc_bootstrap_active, 1);
+        agfx_schedule_frame_presents_locked(s, &started);
+        if (started) {
+            agfx_log(s,
+                     "[apple-gfx-ml] display frame timer started (%dms interval, present queue)\n",
+                     AGFX_DISPLAY_FRAME_INTERVAL_MS);
+        }
+        break;
+    }
+    case AGFX_BOOTSTRAP_PRESENT_CMD_CANCEL:
+        qatomic_set(&s->iosfc_bootstrap_active, 0);
+        agfx_cancel_frame_presents_locked(s);
+        break;
+    }
+}
+
 static void *agfx_bootstrap_present_thread(void *opaque)
 {
     AppleGfxMLState *s = opaque;
@@ -1909,8 +2149,9 @@ static void *agfx_bootstrap_present_thread(void *opaque)
         (int64_t)AGFX_DISPLAY_FRAME_INTERVAL_MS * 1000;
 
     qemu_mutex_lock(&s->bootstrap_present_mutex);
-    while (!s->bootstrap_present_worker_stop) {
+    while (true) {
         AgfxBootstrapPresentCommand *cmd;
+        AgfxHostWork source_owner;
         int64_t now_us;
         int64_t wait_ms;
 
@@ -1918,36 +2159,29 @@ static void *agfx_bootstrap_present_thread(void *opaque)
         if (cmd) {
             /* The serial present worker is the wrapper analogue of
              * PGEFIPresentQueue. It alone owns timer/source state mutation. */
-            switch (cmd->kind) {
-            case AGFX_BOOTSTRAP_PRESENT_CMD_SCHEDULE: {
-                bool started = false;
-
-                qatomic_set(&s->iosfc_bootstrap_active, 1);
-                agfx_schedule_frame_presents_locked(s, &started);
-                if (started) {
-                    agfx_log(s,
-                             "[apple-gfx-ml] display frame timer started (%dms interval, present queue)\n",
-                             AGFX_DISPLAY_FRAME_INTERVAL_MS);
-                }
-                break;
-            }
-            case AGFX_BOOTSTRAP_PRESENT_CMD_CANCEL:
-                qatomic_set(&s->iosfc_bootstrap_active, 0);
-                agfx_cancel_frame_presents_locked(s);
-                break;
-            }
+            agfx_host_work_invoke(&cmd->owner,
+                                 agfx_bootstrap_present_command_call, cmd);
+            agfx_host_work_unref(&cmd->owner);
             g_free(cmd);
             continue;
         }
 
-        if (agfx_take_bootstrap_present_source_locked(s)) {
+        if (agfx_take_bootstrap_present_source_locked(s, &source_owner)) {
             qemu_mutex_unlock(&s->bootstrap_present_mutex);
-            agfx_bootstrap_present_on_queue(s);
+            agfx_host_work_invoke(&source_owner,
+                                 agfx_bootstrap_present_on_queue, s);
+            agfx_host_work_unref(&source_owner);
             qemu_mutex_lock(&s->bootstrap_present_mutex);
             continue;
         }
 
-        if (!s->bootstrap_present_timer.active) {
+        if (s->bootstrap_present_worker_stop) {
+            break;
+        }
+        /* Final stop closes only new autonomous ticks. The serial executor
+         * remains alive for already accepted controls/source descendants. */
+        if (s->bootstrap_present_roots_stopped ||
+            !s->bootstrap_present_timer.active) {
             qemu_cond_wait(&s->bootstrap_present_cond,
                            &s->bootstrap_present_mutex);
             continue;
@@ -1964,7 +2198,7 @@ static void *agfx_bootstrap_present_thread(void *opaque)
                 /* Reference timer source only merges the lightweight present
                  * source on PGEFIPresentQueue; the present source handler
                  * performs qmu_iosfc_present_tick() later on the same queue. */
-                agfx_merge_bootstrap_present_source_locked(s);
+                agfx_merge_bootstrap_present_source_locked(s, true);
             }
             continue;
         }
@@ -2026,6 +2260,8 @@ static void agfx_new_frame_handler_bh(void *opaque)
 
     /* Reference: if pending > 1, another frame will chain from completion (2678) */
     if (pending > 1) {
+        assert(!s->deferred_frame_owner.state);
+        s->deferred_frame_owner = agfx_host_work_ref(s, false);
         if (agfx_log_should_emit(&s->new_frame_handler_log_count)) {
             agfx_log(s,
                      "[apple-gfx-ml] new_frame_handler_bh: chain-only pending_frames=%d\n",
@@ -2072,8 +2308,7 @@ static void qemu_new_frame_signal(void *ctx)
                  __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
                  qatomic_read(&s->mmio_wait_active));
     }
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            agfx_new_frame_handler_bh, s);
+    agfx_schedule_host_bh(s, agfx_new_frame_handler_bh, s);
 }
 
 /* Display refresh is handled by qmetal library's internal thread after the
@@ -2100,13 +2335,24 @@ static void qemu_schedule_display_completion(void *ctx,
     }
 
     job = g_new0(AgfxCompletionJob, 1);
+    job->owner = agfx_host_work_ref(s, false);
     job->fn = fn;
     job->ctx = comp_ctx;
 
     agfx_log(s, "[apple-gfx-ml] schedule_display_completion: enqueue mmio_wait=%d\n",
              qatomic_read(&s->mmio_wait_active));
-    aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                            agfx_display_completion_bh, job);
+    qemu_mutex_lock(&s->completion_mutex);
+    if (s->completion_tail) {
+        s->completion_tail->next = job;
+    } else {
+        s->completion_head = job;
+    }
+    s->completion_tail = job;
+    if (!s->completion_scheduled && !s->completion_dispatch_active) {
+        s->completion_scheduled = true;
+        qemu_bh_schedule(s->completion_bh);
+    }
+    qemu_mutex_unlock(&s->completion_mutex);
 }
 
 /* 1:1 reference apple_gfx_mmio_map_surface_memory (apple-gfx-mmio.m:145-158).
@@ -2137,23 +2383,38 @@ static void *qemu_iosfc_map_memory(void *ctx, uint64_t gpa, uint64_t len, int re
     return ptr + xlat;
 }
 
-/* 1:1 reference apple_gfx_mmio_unmap_surface_memory (apple-gfx-mmio.m:160-177) */
-static int qemu_iosfc_unmap_memory(void *ctx, void *hva, uint64_t len)
+typedef struct AgfxIosfcUnmap {
+    void *hva;
+    int result;
+} AgfxIosfcUnmap;
+
+/* Preserve this mapper leaf's original RCU, status and no-dirty semantics. */
+static void agfx_iosfc_unmap_call(void *opaque)
 {
+    AgfxIosfcUnmap *unmap = opaque;
     MemoryRegion *mr;
     ram_addr_t offset = 0;
 
-    (void)ctx;
-    (void)len;
-
     RCU_READ_LOCK_GUARD();
-    mr = memory_region_from_host(hva, &offset);
+    mr = memory_region_from_host(unmap->hva, &offset);
     if (!mr) {
         agfx_log_write_direct("[apple-gfx-ml] iosfc_unmap: memory not found\n");
-        return -1;
+        unmap->result = -1;
+        return;
     }
     memory_region_unref(mr);
-    return 0;
+    unmap->result = 0;
+}
+
+/* 1:1 reference apple_gfx_mmio_unmap_surface_memory (apple-gfx-mmio.m:160-177) */
+static int qemu_iosfc_unmap_memory(void *ctx, void *hva, uint64_t len)
+{
+    AgfxIosfcUnmap unmap = { .hva = hva, .result = -1 };
+
+    (void)ctx;
+    (void)len;
+    agfx_unmap_bql(agfx_iosfc_unmap_call, &unmap);
+    return unmap.result;
 }
 
 static int qemu_read_vram(void *ctx, uint64_t vram_offset, void *buf, size_t size)
@@ -2185,6 +2446,7 @@ static int qemu_read_vram(void *ctx, uint64_t vram_offset, void *buf, size_t siz
 
 static void agfx_enqueue_session_job(AppleGfxMLState *s, AppleGfxMLSessionJob *job)
 {
+    job->owner = agfx_host_work_ref(s, false);
     job->next = NULL;
     qemu_mutex_lock(&s->mmio_job_mutex);
     if (s->session_job_tail) {
@@ -2195,6 +2457,24 @@ static void agfx_enqueue_session_job(AppleGfxMLState *s, AppleGfxMLSessionJob *j
     s->session_job_tail = job;
     qemu_mutex_unlock(&s->mmio_job_mutex);
     qemu_sem_post(&s->mmio_sem);
+}
+
+static void agfx_mmio_job_call(void *opaque)
+{
+    AppleGfxMLSessionJob *job = opaque;
+
+    switch (job->kind) {
+    case AGFX_SESSION_JOB_MMIO_READ:
+        job->value = qmu_mmio_read(job->state->qmu_dev,
+                                  (uint32_t)job->offset, job->size);
+        break;
+    case AGFX_SESSION_JOB_MMIO_WRITE:
+        /* No wrapper session_mutex across a call that can wait for main DMA:
+         * a main Display child may need that same mutex before servicing it. */
+        qmu_mmio_write(job->state->qmu_dev,
+                      (uint32_t)job->offset, job->value, job->size);
+        break;
+    }
 }
 
 static void *agfx_mmio_worker_thread(void *opaque)
@@ -2222,36 +2502,14 @@ static void *agfx_mmio_worker_thread(void *opaque)
             continue;
         }
 
-        switch (job->kind) {
-        case AGFX_SESSION_JOB_MMIO_READ:
-            /* Reads now handled synchronously in agfx_mmio_read (no worker queue).
-             * This case should not be reached. */
-            job->value = qmu_mmio_read(job->state->qmu_dev,
-                                       (uint32_t)job->offset, job->size);
-            qatomic_set(&job->completed, true);
-            aio_wait_kick();
-            break;
-        case AGFX_SESSION_JOB_MMIO_WRITE:
-            /* Do not hold session_mutex across qmu_mmio_write():
-             * FIFO/KICK handling can synchronously call qemu_write_memory(),
-             * which waits for a main-loop BH to run under BQL. The display BH
-             * may concurrently call agfx_kick_display_render() under that same
-             * BQL edge and take session_mutex first. Holding session_mutex here
-             * creates a hard inversion:
-             *   mmio worker:  session_mutex -> wait main loop/BQL
-             *   display BH:   BQL -> wait session_mutex
-             * qmu_mmio_write() already owns its internal mmio dispatch/serialize
-             * domain, so wrapper-side session serialization must stay limited to
-             * the capture/submit owner-render path itself. */
-            qmu_mmio_write(job->state->qmu_dev,
-                           (uint32_t)job->offset, job->value, job->size);
-            qatomic_set(&job->completed, true);
-            aio_wait_kick();
-            break;
-        }
-
+        agfx_host_work_invoke(&job->owner, agfx_mmio_job_call, job);
+        agfx_host_work_unref(&job->owner);
         if (job->heap_owned) {
             g_free(job);
+        } else {
+            /* No worker access to the caller's stack after this publication. */
+            qatomic_set(&job->completed, true);
+            aio_wait_kick();
         }
     }
     return NULL;
@@ -2264,25 +2522,51 @@ static void *agfx_mmio_worker_thread(void *opaque)
  */
 typedef struct AppleGfxMLIOReadJob {
     AppleGfxMLState *state;
+    AgfxHostWork owner;
     uint32_t offset;
     uint64_t value;
     unsigned size;
     bool completed;
 } AppleGfxMLIOReadJob;
 
-static int apple_gfx_ml_do_mmio_read(void *opaque)
+static void apple_gfx_ml_mmio_read_call(void *opaque)
 {
     AppleGfxMLIOReadJob *job = opaque;
 
     job->value = qmu_mmio_read(job->state->qmu_dev, job->offset, job->size);
+}
+
+static int apple_gfx_ml_do_mmio_read(void *opaque)
+{
+    AppleGfxMLIOReadJob *job = opaque;
+
+    agfx_host_work_invoke(&job->owner, apple_gfx_ml_mmio_read_call, job);
+    return 0;
+}
+
+static void apple_gfx_ml_mmio_read_done(void *opaque, int ret)
+{
+    AppleGfxMLIOReadJob *job = opaque;
+
+    agfx_host_work_unref(&job->owner);
     qatomic_set(&job->completed, true);
     aio_wait_kick();
-    return 0;
+}
+
+static void agfx_mmio_read_call(void *opaque)
+{
+    AppleGfxMLIOReadJob *job = opaque;
+
+    job->owner = agfx_host_work_ref(job->state, false);
+    thread_pool_submit_aio(apple_gfx_ml_do_mmio_read, job,
+                          apple_gfx_ml_mmio_read_done, job);
+    AIO_WAIT_WHILE(NULL, !qatomic_read(&job->completed));
 }
 
 static uint64_t agfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
 {
     AppleGfxMLState *s = opaque;
+    AgfxHostWork owner = agfx_host_work_ref(s, true);
     AppleGfxMLIOReadJob job = {
         .state = s,
         .offset = (uint32_t)offset,
@@ -2293,30 +2577,22 @@ static uint64_t agfx_mmio_read(void *opaque, hwaddr offset, unsigned size)
     /* Reference apple-gfx.m: dispatch the getter on the concurrent background
      * queue while the caller services main AIO. Keep reads off the serial
      * MMIO-write queue, and retain the caller's job until its result is ready. */
-    thread_pool_submit_aio(apple_gfx_ml_do_mmio_read, &job, NULL, NULL);
-    AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
+    agfx_host_work_invoke(&owner, agfx_mmio_read_call, &job);
     if (s->debug_level >= 5) {
         trace_apple_gfx_ml_mmio_read(offset, job.value, size);
     }
+    agfx_host_work_unref(&owner);
     return job.value;
 }
 
-static void agfx_mmio_write(void *opaque, hwaddr offset,
-                             uint64_t val, unsigned size)
+static void agfx_mmio_write_call(void *opaque)
 {
-    AppleGfxMLState *s = opaque;
-    AppleGfxMLSessionJob job = {
-        .state = s,
-        .kind = AGFX_SESSION_JOB_MMIO_WRITE,
-        .offset = offset,
-        .value = val,
-        .size = size,
-        .completed = false,
-        .heap_owned = false,
-    };
+    AppleGfxMLSessionJob *job = opaque;
+    AppleGfxMLState *s = job->state;
+
     qatomic_set(&s->mmio_wait_active, 1);
-    agfx_enqueue_session_job(s, &job);
-    AIO_WAIT_WHILE(NULL, !qatomic_read(&job.completed));
+    agfx_enqueue_session_job(s, job);
+    AIO_WAIT_WHILE(NULL, !qatomic_read(&job->completed));
     qatomic_set(&s->mmio_wait_active, 0);
 
     /* Reference scheduleFramePresents is owned by the wrapper plane, not by
@@ -2324,16 +2600,33 @@ static void agfx_mmio_write(void *opaque, hwaddr offset,
      * the IOSFC MMIO commit points: first MAP_ADDR starts the timer with an
      * immediate first fire, later MAP_ADDR commits merge one pending tick into
      * the already-armed source. */
-    if (offset == PVG_REG_IOSFC_MAP_ADDR && val != 0) {
+    if (job->offset == PVG_REG_IOSFC_MAP_ADDR && job->value != 0) {
         agfx_schedule_frame_presents(s);
-    } else if ((offset == PVG_REG_IOSFC_ENABLE && val == 0) ||
-               offset == PVG_REG_IOSFC_UNMAP) {
+    } else if ((job->offset == PVG_REG_IOSFC_ENABLE && job->value == 0) ||
+               job->offset == PVG_REG_IOSFC_UNMAP) {
         agfx_cancel_frame_presents(s);
     }
 
     if (s->debug_level >= 5) {
-        trace_apple_gfx_ml_mmio_write(offset, val, size);
+        trace_apple_gfx_ml_mmio_write(job->offset, job->value, job->size);
     }
+}
+
+static void agfx_mmio_write(void *opaque, hwaddr offset,
+                            uint64_t val, unsigned size)
+{
+    AppleGfxMLState *s = opaque;
+    AgfxHostWork owner = agfx_host_work_ref(s, true);
+    AppleGfxMLSessionJob job = {
+        .state = s,
+        .kind = AGFX_SESSION_JOB_MMIO_WRITE,
+        .offset = offset,
+        .value = val,
+        .size = size,
+    };
+
+    agfx_host_work_invoke(&owner, agfx_mmio_write_call, &job);
+    agfx_host_work_unref(&owner);
 }
 
 static const MemoryRegionOps agfx_mmio_ops = {
@@ -2470,11 +2763,13 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->session_job_tail = NULL;
     s->render_pool = NULL;
     s->bootstrap_present_worker_stop = false;
+    s->bootstrap_present_roots_stopped = false;
     s->bootstrap_present_cmd_head = NULL;
     s->bootstrap_present_cmd_tail = NULL;
     s->bootstrap_present_timer.active = false;
     s->bootstrap_present_timer.next_fire_us = 0;
     s->bootstrap_present_source.pending = false;
+    agfx_completion_queue_init(s);
     
     /* Create qmetal device with callbacks */
     qmu_extended_callbacks qmu_callbacks = {
@@ -2571,6 +2866,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
 fail_sync:
     /* Returned factory failure has not acquired wrapper workers or Console.
      * Retire only these initialized owners, in reverse acquisition order. */
+    agfx_completion_queue_destroy(s);
     qemu_cond_destroy(&s->bootstrap_present_cond);
     qemu_mutex_destroy(&s->bootstrap_present_mutex);
     qemu_mutex_destroy(&s->session_mutex);
@@ -2587,51 +2883,131 @@ fail_log:
     agfx_log_stop(s);
 }
 
+typedef struct AgfxLifecycleWork {
+    void (*fn)(void *);
+    void *opaque;
+    bool completed;
+} AgfxLifecycleWork;
+
+static void *agfx_lifecycle_work_thread(void *opaque)
+{
+    AgfxLifecycleWork *work = opaque;
+
+    work->fn(work->opaque);
+    qatomic_set(&work->completed, true);
+    aio_wait_kick();
+    return NULL;
+}
+
+/* Reuse the actual main-AIO-pumped lifecycle join: the waited-on worker may
+ * need a main/BQL DMA or dirty BH before it can return. No lock its accepted
+ * descendants need may be held across this wait. */
+static void agfx_run_lifecycle_work(void (*fn)(void *), void *opaque)
+{
+    AgfxLifecycleWork work = { .fn = fn, .opaque = opaque };
+    QemuThread worker;
+
+    qemu_thread_create(&worker, "agfx-lifecycle", agfx_lifecycle_work_thread,
+                       &work, QEMU_THREAD_JOINABLE);
+    AIO_WAIT_WHILE(NULL, !qatomic_read(&work.completed));
+    qemu_thread_join(&worker);
+}
+
+static void agfx_join_mmio_worker(void *opaque)
+{
+    AppleGfxMLState *s = opaque;
+
+    qemu_thread_join(&s->mmio_worker);
+}
+
+static void agfx_join_bootstrap_worker(void *opaque)
+{
+    AppleGfxMLState *s = opaque;
+
+    qemu_thread_join(&s->bootstrap_present_worker);
+}
+
+static void agfx_free_render_pool(void *opaque)
+{
+    AppleGfxMLState *s = opaque;
+
+    thread_pool_free(s->render_pool);
+}
+
+static void agfx_destroy_qmu(void *opaque)
+{
+    AppleGfxMLState *s = opaque;
+
+    qmu_destroy(s->qmu_dev);
+}
+
+typedef struct AgfxQuiesceWork {
+    qmu_session *session;
+    qmu_status status;
+} AgfxQuiesceWork;
+
+static void agfx_quiesce_session(void *opaque)
+{
+    AgfxQuiesceWork *work = opaque;
+
+    work->status =
+        qmu_session_quiesce_host_callback_producers_deferred(work->session);
+}
+
 static void agfx_exit(PCIDevice *pci_dev)
 {
     AppleGfxMLState *s = APPLE_GFX_ML(pci_dev);
-    AppleGfxMLSessionJob *job;
+    AgfxQuiesceWork work = { .session = s->qmu_dev, .status = QMU_ERROR };
+
+    /* PCI has removed its I/O regions before calling exit. This caller is
+     * external to an accepted Session operation; keep State live through
+     * Console unlink and every actual finalizer below. */
+    object_ref(OBJECT(s));
 
     agfx_log(s, "[apple-gfx-ml] Device exit\n");
 
     /* Stop async MMIO worker thread */
     qatomic_set(&s->mmio_worker_stop, true);
     qemu_sem_post(&s->mmio_sem);  /* Wake to exit */
-    qemu_thread_join(&s->mmio_worker);
+    agfx_run_lifecycle_work(agfx_join_mmio_worker, s);
     qemu_sem_destroy(&s->mmio_sem);
 
-    if (s->render_pool) {
-        thread_pool_free(s->render_pool);
-        s->render_pool = NULL;
-    }
+    /* Close autonomous wrapper roots, not its accepted control/source
+     * executor: a queued original may still publish its intentional cancel. */
+    qemu_mutex_lock(&s->bootstrap_present_mutex);
+    s->bootstrap_present_roots_stopped = true;
+    qemu_cond_signal(&s->bootstrap_present_cond);
+    qemu_mutex_unlock(&s->bootstrap_present_mutex);
+
+    agfx_run_lifecycle_work(agfx_quiesce_session, &work);
+    /* Transport the SAME exception back to its actual main caller before any
+     * destruction or void PCI-parent return. Do not turn it into success. */
+    qmu_session_rethrow_quiesce(s->qmu_dev);
+    /* Invalid prerequisites likewise never authorize deletion. Actual pending
+     * native work keeps the real provider barrier itself pending; this only
+     * preserves owners if that provider rejects an invalid lifecycle caller. */
+    AIO_WAIT_WHILE(NULL, work.status != QMU_OK);
+    assert(!s->deferred_frame_owner.state);
 
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     s->bootstrap_present_worker_stop = true;
-    agfx_cancel_frame_presents_locked(s);
-    agfx_free_bootstrap_present_commands_locked(s);
     qemu_cond_signal(&s->bootstrap_present_cond);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
-    qemu_thread_join(&s->bootstrap_present_worker);
+    agfx_run_lifecycle_work(agfx_join_bootstrap_worker, s);
+    qemu_mutex_lock(&s->bootstrap_present_mutex);
+    agfx_cancel_frame_presents_locked(s);
+    qemu_mutex_unlock(&s->bootstrap_present_mutex);
 
-    qemu_mutex_lock(&s->mmio_job_mutex);
-    job = s->session_job_head;
-    s->session_job_head = NULL;
-    s->session_job_tail = NULL;
-    qemu_mutex_unlock(&s->mmio_job_mutex);
-    while (job) {
-        AppleGfxMLSessionJob *next = job->next;
-        if (job->heap_owned) {
-            g_free(job);
-        }
-        job = next;
+    /* All intentional CPU/frame/UI/IRQ/DMA descendants have returned at the
+     * canonical owner barrier, not merely at an empty QEMU queue snapshot. */
+    if (s->render_pool) {
+        agfx_run_lifecycle_work(agfx_free_render_pool, s);
+        s->render_pool = NULL;
     }
+    agfx_run_lifecycle_work(agfx_destroy_qmu, s);
+    s->qmu_dev = NULL;
 
-    /* Destroy qmetal device (stops display thread) */
-    if (s->qmu_dev) {
-        qmu_destroy(s->qmu_dev);
-        s->qmu_dev = NULL;
-    }
-
+    agfx_completion_queue_destroy(s);
     qemu_mutex_destroy(&s->mmio_job_mutex);
     qemu_mutex_destroy(&s->session_mutex);
     qemu_cond_destroy(&s->bootstrap_present_cond);
@@ -2645,6 +3021,16 @@ static void agfx_exit(PCIDevice *pci_dev)
         cursor_unref(s->cursor);
         s->cursor = NULL;
     }
+    if (s->con) {
+        graphic_console_close(s->con);
+        s->con = NULL;
+    }
+    vmstate_unregister_ram(&s->host_vram, DEVICE(s));
+    if (s->msi_used) {
+        msi_uninit(pci_dev);
+        s->msi_used = false;
+    }
+    object_unref(OBJECT(s));
 }
 
 static void agfx_reset(Object *obj, ResetType type)
@@ -2722,6 +3108,7 @@ static void agfx_instance_init(Object *obj)
     s->session_job_head = NULL;
     s->session_job_tail = NULL;
     s->bootstrap_present_worker_stop = false;
+    s->bootstrap_present_roots_stopped = false;
     s->bootstrap_present_cmd_head = NULL;
     s->bootstrap_present_cmd_tail = NULL;
     s->bootstrap_present_timer.active = false;

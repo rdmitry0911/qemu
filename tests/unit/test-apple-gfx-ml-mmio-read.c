@@ -1,8 +1,9 @@
 /*
  * Actual normal AppleGfxML MemoryRegion.read and ThreadPoolAIO controls.
- * Real failed cold-plug leaves an externally retained, initialized MMIO MR.
- * A unit-only opaque getter is attached to that MR, not a successful factory
- * or native/GPU session. No production leaf is copied into this fixture.
+ * The actual factory creates the Session required by accepted-work ownership.
+ * Getter observation forwards the real function/arguments/result; no opaque
+ * Session cookie or token provider. Historical fake-cookie receipts remain
+ * baseline evidence only. No production leaf is copied into this fixture.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -24,7 +25,6 @@
 
 typedef struct ReadControl {
     AppleGfxMLState *state;
-    qmu_session *opaque_session;
     const MemoryRegionOps *candidate_ops;
     const AIOCBInfo *request_type;
     unsigned accepted;
@@ -35,7 +35,6 @@ typedef struct ReadControl {
     unsigned expected_size;
     unsigned held_release;
     unsigned foreign_release;
-    uint32_t sparse_value;
     bool baseline;
     bool held;
     bool strict_args;
@@ -44,13 +43,15 @@ typedef struct ReadControl {
 
 static ReadControl control;
 static PCIHostState *host;
-static char opaque_token;
 int (*qemu_main)(void);
 
 uint64_t agfx_test_baseline_mmio_read(void *, hwaddr, unsigned);
 qmu_session *__wrap_qmu_create_extended(const qmu_extended_config *,
                                        const qmu_extended_callbacks *);
+qmu_session *__real_qmu_create_extended(const qmu_extended_config *,
+                                       const qmu_extended_callbacks *);
 uint64_t __wrap_qmu_mmio_read(qmu_session *, uint32_t, unsigned);
+uint64_t __real_qmu_mmio_read(qmu_session *, uint32_t, unsigned);
 BlockAIOCB *__real_thread_pool_submit_aio(ThreadPoolFunc *, void *,
                                          BlockCompletionFunc *, void *);
 BlockAIOCB *__wrap_thread_pool_submit_aio(ThreadPoolFunc *, void *,
@@ -75,8 +76,8 @@ qmu_session *__wrap_qmu_create_extended(const qmu_extended_config *cfg,
     g_assert_cmpuint(cfg->struct_size, ==, sizeof(*cfg));
     g_assert_cmpuint(cb->struct_size, ==, sizeof(*cb));
     g_assert_true(cb->user_ctx == control.state);
-    /* No callback or context retained, no real factory/GPU initialization. */
-    return NULL;
+    /* Actual factory/admission/Device; no fabricated Session/work provider. */
+    return __real_qmu_create_extended(cfg, cb);
 }
 
 static void release_getter(void *opaque)
@@ -98,9 +99,11 @@ static void foreign_context(void *opaque)
 uint64_t __wrap_qmu_mmio_read(qmu_session *session, uint32_t offset,
                               unsigned size)
 {
-    g_assert_true(session == control.opaque_session);
     g_assert_true(control.state->qmu_dev == session);
     g_assert_cmpint(bql_locked(), ==, control.baseline);
+    if (!control.baseline) {
+        g_assert_nonnull(qmu_session_current_host_work(session));
+    }
     if (control.strict_args) {
         g_assert_cmpuint(offset, ==, control.expected_offset);
         g_assert_cmpuint(size, ==, control.expected_size);
@@ -113,8 +116,7 @@ uint64_t __wrap_qmu_mmio_read(qmu_session *session, uint32_t offset,
         aio_bh_schedule_oneshot(qemu_get_aio_context(), release_getter, &control);
         qemu_event_wait(&control.release);
     }
-    return offset == 0x2000 ? control.sparse_value :
-        ((UINT32_C(0x53470000) ^ offset) + size);
+    return __real_qmu_mmio_read(session, offset, size);
 }
 
 BlockAIOCB *__wrap_thread_pool_submit_aio(ThreadPoolFunc *fn, void *arg,
@@ -125,8 +127,10 @@ BlockAIOCB *__wrap_thread_pool_submit_aio(ThreadPoolFunc *fn, void *arg,
     g_assert_true(qemu_get_current_aio_context() == qemu_get_aio_context());
     g_assert_nonnull(fn);
     g_assert_nonnull(arg);
-    g_assert_null(cb);
-    g_assert_null(opaque);
+    /* Actual worker-return callback retires the canonical child owner before
+     * releasing the main caller; request metadata remains independently live. */
+    g_assert_nonnull(cb);
+    g_assert_true(opaque == arg);
     ++control.accepted;
     ++control.pending;
     request = __real_thread_pool_submit_aio(fn, arg, cb, opaque);
@@ -175,6 +179,7 @@ static uint64_t read32(uint32_t offset)
 static void test_values_and_worker(void)
 {
     const uint32_t offsets[] = { 0x1000, 0x100c, 0x1014, 0x1018, 0x122c };
+    const uint32_t expected[] = { 0, 0, 0, 0, 1 };
     const unsigned before = qatomic_read(&control.getter_calls);
     const unsigned accepted = control.accepted;
 
@@ -183,7 +188,7 @@ static void test_values_and_worker(void)
     for (unsigned i = 0; i < ARRAY_SIZE(offsets); ++i) {
         control.expected_offset = offsets[i];
         g_assert_cmphex(read32(offsets[i]), ==,
-                       (UINT32_C(0x53470000) ^ offsets[i]) + 4);
+                       expected[i]);
     }
     control.strict_args = false;
     g_assert_cmpuint(qatomic_read(&control.getter_calls) - before, ==,
@@ -199,7 +204,7 @@ static void test_main_context_progress(void)
     control.foreign_release = 0;
     qemu_event_init(&control.release, false);
     aio_bh_schedule_oneshot(iohandler_get_aio_context(), foreign_context, &control);
-    g_assert_cmphex(read32(0x100c), ==, (UINT32_C(0x53470000) ^ 0x100c) + 4);
+    g_assert_cmphex(read32(0x100c), ==, 0);
     g_assert_cmpuint(control.held_release, ==, 1);
     g_assert_cmpuint(control.foreign_release, ==, 0);
     control.held = false;
@@ -212,28 +217,27 @@ static void test_main_context_progress(void)
 
 static void test_dispatch_size_and_sparse_value(void)
 {
-    const uint32_t granularities[] = { 0, 4096, 65536 };
+    const uint64_t granularity =
+        __real_qmu_mmio_read(control.state->qmu_dev, 0x2000, 4);
     uint64_t value;
     unsigned before = qatomic_read(&control.getter_calls);
     unsigned accepted = control.accepted;
 
     g_assert_cmpint(memory_region_dispatch_read(&control.state->mmio, 0x1000,
                    &value, MO_64, MEMTXATTRS_UNSPECIFIED), ==, MEMTX_OK);
-    g_assert_cmphex(value, ==,
-       ((uint64_t)((UINT32_C(0x53470000) ^ 0x1004) + 4) << 32) |
-                  ((UINT32_C(0x53470000) ^ 0x1000) + 4));
+    g_assert_cmphex(value, ==, 0); /* Fresh FIFO_ENABLE and FIFO_SIZE. */
     g_assert_cmpuint(qatomic_read(&control.getter_calls) - before, ==, 2);
     g_assert_cmpuint(control.accepted - accepted, ==, 2);
     control.strict_args = true;
     control.expected_offset = 0x2000;
     control.expected_size = 4;
-    for (unsigned i = 0; i < ARRAY_SIZE(granularities); ++i) {
-        control.sparse_value = granularities[i];
-        g_assert_cmpuint(read32(0x2000), ==, granularities[i]);
+    for (unsigned i = 0; i < 3; ++i) {
+        g_assert_cmpuint(read32(0x2000), ==, granularity);
     }
     control.strict_args = false;
     drain_metadata();
-    g_test_message("0x2000 values are opaque unit forwarding cases, not physical adapter capability evidence");
+    g_test_message("0x2000 forwards the SAME actual provider value=%" PRIu64
+                   "; no injected granularity or all-adapter claim", granularity);
 }
 
 static void test_preserved_direct_baseline(void)
@@ -245,7 +249,7 @@ static void test_preserved_direct_baseline(void)
     old_ops.read = agfx_test_baseline_mmio_read;
     control.state->mmio.ops = &old_ops;
     control.baseline = true;
-    g_assert_cmphex(read32(0x1018), ==, (UINT32_C(0x53470000) ^ 0x1018) + 4);
+    g_assert_cmphex(read32(0x1018), ==, 0);
     g_assert_cmpuint(control.accepted, ==, accepted);
     control.baseline = false;
     control.state->mmio.ops = saved;
@@ -263,7 +267,7 @@ static uint64_t measure(bool baseline, unsigned iterations)
     control.baseline = baseline;
     start = now_ns();
     for (unsigned i = 0; i < iterations; ++i) {
-        g_assert_cmphex(read32(0x100c), ==, (UINT32_C(0x53470000) ^ 0x100c) + 4);
+        g_assert_cmphex(read32(0x100c), ==, 0);
     }
     elapsed = now_ns() - start;
     control.baseline = false;
@@ -300,7 +304,7 @@ static void test_cold_warm_cost(void)
                        " dispatch_ns=%" PRIu64,
                        i, iterations, old_time, new_time);
     }
-    g_test_message("UNIT CPU dispatch cost includes typed getter and lightweight submit/reap observation; no Device/GPU throughput or nonregression proof");
+    g_test_message("CPU cost includes actual Session work/getter and lightweight submit/reap observation; no GPU throughput or nonregression proof");
 }
 
 static const TypeInfo test_host_type = {
@@ -324,7 +328,6 @@ int main(int argc, char **argv)
                         options[4], options[5], options[6], options[7], NULL};
     bool cost = false;
     bool saved_msi;
-    Error *error = NULL;
     int status;
 
     for (int i = 1; i < argc; ++i) {
@@ -345,21 +348,18 @@ int main(int argc, char **argv)
     control.state = APPLE_GFX_ML(object_new(TYPE_APPLE_GFX_ML));
     DEVICE(control.state)->hotplugged = false;
     control.state->vram_size_mb = 1;
+    control.state->display_width = 16;
+    control.state->display_height = 12;
     saved_msi = msi_nonbroken;
     msi_nonbroken = true;
-    g_assert_false(qdev_realize(DEVICE(control.state), BUS(host->bus), &error));
-    g_assert_nonnull(error);
-    g_assert_nonnull(strstr(error_get_pretty(error), "Failed to create qmetal device"));
-    error_free(error);
-    g_assert_false(DEVICE(control.state)->realized);
-    g_assert_null(control.state->qmu_dev);
-    g_assert_null(control.state->render_pool);
-    g_assert_null(control.state->con);
-    g_assert_false(control.state->log_writer_started);
+    g_assert_true(qdev_realize(DEVICE(control.state), BUS(host->bus), &error_abort));
+    g_assert_true(DEVICE(control.state)->realized);
+    g_assert_nonnull(control.state->qmu_dev);
+    g_assert_nonnull(control.state->render_pool);
+    g_assert_nonnull(control.state->con);
+    g_assert_true(control.state->log_writer_started);
     control.candidate_ops = control.state->mmio.ops;
     g_assert_nonnull(control.candidate_ops->read);
-    control.opaque_session = (qmu_session *)&opaque_token;
-    control.state->qmu_dev = control.opaque_session;
 
     if (cost) {
         g_test_add_func("/agfx/mmio-read/cold-warm-cost", test_cold_warm_cost);
@@ -371,7 +371,12 @@ int main(int argc, char **argv)
     }
     status = g_test_run();
     drain_metadata();
-    control.state->qmu_dev = NULL;
+    /* Actual production pumped owner barrier and matching resource teardown. */
+    qdev_unrealize(DEVICE(control.state));
+    g_assert_null(control.state->qmu_dev);
+    g_assert_null(control.state->render_pool);
+    g_assert_null(control.state->con);
+    g_assert_false(msi_present(PCI_DEVICE(control.state)));
     object_unparent(OBJECT(control.state));
     object_unref(OBJECT(control.state));
     /* Explicit AS owner retirement followed by queued RAM reclaim, as already

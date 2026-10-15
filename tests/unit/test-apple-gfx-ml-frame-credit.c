@@ -51,6 +51,10 @@ typedef struct CreditControl {
     unsigned fence_count, selected;
     unsigned render_jobs, render_retired, positive, nonpositive;
     unsigned scheduled, original_returns, callbacks, callback_returns, irq_calls;
+    unsigned original_entries, original_depth, max_original_depth;
+    unsigned quiesce_entries, quiesce_returns;
+    bool nested_probe, nested_probe_ran, stop_accepted;
+    qmu_session_work *deferred_work;
     unsigned pending_at_callback[MAX_FENCES];
     bool pixels_at_callback[MAX_FENCES];
     void *shared_maps[2];
@@ -64,12 +68,14 @@ typedef struct OriginalCall {
     CreditControl *control;
     void (*fn)(void *);
     void *opaque;
+    unsigned ordinal;
 } OriginalCall;
 typedef struct RenderCall {
     CreditControl *control;
     ThreadPoolFunc *fn;
     void *opaque;
     GDestroyNotify destroy;
+    qmu_session_work *expected_work;
 } RenderCall;
 typedef struct TransportCall {
     CreditControl *control;
@@ -82,6 +88,7 @@ typedef struct TransportCall {
 
 static CreditControl *active;
 static __thread CreditControl *render_caller;
+static __thread qmu_session_work *render_work;
 static PCIHostState *host;
 static void (*parent_exit)(PCIDevice *);
 static PFN_vkCreateFence real_create_fence;
@@ -100,6 +107,8 @@ void __real_thread_pool_submit_immediate(ThreadPool *, ThreadPoolFunc *, void *,
                                          GDestroyNotify);
 void __wrap_thread_pool_submit_immediate(ThreadPool *, ThreadPoolFunc *, void *,
                                          GDestroyNotify);
+qmu_status __real_qmu_session_quiesce_host_callback_producers_deferred(qmu_session *);
+qmu_status __wrap_qmu_session_quiesce_host_callback_producers_deferred(qmu_session *);
 
 static void changed(CreditControl *c)
 {
@@ -233,8 +242,28 @@ static void original_return(void *opaque)
     OriginalCall *call = opaque;
     CreditControl *c = call->control;
     g_assert_true(bql_locked());
+    g_assert_nonnull(qmu_session_current_host_work(c->state->qmu_dev));
+    g_mutex_lock(&c->mutex);
+    g_assert_cmpuint(call->ordinal, ==, ++c->original_entries);
+    ++c->original_depth;
+    c->max_original_depth = MAX(c->max_original_depth, c->original_depth);
+    bool probe = c->nested_probe && !c->nested_probe_ran;
+    c->nested_probe_ran |= probe;
+    if (probe) {
+        /* Fresh IOSFC publication synchronously appends Mode THEN NFS before
+         * returning to first()'s pump. Require an actual independent original
+         * already published, so depth1 during nested AIO is not vacuous. */
+        g_assert_cmpuint(c->scheduled, >, c->original_entries);
+    }
+    g_mutex_unlock(&c->mutex);
+    if (probe) {
+        /* Actual nested main-AIO polling, not direct invocation of a queue
+         * leaf. A second accepted original must not enter before this returns. */
+        aio_poll(qemu_get_aio_context(), false);
+    }
     call->fn(call->opaque); /* Original typed fn alone retires original ctx. */
     g_mutex_lock(&c->mutex);
+    --c->original_depth;
     ++c->original_returns;
     changed(c);
     g_mutex_unlock(&c->mutex);
@@ -246,11 +275,13 @@ static void observe_schedule(void *opaque, void (*fn)(void *), void *context)
     CreditControl *c = active;
     g_assert_true(opaque == c->state);
     OriginalCall *call = g_new(OriginalCall, 1);
-    *call = (OriginalCall) {c, fn, context};
+    *call = (OriginalCall) {.control = c, .fn = fn, .opaque = context};
     g_mutex_lock(&c->mutex);
-    ++c->scheduled;
-    g_mutex_unlock(&c->mutex);
+    call->ordinal = ++c->scheduled;
+    /* Establish known publication order through the actual scheduler. It
+     * only appends, never calls an original inline under this observer lock. */
     c->original.schedule_display_completion(opaque, original_return, call);
+    g_mutex_unlock(&c->mutex);
 }
 
 static void observe_completion(void *opaque,
@@ -258,6 +289,7 @@ static void observe_completion(void *opaque,
 {
     CreditControl *c = active;
     g_assert_true(opaque == c->state);
+    g_assert_nonnull(qmu_session_current_host_work(c->state->qmu_dev));
     g_mutex_lock(&c->mutex);
     unsigned index = c->callbacks++;
     g_assert_cmpuint(index, <, MAX_FENCES);
@@ -354,6 +386,8 @@ int __wrap_qmu_vk_submit_captured_display_frame(void *context)
     CreditControl *c = render_caller;
     g_assert_nonnull(c);
     g_assert_false(bql_locked());
+    g_assert_nonnull(render_work);
+    g_assert_true(qmu_session_current_host_work(c->state->qmu_dev) == render_work);
     int result = __real_qmu_vk_submit_captured_display_frame(context);
     g_mutex_lock(&c->mutex);
     if (result > 0) {
@@ -371,8 +405,10 @@ static int render_original(void *opaque)
     RenderCall *call = opaque;
     g_assert_null(render_caller);
     render_caller = call->control;
+    render_work = call->expected_work;
     int result = call->fn(call->opaque);
     render_caller = NULL;
+    render_work = NULL;
     return result;
 }
 
@@ -396,8 +432,14 @@ void __wrap_thread_pool_submit_immediate(ThreadPool *pool, ThreadPoolFunc *fn,
     CreditControl *c = active;
     g_assert_true(pool == c->state->render_pool);
     RenderCall *call = g_new(RenderCall, 1);
-    *call = (RenderCall) {c, fn, opaque, destroy};
+    *call = (RenderCall) {.control = c, .fn = fn, .opaque = opaque,
+                         .destroy = destroy};
+    call->expected_work = qmu_session_current_host_work(c->state->qmu_dev);
+    g_assert_nonnull(call->expected_work);
     g_mutex_lock(&c->mutex);
+    if (c->render_jobs == 1 && c->deferred_work) {
+        g_assert_true(call->expected_work == c->deferred_work);
+    }
     ++c->render_jobs;
     g_mutex_unlock(&c->mutex);
     __real_thread_pool_submit_immediate(pool, render_original, call,
@@ -488,6 +530,41 @@ static void release_observation(CreditControl *c)
     g_mutex_unlock(&c->mutex);
 }
 
+static void release_during_quiesce_bh(void *opaque)
+{
+    CreditControl *c = opaque;
+
+    g_assert_true(c->destroying);
+    g_assert_nonnull(c->state->qmu_dev);
+    g_assert_nonnull(c->state->render_pool);
+    g_assert_nonnull(c->state->con);
+    g_assert_true(msi_present(PCI_DEVICE(c->state)));
+    g_assert_cmpint(c->state->pending_frames, ==, 2);
+    g_assert_true(c->state->deferred_frame_owner.state == c->state);
+    g_assert_cmpuint(c->callbacks, ==, 0);
+    release_observation(c);
+}
+
+qmu_status __wrap_qmu_session_quiesce_host_callback_producers_deferred(
+    qmu_session *session)
+{
+    CreditControl *c = active;
+
+    g_assert_true(session == c->state->qmu_dev);
+    g_assert_false(bql_locked());
+    ++c->quiesce_entries;
+    if (c->stop_accepted) {
+        /* Control only when real observation is released. The real barrier,
+         * QueueSubmit, Wait, result and production callbacks are unchanged. */
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                               release_during_quiesce_bh, c);
+    }
+    qmu_status status =
+        __real_qmu_session_quiesce_host_callback_producers_deferred(session);
+    ++c->quiesce_returns;
+    return status;
+}
+
 static void drain_rcu(void)
 {
     bql_unlock();
@@ -500,23 +577,27 @@ static void fixture_exit(PCIDevice *device)
     CreditControl *c = active;
     g_assert_true(device == PCI_DEVICE(c->state));
     g_assert_true(c->destroying);
-    g_assert_true(idle(c));
-    parent_exit(device); /* Unchanged actual agfx_exit, not a fake stop. */
+    if (!c->stop_accepted) {
+        g_assert_true(idle(c));
+    }
+    parent_exit(device); /* Actual pumped stop and physical/child owner barrier. */
     g_assert_null(c->state->qmu_dev);
     g_assert_null(c->state->render_pool);
     g_assert_true(idle(c));
+    g_assert_cmpuint(c->quiesce_entries, ==, 1);
+    g_assert_cmpuint(c->quiesce_returns, ==, 1);
+    g_assert_null(c->state->deferred_frame_owner.state);
+    g_assert_cmpuint(c->max_original_depth, ==, 1);
+    g_assert_null(c->state->con);
+    g_assert_false(msi_present(device));
     g_assert_cmpuint(c->map_count, ==, c->unmap_count);
     g_assert_null(c->shared_maps[0]);
     g_assert_null(c->shared_maps[1]);
     for (unsigned i = 0; i < c->fence_count; ++i) {
         g_assert_true(c->fences[i].destroyed);
     }
-    /* Test-only owners, after real producer stop and while PCI config/MR
-     * remain alive. Product exit and parent PCI unregister are unchanged. */
-    graphic_console_close(c->state->con);
-    vmstate_unregister_ram(&c->state->host_vram, DEVICE(c->state));
-    g_assert_true(msi_present(device));
-    msi_uninit(device);
+    /* Product exit now retires its own matching Console/RAM/MSI owners while
+     * PCI config/MR remain live. Do not perform a second test-only retirement. */
 }
 
 static void fixture_class_init(ObjectClass *klass, const void *data)
@@ -578,13 +659,14 @@ static void create(CreditControl *c, enum AgfxCreditFamily family)
 static void dispose(CreditControl *c)
 {
     TransportCall control;
-    pump_until(c, idle);
-    /* This fixture has no guest/vCPU, mapped IOSFC timer, EXEC, transaction,
-     * stamp or further producer input. Last real invalidate retires its
-     * bounded display records/source callbacks, not a global B1 stop API. */
-    start_transport(&control, c, 0);
-    finish_transport(&control);
-    pump_until(c, idle);
+    if (!c->stop_accepted) {
+        pump_until(c, idle);
+        /* These cases revoke their finite output before final stop. The new
+         * active-stop case deliberately performs no such pre-drain. */
+        start_transport(&control, c, 0);
+        finish_transport(&control);
+        pump_until(c, idle);
+    }
     c->destroying = true;
     qdev_unrealize(DEVICE(c->state));
     object_unparent(OBJECT(c->state));
@@ -595,7 +677,7 @@ static void dispose(CreditControl *c)
     memory_region_del_subregion(get_system_memory(), &c->ram->ram);
     object_unref(OBJECT(c->ram));
     drain_rcu();
-    g_test_message("backend_transfers=%u render_native_submits=%u callbacks=%u local_nonpositive=%u; all render-native fences actually terminal; finite fixture cleanup only, NOT global B1 quiescence",
+    g_test_message("backend_transfers=%u render_native_submits=%u callbacks=%u local_nonpositive=%u; real component owner barrier and terminal fences, NOT VM/whole runtime closure",
                      c->positive, c->fence_count, c->callbacks, c->nonpositive);
     active = NULL;
     g_cond_clear(&c->cond);
@@ -635,7 +717,13 @@ static void test_normal(void)
 
 static bool two_credits(CreditControl *c)
 {
-    return __atomic_load_n(&c->state->pending_frames, __ATOMIC_SEQ_CST) == 2;
+    if (__atomic_load_n(&c->state->pending_frames, __ATOMIC_SEQ_CST) != 2) {
+        return false;
+    }
+    g_assert_true(c->state->deferred_frame_owner.state == c->state);
+    g_assert_nonnull(c->state->deferred_frame_owner.work);
+    c->deferred_work = c->state->deferred_frame_owner.work;
+    return true;
 }
 
 static bool second_completed(CreditControl *c)
@@ -707,6 +795,23 @@ static void test_port(enum AgfxCreditFamily family)
 static void test_port_iosfc(void) { test_port(AGFX_CREDIT_IOSFC); }
 static void test_port_texture(void) { test_port(AGFX_CREDIT_TEXTURE); }
 
+static void test_owner_stop_two(void)
+{
+    CreditControl c;
+
+    create(&c, AGFX_CREDIT_IOSFC);
+    c.nested_probe = true;
+    first(&c, AGFX_CREDIT_IOSFC);
+    g_assert_true(c.nested_probe_ran);
+    publish(&c, AGFX_CREDIT_IOSFC, 0xff405060);
+    pump_until(&c, two_credits);
+    c.stop_accepted = true;
+    dispose(&c); /* No reset/invalidate/idle pre-drain before actual exit. */
+    g_assert_cmpuint(c.positive, ==, 2);
+    g_assert_cmpuint(c.callbacks, ==, 2);
+    g_assert_cmpuint(c.nonpositive, ==, 0);
+}
+
 static char *provider_path(void *symbol)
 {
     Dl_info info = {0};
@@ -772,6 +877,9 @@ int main(int argc, char **argv)
     resolved("normal-capture-submit",
              (void *)&__real_qmu_vk_submit_captured_display_frame, dso_provider);
     resolved("real-factory", (void *)&__real_qmu_create_extended, dso_provider);
+    resolved("real-owner-barrier",
+             (void *)&__real_qmu_session_quiesce_host_callback_producers_deferred,
+             dso_provider);
     resolved("matched-AIR", dlsym(RTLD_DEFAULT, "air2spirv_context_create"),
              air_provider);
     resolved("interposed-wait", (void *)&vkWaitForFences, argv[0]);
@@ -792,6 +900,7 @@ int main(int argc, char **argv)
     g_test_add_func("/agfx/frame-credit/reset-two", test_reset_two);
     g_test_add_func("/agfx/frame-credit/port-iosfc", test_port_iosfc);
     g_test_add_func("/agfx/frame-credit/port-texture", test_port_texture);
+    g_test_add_func("/agfx/frame-credit/owner-stop-two", test_owner_stop_two);
     int status = g_test_run();
     msi_nonbroken = saved_msi;
     pci_root_bus_cleanup(host->bus);
