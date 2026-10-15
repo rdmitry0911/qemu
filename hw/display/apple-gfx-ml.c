@@ -2657,7 +2657,8 @@ static void agfx_reset(Object *obj, ResetType type)
     s->display_enabled = false;
     s->new_frame_ready = false;
     s->gfx_update_requested = false;
-    s->pending_frames = 0;
+    /* Reference PCI reset preserves accepted host frame credits until their
+     * encode/completion paths retire them. */
     s->mmio_wait_active = 0;
     s->rendering_frame_width = 0;
     s->rendering_frame_height = 0;

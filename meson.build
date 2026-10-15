@@ -4447,6 +4447,21 @@ foreach target : target_dirs
                         '-Wl,--wrap=thread_pool_submit_aio',
                         '-Wl,--wrap=qemu_aio_unref'],
           'install': false,
+        }, {
+          'name': 'test-apple-gfx-ml-frame-credit',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-frame-credit.c',
+                           'tests/unit/apple-gfx-ml-credit-test-bridge.cpp'),
+          'include_directories': target_inc,
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qmu_create_extended',
+                        '-Wl,--wrap=qmu_vk_submit_captured_display_frame',
+                        '-Wl,--wrap=thread_pool_submit_immediate',
+                        '-Wl,--export-dynamic-symbol=vkCreateFence',
+                        '-Wl,--export-dynamic-symbol=vkDestroyFence',
+                        '-Wl,--export-dynamic-symbol=vkQueueSubmit',
+                        '-Wl,--export-dynamic-symbol=vkWaitForFences'],
+          'install': false,
         }]
       endif
     endif
@@ -4553,6 +4568,11 @@ foreach target : target_dirs
     if exe['name'] == 'test-apple-gfx-ml-mmio-read'
       test('apple-gfx-ml-mmio-read', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-frame-credit'
+      test('apple-gfx-ml-frame-credit', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 90, suite: ['native-component'])
       continue
     endif
 
