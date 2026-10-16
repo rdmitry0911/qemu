@@ -5,6 +5,23 @@
 For the apple-virgl host stack, `main` is the starting point and integration
 authority in each of AppleVirgl, QEMU, QMetal, and air2spirv.
 
+Integrate and publish every independently verified debt-reduction step into
+that component's main immediately; do not wait for unrelated debts, another
+component, or the entire project to be finished. Choose a coherent causal unit
+with proportionate required gates, not an incomplete semantic fragment. The
+next repair cycle starts from this newly advanced main, not an older baseline.
+Do not accumulate accepted progress only in worktrees, build archives or reports.
+
+Keep committed-main acceptance and the strongest preserved per-input coverage
+as separate baselines. Before a new cycle, reconcile accepted prior work and
+compare against both; a no-regression result against a weaker main does not
+erase losses relative to a stronger preserved candidate. Record exact missing
+inputs, source/build identities and unresolved correctness/performance holds.
+Recover reusable solutions instead of reimplementing them. A higher raw PASS
+count alone does not authorize unverified semantics or a public-ABI change.
+Publication must preserve previously accepted behavior; failed or unmeasured
+gates remain explicit debts, not reasons to postpone an independent passed unit.
+
 After a causal layer is source-complete and has passed the applicable component
 gates, merge its reviewed host commits into that repository's `main` and
 immediately push `main` to the host-authoritative `origin`. Record the merge
