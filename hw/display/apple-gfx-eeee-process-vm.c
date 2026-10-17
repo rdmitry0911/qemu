@@ -288,8 +288,16 @@ AgfxEeeeSourceBacking *agfx_eeee_source_backing_capture(
     AgfxEeeeProviderState *state, uint64_t address, uint64_t length,
     uint64_t alignment)
 {
+    return agfx_eeee_source_backing_capture_extent(state, address, length, 0,
+                                                  alignment);
+}
+
+AgfxEeeeSourceBacking *agfx_eeee_source_backing_capture_extent(
+    AgfxEeeeProviderState *state, uint64_t address, uint64_t length,
+    uint64_t minimum_allocation_bytes, uint64_t alignment)
+{
     const uint64_t page = qemu_real_host_page_size();
-    uint64_t start, view_offset, mapped_length, position;
+    uint64_t start, view_offset, extent, mapped_length, position;
     AgfxEeeeAllocation *allocation;
     AgfxEeeeSourceBacking *source;
     void *reservation;
@@ -303,8 +311,14 @@ AgfxEeeeSourceBacking *agfx_eeee_source_backing_capture(
     }
     start = address - address % page;
     view_offset = address - start;
-    if (length > UINT64_MAX - view_offset ||
-        !agfx_eeee_round_length(length + view_offset, alignment, &mapped_length) ||
+    if (length > UINT64_MAX - view_offset) {
+        return NULL;
+    }
+    /* Native allocation size and visible bytes are separate operands. Every
+     * extra byte still has to pass the SAME saved-alias coverage walk below;
+     * a larger minimum never authorizes padding, copying or GPA re-selection. */
+    extent = MAX(length + view_offset, minimum_allocation_bytes);
+    if (!agfx_eeee_round_length(extent, alignment, &mapped_length) ||
         !agfx_eeee_range(start, mapped_length) ||
         mapped_length > SIZE_MAX - alignment) {
         return NULL;

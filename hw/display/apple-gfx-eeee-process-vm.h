@@ -33,6 +33,17 @@ typedef struct AgfxEeeeSourceBacking AgfxEeeeSourceBacking;
 AgfxEeeeSourceBacking *agfx_eeee_source_backing_capture(
     AgfxEeeeProviderState *state, uint64_t address, uint64_t length,
     uint64_t alignment);
+/* General allocation-extent form. Keep visible length literal: V is always
+ * address modulo the actual native host page size, and allocation length is
+ * round_up(max(V + length, minimum_allocation_bytes), alignment). Minimum is
+ * relative to allocation base, not additional bytes after the visible range.
+ * The complete rounded allocation must be covered by the SAME saved admitted
+ * aliases under the provider lock. Missing tail/overflow fails with no logical
+ * mapping change. Capture/owner/final-BQL-release rules above are unchanged.
+ * The original capture API is exactly this operation with minimum zero. */
+AgfxEeeeSourceBacking *agfx_eeee_source_backing_capture_extent(
+    AgfxEeeeProviderState *state, uint64_t address, uint64_t length,
+    uint64_t minimum_allocation_bytes, uint64_t alignment);
 void agfx_eeee_source_backing_ref(AgfxEeeeSourceBacking *source);
 /* Final release may synchronously return through BQL. Never hold a provider
  * lock, or another lock needed by the main loop, across this call. */

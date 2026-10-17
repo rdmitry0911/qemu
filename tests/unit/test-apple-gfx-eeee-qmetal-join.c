@@ -505,6 +505,150 @@ static void test_persistent_source_backing(void)
     bql_lock();
 }
 
+/* Minimum-extent geometry uses the same actual RAM/provider/capture fixture,
+ * not the DMA syscall controls below. Only these five new cases need running
+ * for the allocation-extent unit; old exporter coverage remains separate. */
+typedef enum SourceMinimumCase {
+    SOURCE_MINIMUM_ZERO_COMPAT,
+    SOURCE_MINIMUM_COVERED_EXTRA,
+    SOURCE_MINIMUM_MISSING_TAIL,
+    SOURCE_MINIMUM_LITERAL_VIEW,
+    SOURCE_MINIMUM_OVERFLOW,
+} SourceMinimumCase;
+
+static void test_source_minimum_extent(gconstpointer data)
+{
+    SourceMinimumCase kind = GPOINTER_TO_UINT(data);
+    AppleGfxMLState ctx = {};
+    qmu_extended_callbacks cb = { .user_ctx = &ctx };
+    AgfxEeeeSourceBacking *source = NULL, *original = NULL;
+    uint64_t address, page, span, offset = 17, length;
+    unsigned finalized = 0;
+
+    ctx.eeee_provider_state = agfx_eeee_provider_state_create();
+    agfx_eeee_provider_fill_callbacks(&cb);
+    page = cb.eeee_task_host_page_size(&ctx);
+    span = 4 * page;
+    length = page - 34;
+    JoinRamOwner *owner = new_source_ram(span, page);
+    uint8_t *canonical = memory_region_get_ram_ptr(&owner->ram);
+
+    owner->finalized = &finalized;
+    memset(canonical, 0x47, span);
+    memory_region_add_subregion(get_system_memory(), JOIN_RAM_GPA, &owner->ram);
+    cb.eeee_task_lock(&ctx);
+    cb.eeee_task_region_ref(&ctx, &owner->ram);
+    cb.eeee_task_unlock(&ctx);
+    g_assert_cmpint(cb.eeee_task_allocate(&ctx, &address, span,
+        QMU_EEEE_TASK_ALLOCATE_ANYWHERE), ==, 1);
+    source_remap(&ctx, &cb, address, page, canonical);
+    if (kind != SOURCE_MINIMUM_MISSING_TAIL) {
+        source_remap(&ctx, &cb, address + page, span - page, canonical + page);
+    }
+
+    switch (kind) {
+    case SOURCE_MINIMUM_ZERO_COMPAT: {
+        original = agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+            address + offset, length, page);
+        source = agfx_eeee_source_backing_capture_extent(ctx.eeee_provider_state,
+            address + offset, length, 0, page);
+        g_assert_nonnull(original);
+        g_assert_nonnull(source);
+        g_assert_cmpuint(agfx_eeee_source_backing_allocation_length(source), ==,
+            agfx_eeee_source_backing_allocation_length(original));
+        g_assert_cmpuint(agfx_eeee_source_backing_visible_offset(source), ==,
+            agfx_eeee_source_backing_visible_offset(original));
+        g_assert_cmpuint(agfx_eeee_source_backing_length(source), ==,
+            agfx_eeee_source_backing_length(original));
+        const unsigned count = agfx_eeee_source_backing_interval_count(original);
+        g_assert_cmpuint(agfx_eeee_source_backing_interval_count(source), ==, count);
+        for (unsigned i = 0; i < count; ++i) {
+            AgfxEeeeSourceInterval a, b;
+            g_assert_true(agfx_eeee_source_backing_interval(original, i, &a));
+            g_assert_true(agfx_eeee_source_backing_interval(source, i, &b));
+            g_assert_true(a.region == b.region);
+            g_assert_cmpint(a.fd, ==, b.fd);
+            g_assert_cmpuint(a.region_offset, ==, b.region_offset);
+            g_assert_cmpuint(a.file_offset, ==, b.file_offset);
+            g_assert_cmpuint(a.allocation_offset, ==, b.allocation_offset);
+            g_assert_cmpuint(a.length, ==, b.length);
+        }
+        canonical[offset] = 0x6a;
+        g_assert_cmpuint(*(uint8_t *)agfx_eeee_source_backing_pointer(source), ==, 0x6a);
+        g_assert_cmpuint(*(uint8_t *)agfx_eeee_source_backing_pointer(original), ==, 0x6a);
+        break;
+    }
+    case SOURCE_MINIMUM_COVERED_EXTRA: {
+        source = agfx_eeee_source_backing_capture_extent(ctx.eeee_provider_state,
+            address + offset, length, 2 * page + 1, page);
+        g_assert_nonnull(source);
+        g_assert_cmpuint(agfx_eeee_source_backing_allocation_length(source), ==, 3 * page);
+        g_assert_cmpuint(agfx_eeee_source_backing_interval_count(source), ==, 2);
+        AgfxEeeeSourceInterval first, second;
+        g_assert_true(agfx_eeee_source_backing_interval(source, 0, &first));
+        g_assert_true(agfx_eeee_source_backing_interval(source, 1, &second));
+        g_assert_cmpuint(first.file_offset, ==, page);
+        g_assert_cmpuint(first.length, ==, page);
+        g_assert_cmpuint(second.file_offset, ==, 2 * page);
+        g_assert_cmpuint(second.allocation_offset, ==, page);
+        g_assert_cmpuint(second.length, ==, 2 * page);
+        uint8_t *allocation = agfx_eeee_source_backing_allocation(source);
+        canonical[3 * page - 1] = 0x9b;
+        g_assert_cmpuint(allocation[3 * page - 1], ==, 0x9b);
+        allocation[2 * page + 7] = 0x35;
+        g_assert_cmpuint(canonical[2 * page + 7], ==, 0x35);
+        break;
+    }
+    case SOURCE_MINIMUM_MISSING_TAIL:
+        g_assert_null(agfx_eeee_source_backing_capture_extent(ctx.eeee_provider_state,
+            address + offset, length, 2 * page, page));
+        /* Literal visible bytes still work: failure did not modify mappings
+         * or manufacture backing for the task's anonymous reservation tail. */
+        source = agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+            address + offset, length, page);
+        g_assert_nonnull(source);
+        g_assert_cmpuint(agfx_eeee_source_backing_allocation_length(source), ==, page);
+        g_assert_cmpuint(*(uint8_t *)(uintptr_t)(address + offset), ==, 0x47);
+        break;
+    case SOURCE_MINIMUM_LITERAL_VIEW:
+        offset = 31;
+        length = page - 77;
+        source = agfx_eeee_source_backing_capture_extent(ctx.eeee_provider_state,
+            address + offset, length, 2 * page - 1, page);
+        g_assert_nonnull(source);
+        g_assert_cmpuint(agfx_eeee_source_backing_allocation_length(source), ==, 2 * page);
+        g_assert_true((uint8_t *)agfx_eeee_source_backing_pointer(source) ==
+            (uint8_t *)agfx_eeee_source_backing_allocation(source) + offset);
+        break;
+    case SOURCE_MINIMUM_OVERFLOW:
+        /* Checked rounding, then a page-aligned minimum whose address range
+         * cannot fit. Neither may wrap into a smaller captured allocation. */
+        g_assert_null(agfx_eeee_source_backing_capture_extent(ctx.eeee_provider_state,
+            address + offset, length, UINT64_MAX, page));
+        g_assert_null(agfx_eeee_source_backing_capture_extent(ctx.eeee_provider_state,
+            address + offset, length, UINT64_MAX - page + 1, page));
+        source = agfx_eeee_source_backing_capture_extent(ctx.eeee_provider_state,
+            address + offset, length, 0, page);
+        g_assert_nonnull(source);
+        g_assert_cmpuint(agfx_eeee_source_backing_allocation_length(source), ==, page);
+        break;
+    }
+    g_assert_nonnull(source);
+    g_assert_cmpuint(agfx_eeee_source_backing_visible_offset(source), ==, offset);
+    g_assert_cmpuint(agfx_eeee_source_backing_length(source), ==, length);
+    agfx_eeee_source_backing_unref(original);
+    agfx_eeee_source_backing_unref(source);
+    cb.eeee_task_region_unref(&ctx, &owner->ram);
+    g_assert_cmpint(cb.eeee_task_deallocate(&ctx, address, span), ==, 0);
+    g_assert_true(agfx_eeee_provider_state_destroy(ctx.eeee_provider_state));
+    memory_region_del_subregion(get_system_memory(), &owner->ram);
+    object_unref(OBJECT(owner));
+    bql_unlock();
+    drain_call_rcu();
+    bql_lock();
+    g_assert_cmpuint(finalized, ==, 1);
+}
+
 /* Syscall-only app-owner controls. These simulated output descriptors are NOT
  * native DMA FDs: no device open/ioctl is ever forwarded while armed. Real
  * SourceBacking/RAM/fstat/seals and original logical replacement still run. */
@@ -856,6 +1000,15 @@ int main(int argc, char **argv)
         GINT_TO_POINTER(FINAL_ALIAS_REMAP_OVERWRITE), test_worker_final_physical_release);
     g_test_add_func("/eeee/persistent-source/exact-backing-independent-of-task",
                     test_persistent_source_backing);
+    const char *minimum_names[] = {
+        "min-zero-compat", "covered-extra-extent", "missing-tail",
+        "literal-visible-range", "checked-overflow",
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(minimum_names); ++i) {
+        g_autofree char *path = g_strdup_printf("/eeee/source-minimum-extent/%s",
+                                                minimum_names[i]);
+        g_test_add_data_func(path, GUINT_TO_POINTER(i), test_source_minimum_extent);
+    }
     const char *export_names[] = {
         "success-owner", "fd-zero-owner", "owner-oom", "list-oom", "stat-error",
         "extent-error", "seals-error", "no-shrink", "write-seal", "open-error",
