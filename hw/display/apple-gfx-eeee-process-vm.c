@@ -103,13 +103,13 @@ static void agfx_eeee_alias_destroy(gpointer data)
 {
     AgfxEeeeAlias *alias = data;
 
-    memory_region_unref(alias->region);
+    apple_gfx_ml_memory_region_unref_bql(alias->region);
     g_free(alias);
 }
 
 static void agfx_eeee_retired_region_destroy(gpointer data)
 {
-    memory_region_unref(data);
+    apple_gfx_ml_memory_region_unref_bql(data);
 }
 
 static GPtrArray *agfx_eeee_take_retired_regions(AgfxEeeeProviderState *state)
@@ -607,7 +607,7 @@ static void agfx_eeee_task_region_unref(void *ctx, void *opaque_region)
         g_hash_table_insert(state->regions, region, GUINT_TO_POINTER(count - 1));
     }
     qemu_mutex_unlock(&state->lock);
-    memory_region_unref(region);
+    apple_gfx_ml_memory_region_unref_bql(region);
 }
 
 static void agfx_eeee_task_publish(void *ctx, void *task)

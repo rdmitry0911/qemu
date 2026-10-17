@@ -828,6 +828,18 @@ static void agfx_unmap_bql(void (*fn)(void *), void *opaque)
     qemu_event_destroy(&call.completed);
 }
 
+static void agfx_memory_region_unref_call(void *opaque)
+{
+    memory_region_unref(opaque);
+}
+
+void apple_gfx_ml_memory_region_unref_bql(MemoryRegion *region)
+{
+    if (region) {
+        agfx_unmap_bql(agfx_memory_region_unref_call, region);
+    }
+}
+
 typedef struct AgfxMappedUnmap {
     void *hva;
     size_t size;

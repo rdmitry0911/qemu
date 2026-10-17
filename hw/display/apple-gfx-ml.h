@@ -123,6 +123,13 @@ bool apple_gfx_ml_get_qmp_capture_bridge(AppleGfxMLCaptureBridge *out);
  * No QMetal session or physical GPU is needed to exercise the UI handoff. */
 void apple_gfx_ml_cursor_show(void *ctx, uint32_t display_id, int visible);
 void apple_gfx_ml_cursor_move(void *ctx, uint32_t display_id);
+/* Final physical RAM pin release, not logical task destruction. Caller must
+ * drop the provider task mutex before entry; it owns the call to RETURN.
+ * The outer lifecycle must permit main-loop dispatch while a worker waits,
+ * just like ordinary unmap_gpa/iosfc_unmap; no BQL wait on the caller's locks.
+ * Reuses the synchronous main-loop/BQL unpin leaf, with no State borrow in BH.
+ * NULL is an immediate no-op (retired alias removal may hold the task lock). */
+void apple_gfx_ml_memory_region_unref_bql(MemoryRegion *region);
 void agfx_publish_display_mode(AppleGfxMLState *s,
                                uint32_t width, uint32_t height,
                                uint32_t iosurface_pixel_format,
