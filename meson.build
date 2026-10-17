@@ -4512,7 +4512,10 @@ foreach target : target_dirs
                          'tests/unit/apple-gfx-eeee-qmetal-test-bridge.cpp'),
         'include_directories': include_directories(qmetal_join_source_dir / 'src/unified'),
         'dependencies': [],
-        'link_args': ['-Wl,--wrap=mmap64'],
+        'link_args': ['-Wl,--wrap=mmap64', '-Wl,--wrap=open64',
+                      '-Wl,--wrap=fcntl64', '-Wl,--wrap=fstat64',
+                      '-Wl,--wrap=ioctl', '-Wl,--wrap=close',
+                      '-Wl,--wrap=g_try_malloc0'],
         'install': false,
       }]
     endif

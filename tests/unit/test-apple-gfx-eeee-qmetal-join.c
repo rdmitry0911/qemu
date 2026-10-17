@@ -13,8 +13,12 @@
 #include "system/system.h"
 #include "hw/display/apple-gfx-ml.h"
 #include "hw/display/apple-gfx-eeee-process-vm.h"
+#include "hw/display/apple-gfx-eeee-source-dmabuf.h"
 #include "apple-gfx-eeee-qmetal-test-bridge.h"
+#include "standard-headers/linux/udmabuf.h"
+#include <linux/memfd.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 
 #define TYPE_JOIN_RAM_OWNER "test-eeee-qmetal-join-ram-owner"
 #define JOIN_RAM_GPA UINT64_C(0x10000000)
@@ -501,6 +505,334 @@ static void test_persistent_source_backing(void)
     bql_lock();
 }
 
+/* Syscall-only app-owner controls. These simulated output descriptors are NOT
+ * native DMA FDs: no device open/ioctl is ever forwarded while armed. Real
+ * SourceBacking/RAM/fstat/seals and original logical replacement still run. */
+typedef enum ExportControl {
+    EXPORT_SUCCESS, EXPORT_FD_ZERO, EXPORT_OWNER_OOM, EXPORT_LIST_OOM,
+    EXPORT_STAT_ERROR, EXPORT_EXTENT_ERROR, EXPORT_SEALS_ERROR,
+    EXPORT_NO_SHRINK, EXPORT_WRITE_SEAL, EXPORT_OPEN_ERROR,
+    EXPORT_IOCTL_INVALID, EXPORT_IOCTL_FD_LIMIT,
+} ExportControl;
+
+static struct {
+    bool armed;
+    ExportControl mode;
+    AgfxEeeeSourceBacking *source;
+    unsigned allocations, opens, ioctls, control_closes, output_closes;
+    int control_fd, output_fd;
+} export_control;
+
+int __real_open64(const char *, int, ...);
+int __wrap_open64(const char *, int, ...);
+int __real_fcntl64(int, int, ...);
+int __wrap_fcntl64(int, int, ...);
+int __real_fstat64(int, struct stat64 *);
+int __wrap_fstat64(int, struct stat64 *);
+int __real_ioctl(int, unsigned long, ...);
+int __wrap_ioctl(int, unsigned long, ...);
+int __real_close(int);
+int __wrap_close(int);
+void *__real_g_try_malloc0(gsize);
+void *__wrap_g_try_malloc0(gsize);
+
+int __wrap_open64(const char *path, int flags, ...)
+{
+    if (export_control.armed) {
+        g_assert_cmpstr(path, ==, "/dev/udmabuf");
+        g_assert_cmpint(flags, ==, O_RDWR | O_CLOEXEC);
+        ++export_control.opens;
+        if (export_control.mode == EXPORT_OPEN_ERROR) {
+            errno = EACCES;
+            return -1;
+        }
+        return export_control.control_fd;
+    }
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list args;
+        va_start(args, flags);
+        mode_t mode = va_arg(args, int);
+        va_end(args);
+        return __real_open64(path, flags, mode);
+    }
+    return __real_open64(path, flags);
+}
+
+int __wrap_fcntl64(int fd, int command, ...)
+{
+    if (export_control.armed && command == F_GET_SEALS) {
+        if (export_control.mode == EXPORT_SEALS_ERROR) {
+            errno = EOPNOTSUPP;
+            return -1;
+        }
+        if (export_control.mode == EXPORT_NO_SHRINK) {
+            return 0;
+        }
+        if (export_control.mode == EXPORT_WRITE_SEAL) {
+            return F_SEAL_SHRINK | F_SEAL_WRITE;
+        }
+    }
+    switch (command) {
+    case F_GETFD: case F_GETFL: case F_GETOWN: case F_GETSIG:
+    case F_GETLEASE: case F_GETPIPE_SZ: case F_GET_SEALS:
+        return __real_fcntl64(fd, command);
+    default:
+        break;
+    }
+    va_list args;
+    va_start(args, command);
+    int result;
+    switch (command) {
+    case F_DUPFD: case F_DUPFD_CLOEXEC: case F_SETFD: case F_SETFL:
+    case F_SETOWN: case F_SETSIG: case F_SETLEASE: case F_NOTIFY:
+    case F_SETPIPE_SZ: case F_ADD_SEALS:
+        result = __real_fcntl64(fd, command, va_arg(args, int));
+        break;
+    default:
+        result = __real_fcntl64(fd, command, va_arg(args, void *));
+        break;
+    }
+    va_end(args);
+    return result;
+}
+
+int __wrap_fstat64(int fd, struct stat64 *file)
+{
+    if (export_control.armed && export_control.mode == EXPORT_STAT_ERROR) {
+        errno = EIO;
+        return -1;
+    }
+    int result = __real_fstat64(fd, file);
+    if (!result && export_control.armed &&
+        export_control.mode == EXPORT_EXTENT_ERROR) {
+        file->st_size = 0; // pure rejection control, actual file is unchanged
+    }
+    return result;
+}
+
+int __wrap_ioctl(int fd, unsigned long request, ...)
+{
+    va_list args;
+    va_start(args, request);
+    void *argument = va_arg(args, void *);
+    va_end(args);
+    if (!export_control.armed) {
+        return __real_ioctl(fd, request, argument);
+    }
+    g_assert_cmpint(fd, ==, export_control.control_fd);
+    g_assert_cmpuint(request, ==, UDMABUF_CREATE_LIST);
+    const struct udmabuf_create_list *list = argument;
+    g_assert_cmpuint(list->flags, ==, UDMABUF_FLAGS_CLOEXEC);
+    g_assert_cmpuint(list->count, ==,
+        agfx_eeee_source_backing_interval_count(export_control.source));
+    uint64_t position = 0;
+    for (unsigned i = 0; i < list->count; ++i) {
+        AgfxEeeeSourceInterval interval;
+        g_assert_true(agfx_eeee_source_backing_interval(export_control.source,
+                                                      i, &interval));
+        g_assert_cmpuint(list->list[i].memfd, ==, interval.fd);
+        g_assert_cmpuint(list->list[i].__pad, ==, 0);
+        g_assert_cmpuint(list->list[i].offset, ==, interval.file_offset);
+        g_assert_cmpuint(list->list[i].size, ==, interval.length);
+        g_assert_cmpuint(interval.allocation_offset, ==, position);
+        position += interval.length;
+    }
+    g_assert_cmpuint(position, ==,
+        agfx_eeee_source_backing_allocation_length(export_control.source));
+    ++export_control.ioctls;
+    if (export_control.mode == EXPORT_IOCTL_INVALID ||
+        export_control.mode == EXPORT_IOCTL_FD_LIMIT) {
+        errno = export_control.mode == EXPORT_IOCTL_INVALID ? EINVAL : EMFILE;
+        return -1;
+    }
+    return export_control.output_fd;
+}
+
+int __wrap_close(int fd)
+{
+    if (export_control.armed && fd == export_control.control_fd) {
+        g_assert_cmpuint(export_control.control_closes++, ==, 0);
+        errno = EUCLEAN; // cleanup must not replace a causal syscall errno
+        return 0;
+    }
+    if (export_control.armed && fd == export_control.output_fd) {
+        g_assert_cmpuint(export_control.output_closes++, ==, 0);
+        return 0;
+    }
+    return __real_close(fd);
+}
+
+void *__wrap_g_try_malloc0(gsize bytes)
+{
+    if (export_control.armed) {
+        ++export_control.allocations;
+        if ((export_control.mode == EXPORT_OWNER_OOM &&
+             export_control.allocations == 1) ||
+            (export_control.mode == EXPORT_LIST_OOM &&
+             export_control.allocations == 2)) {
+            return NULL;
+        }
+    }
+    return __real_g_try_malloc0(bytes);
+}
+
+typedef struct ExportRelease {
+    AgfxEeeeSourceDmaBuf *export;
+    unsigned *finalized;
+    int done;
+} ExportRelease;
+
+static void *export_release_worker(void *opaque)
+{
+    ExportRelease *release = opaque;
+    rcu_register_thread();
+    g_assert_false(bql_locked());
+    agfx_eeee_source_dmabuf_unref(release->export);
+    g_assert_cmpuint(*release->finalized, ==, 1);
+    g_assert_false(bql_locked());
+    qatomic_set(&release->done, 1);
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static void test_immutable_export_owner(gconstpointer data)
+{
+    const ExportControl mode = GPOINTER_TO_INT(data);
+    AppleGfxMLState ctx = {};
+    qmu_extended_callbacks cb = { .user_ctx = &ctx };
+    uint64_t address;
+    unsigned finalized = 0;
+    AgfxEeeeDmaBufFailure failure;
+    QemuThread worker;
+
+    G_STATIC_ASSERT(sizeof(struct udmabuf_create_list) == 8);
+    G_STATIC_ASSERT(sizeof(struct udmabuf_create_item) == 24);
+    ctx.eeee_provider_state = agfx_eeee_provider_state_create();
+    agfx_eeee_provider_fill_callbacks(&cb);
+    const uint64_t page = cb.eeee_task_host_page_size(&ctx);
+    const uint64_t span = 3 * page;
+    JoinRamOwner *owner = (JoinRamOwner *)object_new(TYPE_JOIN_RAM_OWNER);
+    owner->finalized = &finalized;
+    int fd = qemu_memfd_create("eeee-dmabuf544-real-source", span + 2 * page,
+        false, 0, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL, &error_abort);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_true(memory_region_init_ram_from_fd(&owner->ram, OBJECT(owner),
+        "eeee-dmabuf544", span + page, RAM_SHARED, fd, page, &error_abort));
+    uint8_t *canonical = memory_region_get_ram_ptr(&owner->ram);
+    memset(canonical, 0x47, span + page);
+    cb.eeee_task_lock(&ctx);
+    cb.eeee_task_region_ref(&ctx, &owner->ram);
+    cb.eeee_task_unlock(&ctx);
+    g_assert_cmpint(cb.eeee_task_allocate(&ctx, &address, span,
+        QMU_EEEE_TASK_ALLOCATE_ANYWHERE), ==, 1);
+    source_remap(&ctx, &cb, address, page, canonical + 2 * page);
+    source_remap(&ctx, &cb, address + page, 2 * page, canonical);
+    AgfxEeeeSourceBacking *source = agfx_eeee_source_backing_capture(
+        ctx.eeee_provider_state, address + 17, span - 34, page);
+    g_assert_nonnull(source);
+    AgfxEeeeSourceInterval first, second;
+    g_assert_true(agfx_eeee_source_backing_interval(source, 0, &first));
+    g_assert_true(agfx_eeee_source_backing_interval(source, 1, &second));
+    g_assert_cmpuint(first.file_offset, ==, 3 * page);
+    g_assert_cmpuint(second.file_offset, ==, page); // order is not sorted by fd offset
+    const int original_seals = fcntl(first.fd, F_GET_SEALS);
+    export_control = (typeof(export_control)) {
+        .armed = true, .mode = mode, .source = source,
+        .control_fd = INT_MAX - 1, .output_fd = mode == EXPORT_FD_ZERO ? 0 : INT_MAX,
+    };
+    AgfxEeeeSourceDmaBuf *export = agfx_eeee_source_dmabuf_create(source, &failure);
+    const bool success = mode == EXPORT_SUCCESS || mode == EXPORT_FD_ZERO;
+    if (success) {
+        g_assert_nonnull(export);
+        g_assert_cmpint(failure.stage, ==, AGFX_DMABUF_NONE);
+        g_assert_cmpint(agfx_eeee_source_dmabuf_fd(export), ==, export_control.output_fd);
+        g_assert_true(agfx_eeee_source_dmabuf_source(export) == source);
+        g_assert_cmpuint(agfx_eeee_source_dmabuf_allocation_length(export), ==, span);
+        g_assert_cmpuint(agfx_eeee_source_dmabuf_visible_offset(export), ==, 17);
+        g_assert_cmpuint(agfx_eeee_source_dmabuf_length(export), ==, span - 34);
+        g_assert_cmpuint(export_control.opens, ==, 1);
+        g_assert_cmpuint(export_control.ioctls, ==, 1);
+        g_assert_cmpuint(export_control.control_closes, ==, 1);
+    } else {
+        static const AgfxEeeeDmaBufFailureStage stages[] = {
+            [EXPORT_OWNER_OOM] = AGFX_DMABUF_ALLOCATION,
+            [EXPORT_LIST_OOM] = AGFX_DMABUF_ALLOCATION,
+            [EXPORT_STAT_ERROR] = AGFX_DMABUF_FILE_STAT,
+            [EXPORT_EXTENT_ERROR] = AGFX_DMABUF_FILE_EXTENT,
+            [EXPORT_SEALS_ERROR] = AGFX_DMABUF_FILE_SEALS,
+            [EXPORT_NO_SHRINK] = AGFX_DMABUF_SEAL_POLICY,
+            [EXPORT_WRITE_SEAL] = AGFX_DMABUF_SEAL_POLICY,
+            [EXPORT_OPEN_ERROR] = AGFX_DMABUF_CONTROL_OPEN,
+            [EXPORT_IOCTL_INVALID] = AGFX_DMABUF_CREATE_LIST,
+            [EXPORT_IOCTL_FD_LIMIT] = AGFX_DMABUF_CREATE_LIST,
+        };
+        static const int errors[] = {
+            [EXPORT_OWNER_OOM] = ENOMEM, [EXPORT_LIST_OOM] = ENOMEM,
+            [EXPORT_STAT_ERROR] = EIO, [EXPORT_EXTENT_ERROR] = 0,
+            [EXPORT_SEALS_ERROR] = EOPNOTSUPP, [EXPORT_NO_SHRINK] = 0,
+            [EXPORT_WRITE_SEAL] = 0, [EXPORT_OPEN_ERROR] = EACCES,
+            [EXPORT_IOCTL_INVALID] = EINVAL, [EXPORT_IOCTL_FD_LIMIT] = EMFILE,
+        };
+        g_assert_null(export);
+        g_assert_cmpint(failure.stage, ==, stages[mode]);
+        g_assert_cmpint(failure.error_no, ==, errors[mode]);
+        g_assert_cmpint(errno, ==, errors[mode]);
+        g_assert_cmpuint(export_control.output_closes, ==, 0);
+        g_assert_cmpuint(export_control.opens, ==, mode >= EXPORT_OPEN_ERROR ? 1 : 0);
+        g_assert_cmpuint(export_control.ioctls, ==, mode >= EXPORT_IOCTL_INVALID ? 1 : 0);
+        g_assert_cmpuint(export_control.control_closes, ==,
+                         mode >= EXPORT_IOCTL_INVALID ? 1 : 0);
+    }
+    g_assert_cmpint(fcntl(first.fd, F_GETFD), >=, 0);
+    g_assert_cmpint(fcntl(second.fd, F_GETFD), >=, 0);
+    /* Use real fcntl to verify no seals were changed by exporter or controls. */
+    g_assert_cmpint(__real_fcntl64(first.fd, F_GET_SEALS), ==, original_seals);
+    uint8_t *allocation = agfx_eeee_source_backing_allocation(source);
+    canonical[2 * page + 9] = 0x91;
+    g_assert_cmpuint(allocation[9], ==, 0x91);
+    allocation[page + 7] = 0x73;
+    g_assert_cmpuint(canonical[7], ==, 0x73);
+    /* Source and export must outlive all mutable logical task state. */
+    uint64_t overwritten = address;
+    g_assert_cmpint(cb.eeee_task_allocate(&ctx, &overwritten, span,
+        QMU_EEEE_TASK_ALLOCATE_FIXED_OVERWRITE), ==, 1);
+    g_assert_cmpuint(*(uint8_t *)(uintptr_t)address, ==, 0);
+    cb.eeee_task_region_unref(&ctx, &owner->ram);
+    g_assert_cmpint(cb.eeee_task_deallocate(&ctx, address, span), ==, 0);
+    g_assert_true(agfx_eeee_provider_state_destroy(ctx.eeee_provider_state));
+    object_unref(OBJECT(owner));
+    bql_unlock();
+    drain_call_rcu();
+    bql_lock();
+    g_assert_cmpuint(finalized, ==, 0);
+    g_assert_cmpuint(allocation[9], ==, 0x91);
+    if (success) {
+        agfx_eeee_source_backing_unref(source); // only export now owns source
+        agfx_eeee_source_dmabuf_ref(export);
+        agfx_eeee_source_dmabuf_unref(export);
+        g_assert_cmpuint(finalized, ==, 0);
+        g_assert_cmpuint(export_control.output_closes, ==, 0);
+        ExportRelease release = { .export = export, .finalized = &finalized };
+        qemu_thread_create(&worker, "eeee-export-last", export_release_worker,
+                           &release, QEMU_THREAD_JOINABLE);
+        const gint64 deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
+        while (!qatomic_read(&release.done)) {
+            g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+            aio_poll(qemu_get_aio_context(), false);
+            g_thread_yield();
+        }
+        qemu_thread_join(&worker);
+        g_assert_cmpuint(export_control.output_closes, ==, 1);
+    } else {
+        agfx_eeee_source_backing_unref(source);
+    }
+    g_assert_cmpuint(finalized, ==, 1);
+    export_control.armed = false;
+    bql_unlock();
+    drain_call_rcu();
+    bql_lock();
+}
+
 int main(int argc, char **argv)
 {
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
@@ -524,6 +856,15 @@ int main(int argc, char **argv)
         GINT_TO_POINTER(FINAL_ALIAS_REMAP_OVERWRITE), test_worker_final_physical_release);
     g_test_add_func("/eeee/persistent-source/exact-backing-independent-of-task",
                     test_persistent_source_backing);
+    const char *export_names[] = {
+        "success-owner", "fd-zero-owner", "owner-oom", "list-oom", "stat-error",
+        "extent-error", "seals-error", "no-shrink", "write-seal", "open-error",
+        "ioctl-invalid", "ioctl-fd-limit",
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(export_names); ++i) {
+        g_autofree char *path = g_strdup_printf("/eeee/source-dmabuf/%s", export_names[i]);
+        g_test_add_data_func(path, GINT_TO_POINTER(i), test_immutable_export_owner);
+    }
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();
