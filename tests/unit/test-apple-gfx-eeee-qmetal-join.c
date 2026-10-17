@@ -14,6 +14,7 @@
 #include "hw/display/apple-gfx-ml.h"
 #include "hw/display/apple-gfx-eeee-process-vm.h"
 #include "apple-gfx-eeee-qmetal-test-bridge.h"
+#include <sys/mman.h>
 
 #define TYPE_JOIN_RAM_OWNER "test-eeee-qmetal-join-ram-owner"
 #define JOIN_RAM_GPA UINT64_C(0x10000000)
@@ -44,6 +45,25 @@ static const TypeInfo join_owner_type = {
 };
 
 int (*qemu_main)(void);
+
+/* Test-only link wrapper. Armed solely during synchronous source capture;
+ * all original real-RAM/adapter/release cases pass through unchanged. */
+static unsigned source_fail_fixed_ordinal, source_fixed_calls;
+
+/* Normal Linux QEMU builds use _FILE_OFFSET_BITS=64: libc redirects mmap
+ * calls to mmap64. Wrap the actual imported symbol, not the C spelling. */
+void *__real_mmap64(void *, size_t, int, int, int, off64_t);
+void *__wrap_mmap64(void *, size_t, int, int, int, off64_t);
+void *__wrap_mmap64(void *address, size_t length, int protection,
+                     int flags, int fd, off64_t offset)
+{
+    if (source_fail_fixed_ordinal && (flags & MAP_FIXED) &&
+        ++source_fixed_calls == source_fail_fixed_ordinal) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    return __real_mmap64(address, length, protection, flags, fd, offset);
+}
 
 typedef enum FinalReleaseKind {
     FINAL_PROVIDER_REGION,
@@ -239,6 +259,248 @@ static void test_real_producer_adapter_native_window(void)
     bql_lock();
 }
 
+static JoinRamOwner *new_source_ram(uint64_t length, uint64_t file_offset)
+{
+    JoinRamOwner *owner = (JoinRamOwner *)object_new(TYPE_JOIN_RAM_OWNER);
+    int fd = qemu_memfd_create("eeee-persistent-source532", length + file_offset,
+                               false, 0, 0, &error_abort);
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_true(memory_region_init_ram_from_fd(&owner->ram, OBJECT(owner),
+        "eeee-persistent-source532", length, RAM_SHARED, fd, file_offset,
+        &error_abort));
+    return owner;
+}
+
+static void source_remap(AppleGfxMLState *ctx, qmu_extended_callbacks *cb,
+                         uint64_t address, uint64_t length, void *canonical)
+{
+    int current = 0, maximum = 0;
+
+    cb->eeee_task_rcu_enter(ctx);
+    cb->eeee_task_lock(ctx);
+    g_assert_cmpint(cb->eeee_task_remap_shared_fixed_overwrite(ctx,
+        &address, length, cb->eeee_task_host_page_size(ctx) - 1,
+        (uint64_t)(uintptr_t)canonical, &current, &maximum), ==, 1);
+    cb->eeee_task_unlock(ctx);
+    cb->eeee_task_rcu_leave(ctx);
+}
+
+typedef struct SourceRelease {
+    AgfxEeeeSourceBacking *source;
+    unsigned *finalized;
+    int done;
+} SourceRelease;
+
+static void *source_release_worker(void *opaque)
+{
+    SourceRelease *r = opaque;
+
+    rcu_register_thread();
+    g_assert_false(bql_locked());
+    agfx_eeee_source_backing_unref(r->source);
+    g_assert_cmpuint(*r->finalized, ==, 1);
+    g_assert_false(bql_locked());
+    qatomic_set(&r->done, 1);
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static void test_persistent_source_backing(void)
+{
+    AppleGfxMLState ctx = {};
+    qmu_extended_callbacks cb = { .user_ctx = &ctx };
+    uint64_t address, page, alignment, span, overwritten;
+    AgfxEeeeSourceBacking *source;
+    AgfxEeeeSourceInterval first, second;
+    unsigned finalized = 0;
+    QemuThread worker;
+
+    ctx.eeee_provider_state = agfx_eeee_provider_state_create();
+    agfx_eeee_provider_fill_callbacks(&cb);
+    page = cb.eeee_task_host_page_size(&ctx);
+    alignment = MAX(UINT64_C(65536), page);
+    span = 2 * alignment;
+    JoinRamOwner *owner = new_source_ram(span + 2 * page, page);
+    JoinRamOwner *replacement = new_source_ram(span, 0);
+    uint8_t *canonical = memory_region_get_ram_ptr(&owner->ram);
+    uint8_t *new_bytes = memory_region_get_ram_ptr(&replacement->ram);
+
+    owner->finalized = &finalized;
+    memset(canonical, 0x47, span + 2 * page);
+    memset(new_bytes, 0xc2, span);
+    memory_region_add_subregion(get_system_memory(), JOIN_RAM_GPA, &owner->ram);
+    cb.eeee_task_lock(&ctx);
+    cb.eeee_task_region_ref(&ctx, &owner->ram);
+    cb.eeee_task_region_ref(&ctx, &replacement->ram);
+    cb.eeee_task_unlock(&ctx);
+    g_assert_cmpint(cb.eeee_task_allocate(&ctx, &address, span,
+        QMU_EEEE_TASK_ALLOCATE_ANYWHERE), ==, 1);
+    source_remap(&ctx, &cb, address, alignment, canonical + page);
+    /* The second half is zero reservation, NOT admitted RAM. It may not be
+     * silently filled from current GPA, task VA or synthetic padding. */
+    g_assert_null(agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+                                                 address, span, alignment));
+    g_assert_cmpuint(*(uint8_t *)(uintptr_t)address, ==, 0x47);
+    source_remap(&ctx, &cb, address + alignment, alignment,
+                  canonical + page + alignment);
+    for (unsigned fail_at = 1; fail_at <= 2; ++fail_at) {
+        source_fail_fixed_ordinal = fail_at;
+        source_fixed_calls = 0;
+        g_assert_null(agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+            address + 17, span - 34, alignment));
+        source_fail_fixed_ordinal = 0;
+        g_assert_cmpuint(source_fixed_calls, ==, fail_at);
+        g_assert_cmpuint(*(uint8_t *)(uintptr_t)address, ==, 0x47);
+        g_assert_cmpuint(*(uint8_t *)(uintptr_t)(address + alignment), ==, 0x47);
+    }
+    source = agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+                                             address + 17, span - 34, alignment);
+    g_assert_nonnull(source);
+    uint8_t *allocation = agfx_eeee_source_backing_allocation(source);
+    uint8_t *visible = agfx_eeee_source_backing_pointer(source);
+    g_assert_cmpuint((uintptr_t)allocation % alignment, ==, 0);
+    g_assert_cmpuint(agfx_eeee_source_backing_allocation_length(source), ==, span);
+    g_assert_cmpuint(agfx_eeee_source_backing_visible_offset(source), ==, 17);
+    g_assert_cmpuint(agfx_eeee_source_backing_length(source), ==, span - 34);
+    g_assert_true(visible == allocation + 17);
+    g_assert_cmpuint(agfx_eeee_source_backing_interval_count(source), ==, 2);
+    g_assert_true(agfx_eeee_source_backing_interval(source, 0, &first));
+    g_assert_true(agfx_eeee_source_backing_interval(source, 1, &second));
+    g_assert_true(first.region == &owner->ram && second.region == &owner->ram);
+    g_assert_cmpuint(first.region_offset, ==, page);
+    g_assert_cmpuint(first.file_offset, ==, 2 * page);
+    g_assert_cmpuint(first.allocation_offset, ==, 0);
+    g_assert_cmpuint(first.length, ==, alignment);
+    g_assert_cmpuint(second.region_offset, ==, page + alignment);
+    g_assert_cmpuint(second.file_offset, ==, 2 * page + alignment);
+    g_assert_cmpuint(second.allocation_offset, ==, alignment);
+    g_assert_cmpuint(second.length, ==, alignment);
+    struct stat original_stat, first_stat, second_stat;
+    g_assert_cmpint(fstat(memory_region_get_fd(&owner->ram), &original_stat), ==, 0);
+    g_assert_cmpint(fstat(first.fd, &first_stat), ==, 0);
+    g_assert_cmpint(fstat(second.fd, &second_stat), ==, 0);
+    g_assert_cmpuint(first_stat.st_dev, ==, original_stat.st_dev);
+    g_assert_cmpuint(first_stat.st_ino, ==, original_stat.st_ino);
+    g_assert_cmpuint(second_stat.st_dev, ==, original_stat.st_dev);
+    g_assert_cmpuint(second_stat.st_ino, ==, original_stat.st_ino);
+    g_assert_cmpint(first.fd, !=, second.fd); /* two actual admissions */
+    int fd_flags = fcntl(first.fd, F_GETFD);
+    g_assert_cmpint(fd_flags, >=, 0);
+    g_assert_true(fd_flags & FD_CLOEXEC);
+    for (uint64_t i = 0; i < span; ++i) g_assert_cmpuint(allocation[i], ==, 0x47);
+    canonical[page + 7] = 0x6a;
+    g_assert_cmpuint(allocation[7], ==, 0x6a);
+    allocation[alignment + 9] = 0x9b;
+    g_assert_cmpuint(canonical[page + alignment + 9], ==, 0x9b);
+
+    /* Bounds and missing allocation padding fail before native mapping. */
+    g_assert_null(agfx_eeee_source_backing_capture(NULL, address, span, alignment));
+    g_assert_null(agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+                                                 address, 0, alignment));
+    g_assert_null(agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+                                                 UINT64_MAX - 2, 8, alignment));
+    g_assert_null(agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+                                                 address, span, 3 * page));
+    g_assert_null(agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+                                                 address + span, page, page));
+    g_assert_null(agfx_eeee_source_backing_capture(ctx.eeee_provider_state,
+                                                 address + span - 1, 1, alignment));
+    g_assert_false(agfx_eeee_source_backing_interval(source, 2, &first));
+    g_assert_false(agfx_eeee_source_backing_interval(source, 0, NULL));
+    g_assert_false(agfx_eeee_provider_state_destroy(ctx.eeee_provider_state));
+
+    /* A native remap failure must not publish a different backing record. */
+    int current = 0, maximum = 0;
+    overwritten = address;
+    source_fail_fixed_ordinal = 1;
+    source_fixed_calls = 0;
+    cb.eeee_task_rcu_enter(&ctx);
+    cb.eeee_task_lock(&ctx);
+    int failed_remap = cb.eeee_task_remap_shared_fixed_overwrite(&ctx,
+        &overwritten, page, page - 1, (uint64_t)(uintptr_t)new_bytes,
+        &current, &maximum);
+    cb.eeee_task_unlock(&ctx);
+    cb.eeee_task_rcu_leave(&ctx);
+    source_fail_fixed_ordinal = 0;
+    g_assert_cmpint(failed_remap, ==, 0);
+    g_assert_cmpuint(source_fixed_calls, ==, 1);
+    g_assert_cmpuint(*(uint8_t *)(uintptr_t)address, ==, 0x47);
+
+    /* Exercise split aliases, same-VA different RAM and same-VA zero storage.
+     * Captured exact backing and its still-live writes must not change. */
+    source_remap(&ctx, &cb, address + page, page, new_bytes);
+    g_assert_cmpuint(*(uint8_t *)(uintptr_t)(address + page), ==, 0xc2);
+    g_assert_cmpuint(allocation[page], ==, 0x47);
+    AgfxEeeeSourceBacking *mixed = agfx_eeee_source_backing_capture(
+        ctx.eeee_provider_state, address, span, alignment);
+    g_assert_nonnull(mixed);
+    g_assert_cmpuint(agfx_eeee_source_backing_interval_count(mixed), ==, 4);
+    AgfxEeeeSourceInterval prefix, changed, suffix;
+    g_assert_true(agfx_eeee_source_backing_interval(mixed, 0, &prefix));
+    g_assert_true(agfx_eeee_source_backing_interval(mixed, 1, &changed));
+    g_assert_true(agfx_eeee_source_backing_interval(mixed, 2, &suffix));
+    g_assert_true(prefix.region == &owner->ram);
+    g_assert_true(changed.region == &replacement->ram);
+    g_assert_true(suffix.region == &owner->ram);
+    g_assert_cmpint(prefix.fd, ==, suffix.fd); /* actual shared split owner */
+    g_assert_cmpuint(prefix.region_offset, ==, page);
+    g_assert_cmpuint(changed.region_offset, ==, 0);
+    g_assert_cmpuint(suffix.region_offset, ==, 3 * page);
+    uint8_t *mixed_bytes = agfx_eeee_source_backing_pointer(mixed);
+    g_assert_cmpuint(mixed_bytes[page], ==, 0xc2);
+    g_assert_cmpuint(mixed_bytes[2 * page], ==, 0x47);
+    mixed_bytes[page + 5] = 0xa4;
+    g_assert_cmpuint(new_bytes[5], ==, 0xa4);
+    g_assert_cmpuint(allocation[page + 5], ==, 0x47);
+    agfx_eeee_source_backing_unref(mixed);
+    overwritten = address;
+    g_assert_cmpint(cb.eeee_task_allocate(&ctx, &overwritten, span,
+        QMU_EEEE_TASK_ALLOCATE_FIXED_OVERWRITE), ==, 1);
+    g_assert_cmpuint(*(uint8_t *)(uintptr_t)address, ==, 0);
+    g_assert_cmpuint(allocation[7], ==, 0x6a);
+    g_assert_cmpuint(allocation[alignment + 9], ==, 0x9b);
+    cb.eeee_task_region_unref(&ctx, &owner->ram);
+    cb.eeee_task_region_unref(&ctx, &replacement->ram);
+    g_assert_cmpint(cb.eeee_task_deallocate(&ctx, address, span), ==, 0);
+    g_assert_true(agfx_eeee_provider_state_destroy(ctx.eeee_provider_state));
+    ctx.eeee_provider_state = NULL;
+    canonical[page + 7] = 0x35;
+    g_assert_cmpuint(allocation[7], ==, 0x35);
+
+    /* This owner survives State destruction and address-space detachment. */
+    memory_region_del_subregion(get_system_memory(), &owner->ram);
+    object_unref(OBJECT(owner));
+    object_unref(OBJECT(replacement));
+    bql_unlock();
+    drain_call_rcu();
+    bql_lock();
+    g_assert_cmpuint(finalized, ==, 0);
+    g_assert_cmpuint(allocation[7], ==, 0x35);
+    agfx_eeee_source_backing_ref(source);
+    agfx_eeee_source_backing_unref(source);
+    g_assert_cmpuint(finalized, ==, 0);
+    SourceRelease release = { .source = source, .finalized = &finalized };
+    qemu_thread_create(&worker, "eeee-source-last", source_release_worker,
+                       &release, QEMU_THREAD_JOINABLE);
+    const gint64 deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
+    while (!qatomic_read(&release.done)) {
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        aio_poll(qemu_get_aio_context(), false);
+        g_thread_yield();
+    }
+    qemu_thread_join(&worker);
+    g_assert_cmpuint(finalized, ==, 1);
+    g_assert_cmpint(fcntl(first.fd, F_GETFD), ==, -1);
+    g_assert_cmpint(errno, ==, EBADF);
+    g_assert_cmpint(fcntl(second.fd, F_GETFD), ==, -1);
+    g_assert_cmpint(errno, ==, EBADF);
+    agfx_eeee_source_backing_unref(NULL);
+    bql_unlock();
+    drain_call_rcu();
+    bql_lock();
+}
+
 int main(int argc, char **argv)
 {
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
@@ -260,6 +522,8 @@ int main(int argc, char **argv)
         GINT_TO_POINTER(FINAL_ALIAS_ZERO_OVERWRITE), test_worker_final_physical_release);
     g_test_add_data_func("/eeee/physical-final-release/alias-remap-overwrite",
         GINT_TO_POINTER(FINAL_ALIAS_REMAP_OVERWRITE), test_worker_final_physical_release);
+    g_test_add_func("/eeee/persistent-source/exact-backing-independent-of-task",
+                    test_persistent_source_backing);
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();
