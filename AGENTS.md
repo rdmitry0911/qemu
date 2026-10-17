@@ -5,6 +5,14 @@
 For the apple-virgl host stack, `main` is the starting point and integration
 authority in each of AppleVirgl, QEMU, QMetal, and air2spirv.
 
+Main must retain the smallest confirmed non-equivalence surface (least debt)
+accepted for that component, not merely the latest convenient build. Every
+debt-reduction cycle starts from current main and ends, once its coherent unit
+passes the applicable gates, with a debt-reducing commit integrated into main
+and an immediate push. If a cycle has not passed, preserve its work and exact
+remaining debt explicitly; do not call it closed or replace main with a weaker
+baseline. Record the before/after debt and retained accepted coverage.
+
 Integrate and publish every independently verified debt-reduction step into
 that component's main immediately; do not wait for unrelated debts, another
 component, or the entire project to be finished. Choose a coherent causal unit
