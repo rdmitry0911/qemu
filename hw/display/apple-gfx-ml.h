@@ -21,6 +21,7 @@
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
 typedef struct qmu_session_work qmu_session_work;
+typedef struct qmu_display_target qmu_display_target;
 struct AppleGfxMLFrameCompletionJob;
 struct AgfxBootstrapPresentCommand;
 typedef struct ThreadPool ThreadPool;
@@ -148,9 +149,14 @@ struct AppleGfxMLState {
     /* QMetal unified library handle - contains ALL protocol logic */
     qmu_session *qmu_dev;
 
-    /* Native task facilities are constructed only by the complete owning
-     * session cutover.  The recovered carrier alone does not activate them. */
+    /* Constructed only for an explicitly selected complete owning Session:
+     * the separate PCI EFI constructor is not a partial legacy/all39 tail.
+     * State exists before that constructor and retires after its proper NULL
+     * or successful quiescence+destroy RETURN, never on an entered escape. */
     AgfxEeeeProviderState *eeee_provider_state;
+    /* Temporary integration switch, NOT a ready default or vendor fallback.
+     * Paired constructor/native-source/runtime gates remain mandatory. */
+    bool efi_task_source;
 
     /* QEMU display */
     QemuConsole *con;
@@ -165,6 +171,9 @@ struct AppleGfxMLState {
      * by pixman image refs, never independently freed/reallocated by Device. */
     uint8_t *display_fb;
     size_t display_fb_size;
+    /* BQL-owned CURRENT physical output. A frame retains its own target;
+     * completion may instead read this target after an A/B/A mode change. */
+    qmu_display_target *display_target;
     
     /* Current display parameters */
     uint32_t fb_width;
@@ -298,6 +307,7 @@ static inline bool agfx_render_start_mode_is_current(const AppleGfxMLState *s)
     DEFINE_PROP_BOOL("vsync", AppleGfxMLState, vsync_enabled, true), \
     DEFINE_PROP_UINT32("debug", AppleGfxMLState, debug_level, 0), \
     DEFINE_PROP_BOOL("direct_scanout", AppleGfxMLState, direct_scanout, false), \
+    DEFINE_PROP_BOOL("x-efi-task-source", AppleGfxMLState, efi_task_source, false), \
     DEFINE_PROP_STRING("spirv_cache_dir", AppleGfxMLState, spirv_cache_dir), \
     DEFINE_PROP_UINT32("x-pci-vendor-id", AppleGfxMLState, pci_vendor_id_override, 0xffffffff), \
     DEFINE_PROP_UINT32("x-pci-device-id", AppleGfxMLState, pci_device_id_override, 0xffffffff)

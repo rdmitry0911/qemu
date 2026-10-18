@@ -39,8 +39,11 @@
 #include "trace.h"
 
 #include "apple-gfx-ml.h"
+#include "apple-gfx-eeee-process-vm.h"
+#include "apple-gfx-efi-source.h"
 #include "qmu/pvg_regs.h"
 #include "qmu/qmetal_unified.h"
+#include "qmu/qmu_owned_display_frame.h"
 
 /* Forward declarations from qmu_vulkan.h (C++ header, can't include directly) */
 struct qmu_vulkan_ctx;
@@ -104,12 +107,20 @@ typedef struct AgfxHostBH {
     AgfxHostWork owner;
     void (*fn)(void *);
     void *opaque;
+    /* One transferred terminal ref spans actual inner leaf RETURN. */
+    qmu_owned_display_frame *terminal_frame;
 } AgfxHostBH;
 
 static void agfx_host_bh(void *opaque)
 {
     AgfxHostBH *job = opaque;
     agfx_host_work_invoke(&job->owner, job->fn, job->opaque);
+    /* No unwind cleanup: entered leaf/release escape retains this exact
+     * stable envelope, physical source and accepted Work. */
+    if (job->terminal_frame) {
+        qmu_owned_display_frame_release(job->terminal_frame);
+        job->terminal_frame = NULL;
+    }
     agfx_host_work_unref(&job->owner);
     g_free(job);
 }
@@ -138,6 +149,7 @@ struct AgfxLogEntry {
 
 struct AppleGfxMLFrameCompletionJob {
     AppleGfxMLState *state;
+    qmu_owned_display_frame *terminal_frame;
     bool frame_expected;
     bool chain_needed;
     uint8_t *pixels;
@@ -570,7 +582,22 @@ static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
 typedef struct AgfxRenderSubmitJob {
     AppleGfxMLState *state;
     AgfxHostWork owner;
+    qmu_owned_display_frame *prepared_frame;
+    /* Stable completion CPU packet and Work preowned before native prepare. */
+    AgfxHostBH *completion;
 } AgfxRenderSubmitJob;
+
+static void agfx_discard_unsubmitted_completion(AgfxRenderSubmitJob *job)
+{
+    AgfxHostBH *completion = job->completion;
+
+    assert(completion && !completion->terminal_frame);
+    agfx_free_frame_completion_job(completion->opaque);
+    completion->opaque = NULL;
+    agfx_host_work_unref(&completion->owner);
+    g_free(completion);
+    job->completion = NULL;
+}
 
 static void agfx_log_write_direct(const char *text)
 {
@@ -1070,11 +1097,17 @@ static void agfx_enqueue_session_job(AppleGfxMLState *s,
                                      AppleGfxMLSessionJob *job);
 static void qemu_render_frame_complete(void *ctx,
                                        const qmu_render_frame_completion *completion);
+static void qemu_owned_display_done(void *ctx,
+                                    qmu_owned_display_frame *owned_terminal,
+                                    const qmu_render_frame_completion *completion);
+static void agfx_frame_completion_note_metadata(
+    AppleGfxMLFrameCompletionJob *job,
+    const qmu_render_frame_completion *completion);
 static void qemu_frame_completed(void *ctx, int frame_expected);
 static int agfx_render_submit_job(void *opaque);
 static void agfx_render_submit_job_destroy(void *opaque);
 
-static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *vk)
+static void agfx_kick_display_render_legacy(AppleGfxMLState *s, struct qmu_vulkan_ctx *vk)
 {
     int rc;
     AgfxRenderSubmitJob *job;
@@ -1120,7 +1153,69 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
     }
 }
 
-static void agfx_render_submit_call(void *opaque)
+static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *vk)
+{
+    /* Explicit constructor choice, never failure-triggered fallback. */
+    if (s && !s->efi_task_source) {
+        agfx_kick_display_render_legacy(s, vk);
+        return;
+    }
+
+    int rc;
+    AgfxRenderSubmitJob *job;
+
+    if (!s || !vk) {
+        return;
+    }
+
+    agfx_record_render_start_mode(s);
+
+    /* Reference kickoff retains OUTPUT and CB/full region on BQL. Guest
+     * CURRENT source is selected only by background encode, not here. The
+     * existing same-work envelope is acquired before any native publication. */
+    job = g_new0(AgfxRenderSubmitJob, 1);
+    job->state = s;
+    job->owner = agfx_host_work_ref(s, false);
+    job->completion = g_new0(AgfxHostBH, 1);
+    job->completion->owner = agfx_host_work_ref(s, false);
+    job->completion->fn = apple_gfx_ml_frame_completed_bh;
+    job->completion->opaque = g_new0(AppleGfxMLFrameCompletionJob, 1);
+    ((AppleGfxMLFrameCompletionJob *)job->completion->opaque)->state = s;
+    rc = qmu_vk_prepare_owned_display_frame(vk, s->display_target,
+                                            qemu_owned_display_done,
+                                            job->completion,
+                                            &job->prepared_frame);
+    if (rc > 0) {
+        if (agfx_log_should_emit(&s->render_worker_log_count)) {
+            agfx_log(s,
+                     "[apple-gfx-ml] kick_display_render: prepared_output pending_frames=%d mmio_wait=%d\n",
+                     __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
+                     qatomic_read(&s->mmio_wait_active));
+        }
+        thread_pool_submit_immediate(s->render_pool,
+                                     agfx_render_submit_job,
+                                     job,
+                                     agfx_render_submit_job_destroy);
+        return;
+    }
+
+    if (agfx_log_should_emit(&s->render_worker_log_count)) {
+        agfx_log(s,
+                 "[apple-gfx-ml] kick_display_render: prepare_output rc=%d pending_frames=%d\n",
+                 rc,
+                 __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
+    }
+    /* A returned rejection is definitely unsubmitted and owes no native
+     * callback. An escape above never reaches this cleanup/false credit. */
+    assert(!job->prepared_frame);
+    agfx_discard_unsubmitted_completion(job);
+    agfx_render_submit_job_destroy(job);
+    /* Exact returned cleanup, like reference output/CB release, precedes the
+     * one false credit. Unknown cleanup never manufactures completion. */
+    qemu_frame_completed(s, 0);
+}
+
+static void agfx_render_submit_call_legacy(void *opaque)
 {
     AgfxRenderSubmitJob *job = opaque;
     AppleGfxMLState *s = job ? job->state : NULL;
@@ -1160,6 +1255,57 @@ static void agfx_render_submit_call(void *opaque)
     qemu_frame_completed(s, 0);
 }
 
+static void agfx_render_submit_call(void *opaque)
+{
+    /* Explicit constructor choice, never failure-triggered fallback. */
+    if (!opaque || !((AgfxRenderSubmitJob *)opaque)->state ||
+        !((AgfxRenderSubmitJob *)opaque)->state->efi_task_source) {
+        agfx_render_submit_call_legacy(opaque);
+        return;
+    }
+
+    AgfxRenderSubmitJob *job = opaque;
+    AppleGfxMLState *s = job ? job->state : NULL;
+    int rc;
+
+    assert(s && s->qmu_dev && job->prepared_frame);
+    /* The matched endpoint owns source/admission/pool exclusion. Holding the
+     * old wrapper mutex here would invent a second, incomplete lock domain. */
+    rc = qmu_vk_encode_submit_owned_display_frame(job->prepared_frame);
+    if (rc > 0) {
+        /* Done/BH may already have freed this envelope. Never dereference it
+         * after acceptance; only clear this submitter's borrowed address. */
+        job->completion = NULL;
+    }
+    /* Independent caller/native refs allow done/BH before this return. Drop
+     * only after a normal return; unknown acceptance keeps the exact envelope. */
+    qmu_owned_display_frame_release(job->prepared_frame);
+    job->prepared_frame = NULL;
+    if (rc <= 0) {
+        /* Preserve the exact preowned completion packet while rejected
+         * Prepared/native cleanup can still escape. No callback was owed. */
+        agfx_discard_unsubmitted_completion(job);
+    }
+
+    if (rc > 0) {
+        if (agfx_log_should_emit(&s->render_worker_log_count)) {
+            agfx_log(s,
+                     "[apple-gfx-ml] render_worker: submit_owned_output pending_frames=%d mmio_wait=%d\n",
+                     __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST),
+                     qatomic_read(&s->mmio_wait_active));
+        }
+        return;
+    }
+
+    if (agfx_log_should_emit(&s->render_worker_log_count)) {
+        agfx_log(s,
+                 "[apple-gfx-ml] render_worker: submit_owned_output rc=%d pending_frames=%d\n",
+                 rc,
+                 __atomic_load_n(&s->pending_frames, __ATOMIC_SEQ_CST));
+    }
+    qemu_frame_completed(s, 0);
+}
+
 static int agfx_render_submit_job(void *opaque)
 {
     AgfxRenderSubmitJob *job = opaque;
@@ -1173,6 +1319,8 @@ static void agfx_render_submit_job_destroy(void *opaque)
     AgfxRenderSubmitJob *job = opaque;
 
     /* ThreadPool calls this only after its actual worker fn has returned. */
+    assert(!job->completion);
+    qmu_owned_display_frame_release(job->prepared_frame);
     agfx_host_work_unref(&job->owner);
     g_free(job);
 }
@@ -1209,12 +1357,19 @@ struct AppleGfxMLSessionJob {
 typedef enum AgfxBootstrapPresentCommandKind {
     AGFX_BOOTSTRAP_PRESENT_CMD_SCHEDULE,
     AGFX_BOOTSTRAP_PRESENT_CMD_CANCEL,
+    AGFX_BOOTSTRAP_PRESENT_CMD_EFI_RESTART,
+    AGFX_BOOTSTRAP_PRESENT_CMD_EFI_STOP,
 } AgfxBootstrapPresentCommandKind;
 
 typedef struct AgfxBootstrapPresentCommand {
     struct AgfxBootstrapPresentCommand *next;
     AgfxHostWork owner;
     AgfxBootstrapPresentCommandKind kind;
+    /* EFI_STOP stays owned by its synchronous caller through leaf RETURN.
+     * Completion uses bootstrap_present_mutex/cond, not a borrowed event. */
+    void (*invoke_leaf)(void *);
+    void *leaf_ctx;
+    bool completed;
 } AgfxBootstrapPresentCommand;
 
 static void agfx_display_completion_bh(void *opaque)
@@ -1317,7 +1472,7 @@ void agfx_publish_display_mode(AppleGfxMLState *s,
     }
 }
 
-static void apple_gfx_ml_apply_mode_change(AppleGfxMLState *s,
+static void apple_gfx_ml_apply_mode_change_legacy(AppleGfxMLState *s,
                                            uint32_t width,
                                            uint32_t height,
                                            uint32_t iosurface_pixel_format,
@@ -1341,6 +1496,75 @@ static void apple_gfx_ml_apply_mode_change(AppleGfxMLState *s,
                               protection_requirements);
 }
 
+static void apple_gfx_ml_apply_mode_change(AppleGfxMLState *s,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           uint32_t iosurface_pixel_format,
+                                           uint64_t protection_requirements)
+{
+    /* Explicit constructor choice, never failure-triggered fallback. */
+    if (s && !s->efi_task_source) {
+        apple_gfx_ml_apply_mode_change_legacy(s, width, height, iosurface_pixel_format, protection_requirements);
+        return;
+    }
+
+    qmu_display_target *next = NULL;
+    qmu_display_target *outgoing;
+    qmu_status status = QMU_OK;
+
+    if (!s || width == 0 || height == 0) {
+        return;
+    }
+
+    if (s->con) {
+        DisplaySurface *surface = qemu_console_surface(s->con);
+
+        /* Reference set_mode returns on equal current surface geometry even
+         * if the previous newTexture returned nil. Do not retry allocation on
+         * that edge; the initial Console placeholder is not our surface. */
+        if (surface && surface_is_allocated(surface) &&
+            !surface_is_placeholder(surface) &&
+            surface_data(surface) == s->display_fb &&
+            surface_width(surface) == width &&
+            surface_height(surface) == height) {
+            return;
+        }
+    }
+
+    agfx_log(s,
+             "[apple-gfx-ml] mode_change: %ux%u iosurface_pf=0x%08x protection=0x%016" PRIx64 "\n",
+             width,
+             height,
+             iosurface_pixel_format,
+             protection_requirements);
+
+    /* Pre-Console factory callbacks publish metadata only. Actual mode and
+     * initial Console publication are the ONLY physical-mode edges; completed
+     * payloads must never invoke this function. Commit State before synchronous
+     * display listeners can observe the new Console surface. */
+    if (s->con && s->qmu_dev) {
+        struct qmu_vulkan_ctx *vk = qmu_session_get_vulkan(s->qmu_dev);
+
+        status = qmu_display_publish_mode_target(vk, width, height, &next);
+        /* A returned allocation failure corresponds to a nil newTexture, not
+         * stale old-mode success. The visible Console mode still changes;
+         * kickoff with nil output is a definite unsubmitted encode rejection. */
+        assert(status == QMU_OK || next == NULL);
+    }
+    outgoing = s->display_target;
+    s->display_target = next;
+    agfx_publish_display_mode(s,
+                              width,
+                              height,
+                              iosurface_pixel_format,
+                              protection_requirements);
+    qmu_display_target_release(outgoing);
+    if (status != QMU_OK) {
+        agfx_log(s, "[apple-gfx-ml] mode_change: native target unavailable status=%d\n",
+                 status);
+    }
+}
+
 static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                                             AppleGfxMLFrameCompletionJob *job)
 {
@@ -1351,41 +1575,75 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
     AppleGfxMLCaptureBridge applied_bridge = { 0 };
     bool clockab_capture_armed = false;
     bool clockab_ppm_written = false;
+    bool copy_pixels = true;
     char clockab_ppm[64] = { 0 };
 
     if (!s || !job || !s->qmu_dev) {
         return false;
     }
 
-    /* Reference apple_gfx_render_frame_completed_bh applies the rendered
-     * texture that belongs to the completed command buffer. qmetal delivers
-     * that immutable per-submit payload to this callback; copy it into the
-     * visible QEMU surface on the BH edge instead of late-reading a mutable
-     * global latest-frame slot that may already hold another completion. */
+    /* Reference decrements once, then compares render-start/current W/H before
+     * reading the CURRENT physical output. Equal dimensions do not imply the
+     * completed output is still current (A/B/A creates a different target). */
     if (!agfx_render_start_mode_is_current(s)) {
         return false;
     }
 
-    if (!job->pixels || job->width == 0 || job->height == 0 || job->stride == 0) {
-        return false;
+    if (job->terminal_frame) {
+        qmu_display_target *selected_current = s->display_target;
+        qmu_render_frame_completion actual_read;
+
+        assert(bql_locked());
+        width = s->fb_width;
+        height = s->fb_height;
+        stride = s->fb_stride;
+        frame_size = (size_t)height * stride;
+        /* The accepted Console owner fixes this allocation/stride. BQL fixes
+         * selected_current until the ONE callback-free native read returns;
+         * no target retain export, AIO pump, retry or source reselection. */
+        assert(width && height && stride >= (uint64_t)width * 4 &&
+               frame_size <= s->display_fb_size);
+        g_free(job->pixels);
+        job->pixels = g_malloc(frame_size);
+        job->width = width;
+        job->height = height;
+        job->stride = stride;
+        /* Valid call returns only after successful exact read. Native unknown
+         * or read failure escapes through the existing accepted-work C++
+         * boundary; do not free this envelope, fake RETURN/apply or chain.
+         * The reference pending decrement has already occurred, not rolled back. */
+        (void)qmu_display_copy_selected_current_target(job->terminal_frame,
+            selected_current, job->pixels, width, height, stride, &actual_read);
+        /* Literal ObjC [nil getBytes] leaves Console bytes unchanged. It is
+         * not a physical read or black fallback; original capture/UI/chain
+         * still execute below against the unchanged current Console bytes. */
+        copy_pixels = actual_read.pixels != NULL;
+        /* Metadata belongs to bytes actually read. ModeABA TA1 must not carry
+         * the encoded TA0 guest-source labels when that relation is unproven. */
+        agfx_frame_completion_note_metadata(job, &actual_read);
+    } else {
+        /* Compatibility producers retain their original immutable carrier.
+         * This CPU-only leaf is deliberately NOT physical-mode publication. */
+        if (!job->pixels || !job->width || !job->height || !job->stride) {
+            return false;
+        }
+        width = job->width;
+        height = job->height;
+        stride = job->stride;
+        frame_size = (size_t)height * stride;
+        agfx_publish_display_mode(s, width, height,
+                                  s->fb_iosurface_pixel_format,
+                                  s->fb_protection_requirements);
     }
-
-    width = job->width;
-    height = job->height;
-    stride = job->stride;
-    frame_size = (size_t)height * stride;
-
-    agfx_publish_display_mode(s, width, height, s->fb_iosurface_pixel_format,
-                              s->fb_protection_requirements);
 
     if (frame_size > s->display_fb_size) {
         return false;
     }
-    memcpy(s->display_fb, job->pixels, frame_size);
+    if (copy_pixels) {
+        memcpy(s->display_fb, job->pixels, frame_size);
+    }
 
-    /* Update frame counter and log. This is the wrapper analogue of reference
-     * frame_completed_bh copying from the completed display texture into the
-     * visible surface on the BH edge. */
+    /* Publish only after the actual selected read/compatibility copy returned. */
     s->frame_count++;
 
     /* AGFX_FRAME_CAPTURE_DIR_ALL — env-gated per-present PPM capture for the
@@ -1629,19 +1887,12 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
     agfx_free_frame_completion_job(job);
 }
 
-static void qemu_render_frame_complete(void *ctx,
-                                       const qmu_render_frame_completion *completion)
+static void agfx_frame_completion_note_metadata(
+    AppleGfxMLFrameCompletionJob *job,
+    const qmu_render_frame_completion *completion)
 {
-    AppleGfxMLState *s = ctx;
-    AppleGfxMLFrameCompletionJob *job;
-
-    if (!s || !completion) {
-        return;
-    }
-
-    job = g_new0(AppleGfxMLFrameCompletionJob, 1);
-    job->state = s;
     job->frame_expected = completion->frame_expected != 0;
+    memset(&job->bridge, 0, sizeof(job->bridge));
     job->bridge.valid = completion->seq_metadata_version != 0;
     job->bridge.qmetal_host_delivery_seq = completion->host_delivery_seq;
     job->bridge.display_cookie = completion->display_submit_seq;
@@ -1700,6 +1951,20 @@ static void qemu_render_frame_complete(void *ctx,
     job->bridge.clockab_filter = completion->clockab_filter;
     job->bridge.clockab_copy_path = completion->clockab_copy_path;
     job->bridge.clockab_composite_flags = completion->clockab_composite_flags;
+}
+
+static AppleGfxMLFrameCompletionJob *
+agfx_frame_completion_job_new(AppleGfxMLState *s,
+                              const qmu_render_frame_completion *completion)
+{
+    AppleGfxMLFrameCompletionJob *job;
+
+    if (!s || !completion) {
+        return NULL;
+    }
+    job = g_new0(AppleGfxMLFrameCompletionJob, 1);
+    job->state = s;
+    agfx_frame_completion_note_metadata(job, completion);
     if (job->frame_expected && completion->pixels &&
         completion->width != 0 && completion->height != 0 &&
         completion->stride != 0) {
@@ -1709,7 +1974,41 @@ static void qemu_render_frame_complete(void *ctx,
         job->height = completion->height;
         job->stride = completion->stride;
     }
-    agfx_schedule_host_bh(s, apple_gfx_ml_frame_completed_bh, job);
+    return job;
+}
+
+static void qemu_render_frame_complete(void *ctx,
+                                       const qmu_render_frame_completion *completion)
+{
+    AppleGfxMLState *s = ctx;
+    AppleGfxMLFrameCompletionJob *job =
+        agfx_frame_completion_job_new(s, completion);
+
+    if (job) {
+        agfx_schedule_host_bh(s, apple_gfx_ml_frame_completed_bh, job);
+    }
+}
+
+static void qemu_owned_display_done(void *ctx,
+                                    qmu_owned_display_frame *owned_terminal,
+                                    const qmu_render_frame_completion *completion)
+{
+    AgfxHostBH *envelope = ctx;
+    AppleGfxMLFrameCompletionJob *job = envelope ? envelope->opaque : NULL;
+    AppleGfxMLState *s = job ? job->state : NULL;
+
+    assert(s && owned_terminal && completion);
+    /* Adopt the pre-established native terminal reference and metadata.
+     * Its own readback bytes stay protected by this same frame; the BH reads
+     * its explicit CURRENT target instead of cloning an encoded payload.
+     * The callee's separate native ref protects overlap through done RETURN. */
+    assert(!envelope->terminal_frame && !job->terminal_frame);
+    /* All CPU packets/work exist before native prepare. Adopt before aio
+     * publication; the leaf borrows this ref for its CURRENT target read. */
+    envelope->terminal_frame = owned_terminal;
+    job->terminal_frame = owned_terminal;
+    agfx_frame_completion_note_metadata(job, completion);
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), agfx_host_bh, envelope);
 }
 
 static void qemu_frame_completed(void *ctx, int frame_expected)
@@ -1975,7 +2274,7 @@ static void agfx_merge_bootstrap_present_source_locked(AppleGfxMLState *s,
     if (!s->bootstrap_present_source.pending) {
         s->bootstrap_present_source.owner = agfx_host_work_ref(s, root);
         s->bootstrap_present_source.pending = true;
-        qemu_cond_signal(&s->bootstrap_present_cond);
+        qemu_cond_broadcast(&s->bootstrap_present_cond);
     }
 }
 
@@ -2023,10 +2322,24 @@ static void agfx_free_bootstrap_present_commands_locked(AppleGfxMLState *s)
     s->bootstrap_present_cmd_tail = NULL;
     while (cmd) {
         AgfxBootstrapPresentCommand *next = cmd->next;
-        agfx_host_work_unref(&cmd->owner);
-        g_free(cmd);
+
+        if (cmd->kind == AGFX_BOOTSTRAP_PRESENT_CMD_EFI_STOP) {
+            /* Admitted synchronous source cleanup is not a timer notice.
+             * Its caller still owns leaf_ctx and waits for actual RETURN. */
+            cmd->next = NULL;
+            if (s->bootstrap_present_cmd_tail) {
+                s->bootstrap_present_cmd_tail->next = cmd;
+            } else {
+                s->bootstrap_present_cmd_head = cmd;
+            }
+            s->bootstrap_present_cmd_tail = cmd;
+        } else {
+            agfx_host_work_unref(&cmd->owner);
+            g_free(cmd);
+        }
         cmd = next;
     }
+    qemu_cond_broadcast(&s->bootstrap_present_cond);
 }
 
 static void agfx_schedule_frame_presents_locked(AppleGfxMLState *s, bool *started)
@@ -2041,7 +2354,7 @@ static void agfx_schedule_frame_presents_locked(AppleGfxMLState *s, bool *starte
         if (started) {
             *started = true;
         }
-        qemu_cond_signal(&s->bootstrap_present_cond);
+        qemu_cond_broadcast(&s->bootstrap_present_cond);
         return;
     }
 
@@ -2069,7 +2382,7 @@ static void agfx_schedule_frame_presents(AppleGfxMLState *s)
         s->bootstrap_present_cmd_head = cmd;
     }
     s->bootstrap_present_cmd_tail = cmd;
-    qemu_cond_signal(&s->bootstrap_present_cond);
+    qemu_cond_broadcast(&s->bootstrap_present_cond);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
 }
 
@@ -2107,8 +2420,70 @@ static void agfx_cancel_frame_presents(AppleGfxMLState *s)
         s->bootstrap_present_cmd_head = cmd;
     }
     s->bootstrap_present_cmd_tail = cmd;
-    qemu_cond_signal(&s->bootstrap_present_cond);
+    qemu_cond_broadcast(&s->bootstrap_present_cond);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
+}
+
+void agfx_efi_source_schedule_present(void *opaque)
+{
+    AppleGfxMLState *s = opaque;
+    AgfxBootstrapPresentCommand *cmd;
+
+    assert(s && s->efi_task_source);
+    cmd = g_new0(AgfxBootstrapPresentCommand, 1);
+    cmd->owner = agfx_host_work_ref(s, false);
+    cmd->kind = AGFX_BOOTSTRAP_PRESENT_CMD_EFI_RESTART;
+    qemu_mutex_lock(&s->bootstrap_present_mutex);
+    if (s->bootstrap_present_cmd_tail) {
+        s->bootstrap_present_cmd_tail->next = cmd;
+    } else {
+        s->bootstrap_present_cmd_head = cmd;
+    }
+    s->bootstrap_present_cmd_tail = cmd;
+    qemu_cond_broadcast(&s->bootstrap_present_cond);
+    qemu_mutex_unlock(&s->bootstrap_present_mutex);
+}
+
+void agfx_efi_source_stop_on_present_queue(void *opaque,
+                                         void (*invoke_leaf)(void *),
+                                         void *leaf_ctx)
+{
+    AppleGfxMLState *s = opaque;
+    AgfxBootstrapPresentCommand *cmd;
+
+    assert(s && s->efi_task_source && invoke_leaf);
+    /* Off-main MMIO callers wait here while their original QEMU caller pumps
+     * AIO. Never block BQL on a prior present that may require main work. */
+    assert(!bql_locked());
+    if (qemu_thread_is_self(&s->bootstrap_present_worker)) {
+        qemu_mutex_lock(&s->bootstrap_present_mutex);
+        qatomic_set(&s->iosfc_bootstrap_active, 0);
+        agfx_cancel_frame_presents_locked(s);
+        qemu_mutex_unlock(&s->bootstrap_present_mutex);
+        invoke_leaf(leaf_ctx); /* QMetal captures the original exception. */
+        return;
+    }
+
+    cmd = g_new0(AgfxBootstrapPresentCommand, 1);
+    cmd->owner = agfx_host_work_ref(s, false);
+    cmd->kind = AGFX_BOOTSTRAP_PRESENT_CMD_EFI_STOP;
+    cmd->invoke_leaf = invoke_leaf;
+    cmd->leaf_ctx = leaf_ctx;
+    qemu_mutex_lock(&s->bootstrap_present_mutex);
+    if (s->bootstrap_present_cmd_tail) {
+        s->bootstrap_present_cmd_tail->next = cmd;
+    } else {
+        s->bootstrap_present_cmd_head = cmd;
+    }
+    s->bootstrap_present_cmd_tail = cmd;
+    qemu_cond_broadcast(&s->bootstrap_present_cond);
+    while (!cmd->completed) {
+        qemu_cond_wait(&s->bootstrap_present_cond, &s->bootstrap_present_mutex);
+    }
+    qemu_mutex_unlock(&s->bootstrap_present_mutex);
+    /* Worker no longer uses cmd after publishing completed under this mutex.
+     * Only the original synchronous caller retires its CPU command packet. */
+    g_free(cmd);
 }
 
 static void agfx_bootstrap_present_on_queue(void *opaque)
@@ -2132,9 +2507,19 @@ static void agfx_bootstrap_present_on_queue(void *opaque)
 static void agfx_bootstrap_present_command_call(void *opaque)
 {
     AgfxBootstrapPresentCommand *cmd = opaque;
-    AppleGfxMLState *s = cmd->owner.state;
+    AppleGfxMLState *s;
 
+    assert(cmd);
+    s = cmd->owner.state;
+    assert(s);
+
+    /* Worker dequeue and CPU timer mutation share the original locked cut.
+     * Reset cannot cancel and then be undone by a previously popped restart. */
     switch (cmd->kind) {
+    case AGFX_BOOTSTRAP_PRESENT_CMD_EFI_RESTART:
+        /* Actual texture publication restarts the immediate100ms timer. */
+        agfx_cancel_frame_presents_locked(s);
+        /* fall through */
     case AGFX_BOOTSTRAP_PRESENT_CMD_SCHEDULE: {
         bool started = false;
 
@@ -2148,9 +2533,17 @@ static void agfx_bootstrap_present_command_call(void *opaque)
         break;
     }
     case AGFX_BOOTSTRAP_PRESENT_CMD_CANCEL:
+    case AGFX_BOOTSTRAP_PRESENT_CMD_EFI_STOP:
         qatomic_set(&s->iosfc_bootstrap_active, 0);
         agfx_cancel_frame_presents_locked(s);
         break;
+    }
+    if (cmd->kind == AGFX_BOOTSTRAP_PRESENT_CMD_EFI_STOP) {
+        /* Same serial lane: every prior present has actually RETURNED.
+         * No queue/state mutex spans original texture/mapping retirement. */
+        qemu_mutex_unlock(&s->bootstrap_present_mutex);
+        cmd->invoke_leaf(cmd->leaf_ctx);
+        qemu_mutex_lock(&s->bootstrap_present_mutex);
     }
 }
 
@@ -2169,12 +2562,20 @@ static void *agfx_bootstrap_present_thread(void *opaque)
 
         cmd = agfx_take_bootstrap_present_command_locked(s);
         if (cmd) {
+            const bool synchronous =
+                cmd->kind == AGFX_BOOTSTRAP_PRESENT_CMD_EFI_STOP;
+
             /* The serial present worker is the wrapper analogue of
              * PGEFIPresentQueue. It alone owns timer/source state mutation. */
             agfx_host_work_invoke(&cmd->owner,
                                  agfx_bootstrap_present_command_call, cmd);
             agfx_host_work_unref(&cmd->owner);
-            g_free(cmd);
+            if (synchronous) {
+                cmd->completed = true;
+                qemu_cond_broadcast(&s->bootstrap_present_cond);
+            } else {
+                g_free(cmd);
+            }
             continue;
         }
 
@@ -2612,7 +3013,10 @@ static void agfx_mmio_write_call(void *opaque)
      * the IOSFC MMIO commit points: first MAP_ADDR starts the timer with an
      * immediate first fire, later MAP_ADDR commits merge one pending tick into
      * the already-armed source. */
-    if (job->offset == PVG_REG_IOSFC_MAP_ADDR && job->value != 0) {
+    if (s->efi_task_source) {
+        /* Direct EFI controls this queue at actual source creation/stop.
+         * In particular1220 is a port doorbell, not IOSFC_UNMAP. */
+    } else if (job->offset == PVG_REG_IOSFC_MAP_ADDR && job->value != 0) {
         agfx_schedule_frame_presents(s);
     } else if ((job->offset == PVG_REG_IOSFC_ENABLE && job->value == 0) ||
                job->offset == PVG_REG_IOSFC_UNMAP) {
@@ -2707,6 +3111,22 @@ static const GraphicHwOps agfx_gfx_ops = {
 /* ============================================================
  * Device Lifecycle
  * ============================================================ */
+
+/* Only after the new factory's ordinary NULL contract, or the actual Session
+ * quiescence and destroy RETURN. Empty provider tables are a consistency
+ * check here, never a substitute for that external callback lifetime cut.
+ * Independent captured physical SourceBacking readers need no State borrow. */
+static void agfx_retire_efi_provider_state(AppleGfxMLState *s)
+{
+    if (!s->eeee_provider_state) {
+        return;
+    }
+    if (!agfx_eeee_provider_state_destroy(s->eeee_provider_state)) {
+        error_report("apple-gfx: EFI provider remains live after lifecycle RETURN");
+        abort(); /* Preserve/reject the violated contract, never force-free. */
+    }
+    s->eeee_provider_state = NULL;
+}
 
 static void agfx_realize(PCIDevice *pci_dev, Error **errp)
 {
@@ -2843,7 +3263,21 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     qmu_config.mode_data[2] = (1024u << 16) | 1280u;
     qmu_config.mode_count = 3;
 
-    s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
+    if (s->efi_task_source) {
+        qmu_efi_provider_v2 efi_provider;
+
+        /* Explicit, disabled-by-default integration candidate. This SAME
+         * State must exist before the new constructor can copy its complete
+         * separate18 facilities/capture table. The legacy table above keeps
+         * its entire EEEE18 tail zero; no all39 or IOSFC mapper activation. */
+        assert(!s->eeee_provider_state);
+        s->eeee_provider_state = agfx_eeee_provider_state_create();
+        agfx_efi_source_fill_provider(&efi_provider, s);
+        s->qmu_dev = qmu_create_extended_efi_v2(&qmu_config, &qmu_callbacks,
+                                               &efi_provider);
+    } else {
+        s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
+    }
     if (!s->qmu_dev) {
         error_setg(errp, "Failed to create qmetal device");
         goto fail_sync;
@@ -2864,9 +3298,9 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     /* Create QEMU console */
     s->con = graphic_console_init(DEVICE(s), 0, &agfx_gfx_ops, s);
     
-    /* Before Console creation, callbacks can publish metadata only. Bind the
-     * initial owned pixel allocation through the same mode publication leaf. */
-    agfx_publish_display_mode(s, s->display_width, s->display_height,
+    /* Before Console creation callbacks publish metadata only. Bind the first
+     * physical target and owned Console allocation before any kickoff/listener. */
+    apple_gfx_ml_apply_mode_change(s, s->display_width, s->display_height,
                              s->fb_iosurface_pixel_format,
                              s->fb_protection_requirements);
     s->rendering_frame_width = s->fb_width;
@@ -2876,6 +3310,10 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     return;
 
 fail_sync:
+    /* The new ABI's ordinary NULL RETURN guarantees no live provider ingress,
+     * task or callback descendant. An entered escape does NOT reach this
+     * label and must not be converted to a guessed clean NULL/fallback. */
+    agfx_retire_efi_provider_state(s);
     /* Returned factory failure has not acquired wrapper workers or Console.
      * Retire only these initialized owners, in reverse acquisition order. */
     agfx_completion_queue_destroy(s);
@@ -2988,7 +3426,7 @@ static void agfx_exit(PCIDevice *pci_dev)
      * executor: a queued original may still publish its intentional cancel. */
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     s->bootstrap_present_roots_stopped = true;
-    qemu_cond_signal(&s->bootstrap_present_cond);
+    qemu_cond_broadcast(&s->bootstrap_present_cond);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
 
     agfx_run_lifecycle_work(agfx_quiesce_session, &work);
@@ -3003,7 +3441,7 @@ static void agfx_exit(PCIDevice *pci_dev)
 
     qemu_mutex_lock(&s->bootstrap_present_mutex);
     s->bootstrap_present_worker_stop = true;
-    qemu_cond_signal(&s->bootstrap_present_cond);
+    qemu_cond_broadcast(&s->bootstrap_present_cond);
     qemu_mutex_unlock(&s->bootstrap_present_mutex);
     agfx_run_lifecycle_work(agfx_join_bootstrap_worker, s);
     qemu_mutex_lock(&s->bootstrap_present_mutex);
@@ -3016,8 +3454,16 @@ static void agfx_exit(PCIDevice *pci_dev)
         agfx_run_lifecycle_work(agfx_free_render_pool, s);
         s->render_pool = NULL;
     }
+    /* Persistent mode ownership is physical, not a permanent SessionWork.
+     * Native/worker/BH/read descendants have returned at the canonical barrier. */
+    qmu_display_target_release(s->display_target);
+    s->display_target = NULL;
     agfx_run_lifecycle_work(agfx_destroy_qmu, s);
     s->qmu_dev = NULL;
+    /* Successful canonical quiescence AND actual destroy RETURN precede this
+     * provider teardown. Capture readers retain their own MR/dupfd backing
+     * independently; never force their release or wait under provider locks. */
+    agfx_retire_efi_provider_state(s);
 
     agfx_completion_queue_destroy(s);
     qemu_mutex_destroy(&s->mmio_job_mutex);
