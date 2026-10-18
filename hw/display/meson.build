@@ -88,6 +88,7 @@ else
 
     apple_gfx_ml_ss = ss.source_set()
     apple_gfx_ml_ss.add(files('apple-gfx-ml.c', 'apple-gfx-eeee-process-vm.c',
+                             'apple-gfx-efi-capture.c',
                              'apple-gfx-eeee-source-dmabuf.c'))
 
     cc = meson.get_compiler('c')
