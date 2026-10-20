@@ -1,0 +1,88 @@
+{
+  "status": "UNACCEPTED_HISTORICAL_SOURCE_RESTORATION_CANDIDATE_NOT_MAIN",
+  "date": "2026-10-20",
+  "authority": "Source-only candidate requested by owner. No main replacement, publication, build, test, VM or acceptance is performed by this commit.",
+  "history": "Two parents retain current committed-main history and historical donor history. The tree intentionally selects the full historical donor projection, not a functional superset or a completed no-regression merge.",
+  "metadata_only_deviations": [
+    "AGENTS.md is the exact current-main rules blob.",
+    "This new transition document is the sole other deviation from the donor tree."
+  ],
+  "historical_evidence": "eeee-iosurface-views-live-a/b-20260928 preserved 401-frame A/B login-screen evidence belongs to original QEMU96c63afe/QMetal6f0467/AIRd1e485/customRADV tuple. It does not establish authenticated Desktop/Finder/Screensaver, eee1 driver, visual parity of this reconstructed candidate, or parity on all adapters.",
+  "reconstruction_evidence": "whole985 historical QEMU ordinary build and whole990 matched125/8efAIR component build; whole991 native controls/BDA and whole992 public ABI/relocation/CLI are separately scoped existing candidate receipts. Their binaries/markers are not builds of this new commit and are not a main-built guest package.",
+  "tuple_boundary": "AIR main remains cc3c29ce6cb806d5764ac58caf6d369f7db85723. Historical oldAIR8ef reconstruction stays separate. Historical QMetal125 must use its matched oldAIR8ef headers/DSO tuple; never substitute current AIR into that caller without the complete ABI3 carrier AND execution/owner reconciliation.",
+  "preservation": {
+    "accepted_qmetal_main": "68cbdb0aab8a20f08d341ef2cde9a6352573ff25",
+    "accepted_qemu_main": "8b24fe7f13add54dc621bfe2669f16d18d3e7f9d",
+    "localtask979": {
+      "ref": "refs/heads/fix/whole-localtask979-20261020",
+      "sha": "3b41e7a281a75d2d7ae13810bc01adc755f631ac",
+      "disposition": "Preserved separate WIP, not required as a new prerequisite for reconstructing the historical whole path."
+    },
+    "modern1005": {
+      "ref": "refs/heads/compare/whole-compute-abi3-1005-20261020",
+      "base": "06621c3e5c5ef17607139e971d7f2b660ea1aecc",
+      "source_report": "WHOLE1005-CARRIER-RECOVERY-SOURCE.json",
+      "source_report_sha256": "f5a46abacdf9e73a1b9a13e13807ea28effc5fbb4f4a23cb377bd811d1904429",
+      "disposition": "Preserved independent modern AIR ABI3 carrier candidate; its dirty source unit is NOT incorporated by this restoration commit and does not yet close image execution/native owners."
+    }
+  },
+  "next": "Review/qualify the exact reconstructed historical component tuple, preserve explicit reopened debts and obtain any required trade-off authority before main promotion. Reuse unaffected receipts; changed dependencies owe their original affected gates. Future complete donor units are not prerequisites merely to reconstruct this source candidate. Only explicit committed-main component revisions may form a guest-run package.",
+  "no_claims": "No functional debt-reduction acceptance, least-debt main replacement, runtime/pixel result, all-platform support, performance non-regression or completed historical E2E recovery is claimed.",
+  "component": "QEMU",
+  "first_parent": "8b24fe7f13add54dc621bfe2669f16d18d3e7f9d",
+  "donor": "5582c052ade72689cb6470a77098bce54db70e09",
+  "donor_tree": "960b945b63964432554205c43e37fe49b762bbb9",
+  "retained": "Entire historical5582 source/configuration/assets/submodule tree and original legacy extended callback/guest/render/presentation flow. Source reconstruction does not require introducing LocalTask/NoCopy.",
+  "reopened_debts": [
+    {
+      "unit": "Direct pinned-memory dirty lifetime and host UI/MMIO caller envelope",
+      "donors": [
+        "1b6feb8f5105027711dc79c4457418080a8dd97e",
+        "a863a07df93b42b350a4ff459f5f58fb23e96b01",
+        "ba11310676e0138024582cb87d0d1b9296217590",
+        "13961ee06ac67bcbc4693ff56b028d2e091570e1",
+        "01d7f5756b924cda69f2d0cc3b2d73ce1dfe410b",
+        "7b65a1e6c2caa1bc2ca2058fda8fc1827e01fa65"
+      ]
+    },
+    {
+      "unit": "Reset-safe accepted display credits and paired producer terminal custody",
+      "donors": [
+        "9643cf59415a49ff8e2bc6c4c258f8489b722e06"
+      ],
+      "qmetal_dependency": "6b331f135e5a5e14f30aa3ad2913edd03511be83"
+    },
+    {
+      "unit": "Same accepted SessionWork through callback/child/BH/unpin RETURN and quiesce",
+      "donors": [
+        "8f33076170ded4579baf0beda8eb7702a08bfc49"
+      ],
+      "qmetal_dependency": "1ddbb8147c60a3e07e3187f90eba9a3d5fc40d05"
+    },
+    {
+      "unit": "Retained native process-VM source/export/extent/BQL contract",
+      "donors": [
+        "9a87360560aa43bae4aba992e3b486887deb99c4",
+        "4e7cb3fedbb23cc90ad5a1b48c44e8fb47444b28",
+        "360e6610a9544957d6667a999e160b4d94416a3d",
+        "2e5490a1d1e64a7c096cba3cec23c24739b5b9d9",
+        "c143dd137a82d1e4aaeed98f8be3493e71c03cba",
+        "a67e525ff1d24747cf3bc248e7db76f464813760"
+      ],
+      "note": "Inert components remain inert until a whole actual consumer is selected; supplemental DMA test is not a new live GPU coherency implementation."
+    },
+    {
+      "unit": "Typed original EFI capture and complete owned output/presentation",
+      "donors": [
+        "f1501c62a92d566bf74abe5d03a6e00576bd3411",
+        "8b24fe7f13add54dc621bfe2669f16d18d3e7f9d"
+      ],
+      "qmetal_dependency": "773122bfd902c9e0f4e6ac1b6e5b8a832c1da8e4 and accepted matching successors"
+    }
+  ],
+  "planning_receipts": [
+    "WHOLE989-QEMU-INTEGRATION-PLAN.json",
+    "WHOLE996-QMETAL-RESTORE-PLAN.json"
+  ],
+  "build_identity_limit": "Historical-source rebuild whole985 SHA f4a4268348f195e4587817876da0317ab13717f221c48952d96bc48bb332c76d is not original96c63afe784a27bd2c3e18e4471423f43b2c973aee8acfcd70a4c0d6f2a90f46 and is not built from this new candidate's Git marker."
+}

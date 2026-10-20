@@ -19,8 +19,6 @@
 #include "system/system.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
-#include "hw/virtio/apple-virgl-bridge.h"
-#include "hw/virtio/apple-virgl-protocol.h"
 #include "hw/virtio/virtio-gpu-bswap.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
 #include "hw/core/qdev-properties.h"
@@ -60,24 +58,6 @@ static void virtio_gpu_gl_flushed(VirtIOGPUBase *b)
     VirtIOGPU *g = VIRTIO_GPU(b);
 
     virtio_gpu_process_cmdq(g);
-}
-
-static bool virtio_gpu_gl_handle_cursor_element(VirtIOGPU *g,
-                                                VirtQueue *vq,
-                                                VirtQueueElement *elem)
-{
-    AppleVirglBridge *bridge;
-    struct virtio_gpu_ctrl_hdr header = { 0 };
-    size_t copied = iov_to_buf(elem->out_sg, elem->out_num, 0, &header,
-                               sizeof(header));
-
-    if (copied != sizeof(header) ||
-        le32_to_cpu(header.type) != APPLE_VIRGL_CURSOR_CMD_COMPLETION_RECEIVE) {
-        return false;
-    }
-
-    bridge = virtio_gpu_apple_virgl_bridge(g, true);
-    return apple_virgl_bridge_accept_completion_receiver(bridge, vq, elem);
 }
 
 static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
@@ -126,7 +106,6 @@ static void virtio_gpu_gl_reset(VirtIODevice *vdev)
     VirtIOGPU *g = VIRTIO_GPU(vdev);
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(vdev);
 
-    apple_virgl_bridge_reset(gl->apple_virgl_bridge);
     virtio_gpu_reset(vdev);
 
     /*
@@ -195,18 +174,12 @@ static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
             timer_free(gl->print_stats);
         }
         timer_free(gl->fence_poll);
-        virgl_renderer_force_ctx_0();
-        virtio_gpu_virgl_reset_scanout(g);
-        g_clear_pointer(&gl->apple_virgl_bridge,
-                        apple_virgl_bridge_free);
-        virgl_renderer_force_ctx_0();
         virgl_renderer_cleanup(NULL);
     }
 
     gl->renderer_state = RS_START;
 
-    g_clear_pointer(&g->capset_ids, g_array_unref);
-    virtio_gpu_device_unrealize(qdev);
+    g_array_unref(g->capset_ids);
 }
 
 static void virtio_gpu_gl_class_init(ObjectClass *klass, const void *data)
@@ -220,7 +193,6 @@ static void virtio_gpu_gl_class_init(ObjectClass *klass, const void *data)
     vgc->handle_ctrl = virtio_gpu_gl_handle_ctrl;
     vgc->process_cmd = virtio_gpu_virgl_process_cmd;
     vgc->update_cursor_data = virtio_gpu_gl_update_cursor_data;
-    vgc->handle_cursor_element = virtio_gpu_gl_handle_cursor_element;
 
     vdc->realize = virtio_gpu_gl_device_realize;
     vdc->unrealize = virtio_gpu_gl_device_unrealize;
@@ -237,25 +209,9 @@ static const TypeInfo virtio_gpu_gl_info = {
 module_obj(TYPE_VIRTIO_GPU_GL);
 module_kconfig(VIRTIO_GPU);
 
-static void thunderbolt_virtio_gpu_gl_class_init(ObjectClass *klass,
-                                                 const void *data)
-{
-    DeviceClass *dc = DEVICE_CLASS(klass);
-
-    dc->hotpluggable = true;
-}
-
-static const TypeInfo thunderbolt_virtio_gpu_gl_info = {
-    .name = TYPE_THUNDERBOLT_VIRTIO_GPU_GL,
-    .parent = TYPE_VIRTIO_GPU_GL,
-    .class_init = thunderbolt_virtio_gpu_gl_class_init,
-};
-module_obj(TYPE_THUNDERBOLT_VIRTIO_GPU_GL);
-
 static void virtio_register_types(void)
 {
     type_register_static(&virtio_gpu_gl_info);
-    type_register_static(&thunderbolt_virtio_gpu_gl_info);
 }
 
 type_init(virtio_register_types)
