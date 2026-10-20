@@ -4409,6 +4409,11 @@ foreach target : target_dirs
         'install': false,
       }]
       if host_os == 'linux' and 'CONFIG_APPLE_GFX_ML' in config_target
+        if 'cpp' not in all_languages
+          add_languages('cpp', required: true, native: false)
+          all_languages += ['cpp']
+          cxx = meson.get_compiler('cpp')
+        endif
         qmetal_import_source_dir = get_option('apple_virgl_qmetal_source_dir')
         if qmetal_import_source_dir == ''
           qmetal_import_source_dir = meson.project_source_root() / '../qmetal'
@@ -4526,6 +4531,7 @@ foreach target : target_dirs
     emulator = executable(exe_name, exe['sources'],
                install: exe.get('install', true),
                c_args: c_args + exe.get('c_args', []),
+               include_directories: exe.get('include_directories', []),
                dependencies: arch_deps + exe['dependencies'],
                objects: lib.extract_all_objects(recursive: true),
                link_depends: [block_syms, qemu_syms],

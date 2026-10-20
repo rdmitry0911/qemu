@@ -10,7 +10,8 @@
     "01d7f5756b924cda69f2d0cc3b2d73ce1dfe410b returned factory-failure owner cleanup and unchanged controls",
     "7b65a1e6c2caa1bc2ca2058fda8fc1827e01fa65 concurrent MMIO-read caller context and unchanged controls",
     "9643cf59415a49ff8e2bc6c4c258f8489b722e06 accepted reset credits and original frame controls",
-    "8f33076170ded4579baf0beda8eb7702a08bfc49 SAME accepted SessionWork/callback/BH/unpin RETURN and canonical quiesce; actual original native imported/frame/MMIO controls"
+    "8f33076170ded4579baf0beda8eb7702a08bfc49 SAME accepted SessionWork/callback/BH/unpin RETURN and canonical quiesce; actual original native imported/frame/MMIO controls",
+    "9a87360560aa43bae4aba992e3b486887deb99c4 original required C++ language admission and per-executable include propagation only; no additional inert supplier/test activation"
   ],
   "complete_selected_caller_edges": [
     "Actual public root MMIO read/write retains State and one canonical root operation; worker/main-AIO child retains SAME work before publication, TLS invocation before actual QMU call, unref only after actual return and final stack access before completion signal.",
