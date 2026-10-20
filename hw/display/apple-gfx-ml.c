@@ -22569,31 +22569,6 @@ static void apple_gfx_ml_raise_interrupt_bh(void *opaque)
     uint64_t delivery_seq = 0;
     uint64_t deliveries_since = 0;
 
-    if (!s) {
-        if (job->diag_enabled) {
-            pending_before = agfx_stamp_irq_pending_dec(s);
-            pending_after = pending_before ? pending_before - 1 : 0;
-            delivery_seq = qatomic_fetch_inc(&s->stamp_irq_delivery_seq) + 1;
-            deliveries_since =
-                qatomic_fetch_inc(&s->stamp_irq_deliveries_since_event_read) + 1;
-            agfx_log(s,
-                     "[apple-gfx-ml] DIAG_STAMP_IRQ_COALESCE where=deliver_drop_exit "
-                     "ts_ns=%llu tid=0x%lx request_seq=%llu delivery_seq=%llu "
-                     "vector=%u pending_before=%llu pending_after=%llu "
-                     "irq_deliveries_since_last_event_read=%llu\n",
-                     (unsigned long long)subk_sig_timing_now_ns(),
-                     subk_sig_timing_tid(),
-                     (unsigned long long)job->request_seq,
-                     (unsigned long long)delivery_seq,
-                     job->vector,
-                     (unsigned long long)pending_before,
-                     (unsigned long long)pending_after,
-                     (unsigned long long)deliveries_since);
-        }
-        g_free(job);
-        return;
-    }
-
     s->irq_count++;
 
     if (s->irq_count <= AGFX_LOG_INITIAL_COUNT || (s->irq_count % AGFX_LOG_INTERVAL) == 0) {
