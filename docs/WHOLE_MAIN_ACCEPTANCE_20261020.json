@@ -1,0 +1,44 @@
+{
+  "status": "WHOLE_FOUNDATION_PLUS_ACCEPTED_MAIN_UNITS_COMPONENT_ACCEPTED_NOT_NEW_GUEST_E2E",
+  "starting_main": "8b24fe7f13add54dc621bfe2669f16d18d3e7f9d",
+  "reviewed_candidate": "7fd53be227b9bc46cfbaf85c2fbe170cf0fbb932",
+  "reviewed_tree": "78bee19f7004e3a0364e4524d6367b8d5f522387",
+  "dependencies": {
+    "QMetal_main": "69875b7bab5fffd8f385a7f3ca348d94813d7f17",
+    "QMetal_DSO": "902d4e0a126e646a9b8dd71da4d45979b525364094b0897f8088afbc99db295a",
+    "AIR_main": "cc3c29ce6cb806d5764ac58caf6d369f7db85723",
+    "AIR_DSO": "e1d768826f6daa1a57103bd5fefd8372a3e7296eed7a6df94cc03939b9a7dbd9"
+  },
+  "selection": "Reuse the whole preserved historical e2e QEMU foundation and reconcile complete later accepted main units. Main-to-candidate15path delta restores the full historical wrapper rather than repeatedly importing small fragments. Original main is an ancestor; no accepted main path is deleted.75path original restoration ledger:61 exact main blobs,6 whole additions,8 intentional intersections. Modern AIR/main provider retained, not the historical serialized translator or unbuilt QMetal whole candidate.",
+  "before_after_debt": "Before: authoritative main lacked the preserved whole wrapper/caller foundation while the whole candidate lacked accepted EFI/owned/nativeeee1/platform units. After: one ancestry-preserving source union includes both, normal builds and affected controls pass with scopes below. This closes lost source integration and applicable component reconciliation; it does not turn historical guest receipts into new runtime evidence or close all contracts.",
+  "evidence_root": "/srv/project/apple-virgl/evidence/runs",
+  "source_review": {
+    "path": "20261014-qmetal-parallel/ROOT1035-WHOLE-SOURCE-REVIEW.json",
+    "sha256": "f655332ef505aa63e0e3209cf9a96c1b6d34ca11fb336a05798700f3c0824e84",
+    "scope": "Root reviewed committed intersection diffs and complete source FINAL, verified75mode/blob ledger and67 changed-file identities; no deleted accepted path. Underlying historical source/build identities and recovery records remain in WHOLE_NATIVE_CUSTODY_RECOVERY/WHOLE_ACCEPTED_UNION docs."
+  },
+  "normal_build": {
+    "path": "20261014-qemu-parallel/whole1035-accepted-union-build/END.json",
+    "sha256": "f46ca01fc955569e23dd942087534cd67101e7271ffafc89e071541cb18abe83",
+    "scope": "Exact7fd normal configure,1050Ninja steps/18affected targets; source authority, three eager relocations, CLI/device-property checks pass.51.9569s build/73.5749s total. Copied graph; old graph preserved. This is a candidate component build, not a main-built guest package."
+  },
+  "component_gates": [
+    {"path":"20261014-qemu-parallel/whole1036-core-controls/END.json","sha256":"61c22d81da4f5fc2e09a5795141d4b20400127ac162e57453cf68874e8e239a6","scope":"121actual named cases:31original linked native/mode/cursor/memory/MMIO;23supplier/processVM/source extent/export-owner;67pure nativeeee1protocol/framepump/present/cursor. Natural zero, no VUID/skip. Not121shaders or guest graphics."},
+    {"path":"20261014-qemu-parallel/whole1037-platform-controls/END.json","sha256":"31c6989e8ff88999e16e0de781b46bbc10f29ae0cb221722e8edcfa3f0715d43","scope":"13diskless actual QTests:5SMC and8VGA/multihead/Thunderbolt hotplug. No Tahoe/base/overlay touched."},
+    {"path":"20261014-qemu-parallel/manual1037-fixture-build/END.json","sha256":"88bccc9727a50062fc2c4e72c6f78869e056fd3b91c41876f3bc82a20c74c520","scope":"Four unchanged manual test/bridge TUs plus2links reuse current1541normal objects and4655consumed inputs. Source/private-header/loader/provider closure. No product source duplication or native execution in builder."},
+    {"path":"20261014-qemu-parallel/manual1039-cpu-controls/END.json","sha256":"1485041982abe9e8259a353857aacc8c79036b971d21759467e939da95cb58b5","scope":"5actual original typed CPU capture/alias/export refusal/FD0 controls, not native GPU access."},
+    {"path":"20261014-qemu-parallel/manual1039-efi-native-controls/END.json","sha256":"3b93e6a6f6d08a6edae86e13f124f9cd51842699537b525b99f4de618728bdda","scope":"Actual original-page typed DMA construction/view/retire; A4096/V20/L4056/B4076/R4080/S4080. System RADV ICD3ed98, distinct from restored core ICD05fc; no GPU submit/access."},
+    {"path":"20261014-qemu-parallel/manual1039-dma-native-controls/END.json","sha256":"134c027f3ff1a97fc4db96590fcdc238c00ef5c4969a53aa9e7a796ca4687f6e","scope":"Actual original-page DMA import/bind/destroy/free/source RETURN; A4096/V17/L4062/B4079/R4080/S4080. Same qualified system AMD mechanical tuple, no GPU submit/access."},
+    {"path":"20261014-qemu-parallel/whole1039-remote-intel-controls/END.json","sha256":"45ac553adcca2ee39c67f12594cb9dea2b6ba28806bdc81c5340f9016a2856ab","scope":"Exact new e850 owned binary/provider902d/AIR e1d on prior qualified IntelICD/runtime;5named serial-stop-reset/plain HOST/BH-before-encodeRETURN/ABA/Gamma cases pass. Gamma exact RGB3basis; eager exe/ICD/validation checks and16raw blocks verified; cleanup complete."},
+    {"path":"20261014-qemu-parallel/whole1039-remote-nvidia-controls/END.json","sha256":"c89e6b1ce57b5ee221c6768da462f39a23aeefe8984300eec738f305563d3ab5","scope":"Same5cases including actual exact RGB3basis on prior qualified NVIDIAICD/runtime;16raw blocks/eager binding/cleanup verified. Distinct adapter witness, not all-platform guest or live writer proof."}
+  ],
+  "explicit_negative_and_limits": {
+    "AMD_original_HOST": "whole1036-owned-controls naturalSIGABRT after6 individually successful cases at callback-bh-before-encode-return internal10s; whole11case local suite is NOT PASS. REVIEW1038-AMD-HOST-OWNED.json97ab4a2a ranks original shared-file HOST admission before schedule; exact refusal insufficiently evidenced. Intel/NVIDIA newtuple PASS excludes a universal connected integration break but does not close AMD original-file HOST. Accepted prior main HOST scope was also Intel/NVIDIA. No anonymous/DMA/copy/vendor fallback substituted.",
+    "harness701": "whole1038 remote first attempt never executed native testcase because staging copy lost executable mode; transport and eager checks passed. Failure preserved, erroneous network label corrected in ROOT1038-NEGATIVE701. Only exact owned executable mode restored from source0771, fresh outputs reused unchanged transferred bytes and all assertions. No network/environment denial was bypassed.",
+    "performance": "Intel Gamma successful wholeprocess wall0.92s, CPU0.24s, maxRSS115392KiB; NVIDIA1.56s/0.80s/220288KiB. Single absolute samples, not statistical nonregression/speedup or isolated shader/pipeline/GPU costs. Original source performance debts retained; no AIR edits or corpus/performance replay claimed.",
+    "static_style": "git diff --check reports one historical whitespace-only added line in retained wrapper. No semantic patch or gate weakening made to alter frozen tested source solely for that style warning.",
+    "counter": "current701,last_fresh699,next_negative702,next_fresh703; manual/platform/eligible controls passed. Remote1039 reuses immutable1038 manifest counter700 as artifact provenance, not a new authoritative counter."
+  },
+  "publication": "Root integrates this exact source-complete component union plus this documentation-only acceptance into main and immediately pushes authoritative host origin, saving actual resulting main/remote SHA in separate publication receipt. No unrelated debt is a prerequisite to this independently verified integration.",
+  "next_and_remaining": "Build a fresh explicit committed-main package using resulting QEMUmain, QMetalmain698, AIRmaincc3 and pinned dependencies/hashes. Then stockeeee freshCOW/controltuple/driver identity and bounded runtime first, stableAB then reference/Desktop/Finder/Screensaver; later separate nativeeee1warmbuild/install/reboot/loadedUUID-AuxKC. Last actual guest977hang unchanged. Modern/historical QMetal whole union, later BH Display/content capture, AMD original-file/liveDMA/livewriter/cache/all3 costs, inheritedAIR6708/13594 with3933invalid2826refusals122segv5timeouts/10182nonshader and LLVMtranslator provenance remain explicit separate debts. No new guest/runtime/visual closure claimed."
+}
