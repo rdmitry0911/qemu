@@ -782,28 +782,27 @@ static void test_port(enum AgfxCreditFamily family)
         g_assert_cmpuint(c.callbacks, ==, 0);
         g_assert_cmpint(c.state->pending_frames, ==, 1);
     }
-    /* Explicit SET page0 revokes the old port; original native terminal and
-     * logical credit still return exactly once before a fresh page attaches. */
+    /* Pinned x86 setNub's waitForPendingFrames is an empty six-byte return,
+     * not a native fence drain. CURRENT is revoked, but the accepted native
+     * command and its original logical credit still own their real terminal.
+     * Both SET0 and the successor SET must RETURN before fence observation. */
     start_transport(&call, &c, 0, false);
-    const gint64 deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
-    while (agfx_credit_delivery_epoch(c.state->qmu_dev) == epoch) {
-        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
-        aio_poll(qemu_get_aio_context(), false);
-        g_thread_yield();
-    }
-    g_assert_false(qatomic_read(&call.done));
-    release_observation(&c);
     finish_transport(&call, QMU_OK); /* Main AIO pumps real RAM/DMA/IRQ BHs. */
     g_assert_cmpuint(c.map_count, ==, 1);
     g_assert_cmpuint(c.unmap_count, ==, 1);
-    pump_until(&c, idle);
-    g_assert_cmpuint(c.callbacks, ==, 1);
-    g_assert_false(c.pixels_at_callback[0]);
-    g_assert_cmpuint(c.pending_at_callback[0], ==, 1);
+    g_assert_cmpuint(c.callbacks, ==, 0);
+    g_assert_cmpint(c.state->pending_frames, ==, 1);
     start_transport(&call, &c, (CREDIT_GPA >> 12) + 1, false);
     finish_transport(&call, QMU_OK);
     g_assert_cmpuint(c.map_count, ==, 2);
     g_assert_cmpuint(c.unmap_count, ==, 1);
+    g_assert_cmpuint(c.callbacks, ==, 0);
+    g_assert_cmpint(c.state->pending_frames, ==, 1);
+    release_observation(&c);
+    pump_until(&c, idle);
+    g_assert_cmpuint(c.callbacks, ==, 1);
+    g_assert_false(c.pixels_at_callback[0]);
+    g_assert_cmpuint(c.pending_at_callback[0], ==, 1);
     publish(&c, family, 0xff708090);
     pump_until(&c, second_completed);
     g_assert_cmpuint(c.positive, ==, 2);
