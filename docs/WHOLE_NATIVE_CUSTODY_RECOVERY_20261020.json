@@ -1,0 +1,36 @@
+{
+  "status": "WIP_WHOLE_QEMU_EXISTING_OWNER_ENVELOPE_RECONCILED_PENDING_COMPONENT_BUILD_AND_GATES",
+  "starting_point": "40562c17fc20c20664464fba6cb96160a2f246f7, historical5582 functional tree with retained8b24 main ancestry. No main ref or preserved historical/main source was overwritten.",
+  "source_fix": "apple-virgl/evidence/runs/20261014-qmetal-parallel/FIX-CANDIDATE1011-WHOLE-NATIVE-CUSTODY.json",
+  "reuse": [
+    "1b6feb8f5105027711dc79c4457418080a8dd97e direct map pin/dirty leaves and unchanged memory controls",
+    "a863a07df93b42b350a4ff459f5f58fb23e96b01 render-start mode chain and unchanged controls",
+    "ba11310676e0138024582cb87d0d1b9296217590 cursor publication and unchanged controls",
+    "13961ee06ac67bcbc4693ff56b028d2e091570e1 Console-owned surface and unchanged controls",
+    "01d7f5756b924cda69f2d0cc3b2d73ce1dfe410b returned factory-failure owner cleanup and unchanged controls",
+    "7b65a1e6c2caa1bc2ca2058fda8fc1827e01fa65 concurrent MMIO-read caller context and unchanged controls",
+    "9643cf59415a49ff8e2bc6c4c258f8489b722e06 accepted reset credits and original frame controls",
+    "8f33076170ded4579baf0beda8eb7702a08bfc49 SAME accepted SessionWork/callback/BH/unpin RETURN and canonical quiesce; actual original native imported/frame/MMIO controls"
+  ],
+  "complete_selected_caller_edges": [
+    "Actual public root MMIO read/write retains State and one canonical root operation; worker/main-AIO child retains SAME work before publication, TLS invocation before actual QMU call, unref only after actual return and final stack access before completion signal.",
+    "Generic dirty/DMA, original IRQ and UI/new-frame/completion BHs retain SAME accepted work and real State, return before release; no fallback replacement root for a callback.",
+    "One original Display callback per FIFO dispatch, active guard through nested main AIO; exact callback operands and work retained through RETURN, not just until enqueue or empty queue.",
+    "Render pool job retains caller lineage through actual threadpool return; deferred second frame retains its own accepted work through kickoff, never borrows predecessor operation.",
+    "Bootstrap commands and merge source retain exact owner; root-close stops only autonomous ticks, leaving accepted controls/source and descendants live; generation/timer/cancel scheduling algorithms reused.",
+    "Generic and IOSFC unpins invoke actual leaf under BQL, synchronously return before release; dirty notification no longer spends original map pin.",
+    "Exit keeps actual State live, joins MMIO while pumping main AIO, stops wrapper roots, runs exact provider quiesce off-main, rethrows original exception on actual main caller before deletion, then joins source/render services and destroys QMU/Console/MSI/RAM owners."
+  ],
+  "historical_intersections_reconciled": [
+    "Old serial completion queue already existed: extended that existing FIFO with accepted8f dispatch-active/lineage semantics, not a second queue. Reset no longer destroys original completion operands or accepted frame credits.",
+    "Old wrapper has shutdown notifier and runstate/exiting guards absent from8f. Notifier now reuses8f autonomous-root-stop before1dd begin_shutdown root-close; accepted callbacks use8f null-only guards and cannot be cancelled by global shutdown before canonical RETURN. Paired provider must implement1dd root-close-only begin_shutdown, not old worker-stop behavior.",
+    "Historical diagnostic State fields and MMIO guest captures/counters, log sink, IRQ fields, breakpoints and exit releases retained. Exact donor render-submit/completion-queue functions replace their old diagnostic-heavy versions; removed timing text is not claimed graphics coverage. No new localization instrumentation was added.",
+    "Returned pre-success factory failure also retires old-only initialized completion BH/mutex and shutdown notifier/debug registration, reusing existing historical exit releases in acquisition order.",
+    "Production guest/PCI/MMIO/render/presentation source remains old whole flow; no modern whole-file overwrite, inert native-source activation, NoCopy or LocalTask implementation."
+  ],
+  "source_application": "Existing Git donor patches plus reviewed apply_patch reconciliation. Original8f C patch had17 context rejects against historical diagnostics/serial completion; all17 source intersections reconciled. Original rejects preserved outside source at apple-virgl/evidence/runs/20261014-qemu-parallel/whole1011-source/original-8f330-context-rejects.patch. A generated apply_patch initially used backward hunk ordering and was rejected atomically before edits; ordered same-source application succeeded. Neither source-tool negative is a graphics/localization run.",
+  "dependency_boundary": "This wrapper requires complete published1dd/6b provider semantics; accepted QMetal main68cb already includes them and can be used for a separately scoped component build. QMetal historical-recovery WIP0d075924 remains source-open and must NOT be used for wrapper/runtime acceptance or described as a complete provider. AIR unchangedcc3. C/private headers and DSO must match exact main-built provider; symbols alone are not proof.",
+  "necessary_checks": "Normal matched QEMU and all affected actual C/C++ component builds, unchanged original memory/render-mode/cursor/surface/factory/MMIO/frame/imported controls, actual same-work/RETURN/quiesce/both mappings and original exception invariants. Future historical-to-modern QMetal union needs its own complete source/gates; modernN2 and guests remain unadmitted while their causal source is open.",
+  "scope_limit": "Source reconciliation is not runtime, graphical or performance closure. Source-specific independent gates have not yet run. No actual977 guest-root assertion, current modernAIR image repair, all3 support/cost, main promotion or publication. Existing historic401frame/36shader tuples retain only original tuple scope.",
+  "counter": {"current":684,"last_fresh":683,"next_negative":685,"next_fresh":687}
+}

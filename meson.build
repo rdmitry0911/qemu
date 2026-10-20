@@ -4379,6 +4379,119 @@ foreach target : target_dirs
       'sources': [main_rs, files('system/main.c')],
       'dependencies': [sdl]
     }]
+    # Native controls reuse actual system/QOM objects and production leaves,
+    # without realizing a graphics device or GPU session.
+    if target_name == 'x86_64'
+      execs += [{
+        'name': 'test-apple-gfx-ml-memory',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-ml-memory.c'),
+        'dependencies': [],
+        'install': false,
+      }, {
+        'name': 'test-apple-gfx-ml-memory-baseline',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-ml-memory.c'),
+        'dependencies': [],
+        'c_args': ['-DAGFX_MEMORY_BASELINE_CONTROL'],
+        'install': false,
+      }, {
+        'name': 'test-apple-gfx-ml-render-mode',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-ml-render-mode.c'),
+        'dependencies': [],
+        'install': false,
+      }, {
+        'name': 'test-apple-gfx-ml-cursor-visibility',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-ml-cursor-visibility.c'),
+        'dependencies': [],
+        'install': false,
+      }]
+      if host_os == 'linux' and 'CONFIG_APPLE_GFX_ML' in config_target
+        qmetal_import_source_dir = get_option('apple_virgl_qmetal_source_dir')
+        if qmetal_import_source_dir == ''
+          qmetal_import_source_dir = meson.project_source_root() / '../qmetal'
+        endif
+        execs += [{
+          'name': 'test-apple-gfx-ml-surface-backing',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-surface-backing.c',
+                           'tests/unit/apple-gfx-ml-surface-baseline.c'),
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qemu_memfd_alloc',
+                        '-Wl,--wrap=qemu_memfd_free'],
+          'install': false,
+        }, {
+          'name': 'test-apple-gfx-ml-realize-failure',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-realize-failure.c'),
+          'include_directories': target_inc,
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qmu_create_extended',
+                        '-Wl,--wrap=qemu_ram_alloc',
+                        '-Wl,--wrap=qemu_ram_free',
+                        '-Wl,--wrap=qemu_anon_ram_free',
+                        '-Wl,--wrap=vmstate_unregister_ram',
+                        '-Wl,--wrap=msi_uninit',
+                        '-Wl,--wrap=qemu_thread_create',
+                        '-Wl,--wrap=qemu_thread_join',
+                        '-Wl,--wrap=qemu_mutex_destroy',
+                        '-Wl,--wrap=qemu_cond_destroy'],
+          'install': false,
+        }, {
+          'name': 'test-apple-gfx-ml-mmio-read',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-mmio-read.c',
+                           'tests/unit/apple-gfx-ml-mmio-read-baseline.c'),
+          'include_directories': target_inc,
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qmu_create_extended',
+                        '-Wl,--wrap=qmu_mmio_read',
+                        '-Wl,--wrap=thread_pool_submit_aio',
+                        '-Wl,--wrap=qemu_aio_unref'],
+          'install': false,
+        }, {
+          'name': 'test-apple-gfx-ml-frame-credit',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-frame-credit.c',
+                           'tests/unit/apple-gfx-ml-credit-test-bridge.cpp'),
+          'include_directories': target_inc,
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qmu_create_extended',
+                        '-Wl,--wrap=qmu_vk_submit_captured_display_frame',
+                        '-Wl,--wrap=qmu_session_quiesce_host_callback_producers_deferred',
+                        '-Wl,--wrap=thread_pool_submit_immediate',
+                        '-Wl,--export-dynamic-symbol=vkCreateFence',
+                        '-Wl,--export-dynamic-symbol=vkDestroyFence',
+                        '-Wl,--export-dynamic-symbol=vkQueueSubmit',
+                        '-Wl,--export-dynamic-symbol=vkWaitForFences'],
+          'install': false,
+        }, {
+          'name': 'test-apple-gfx-ml-imported-dirty',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-imported-dirty.c',
+                           'tests/unit/apple-gfx-ml-imported-dirty-bridge.cpp'),
+          'include_directories': target_inc + include_directories(
+            qmetal_import_source_dir / 'src',
+            qmetal_import_source_dir / 'include/vma'),
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qmu_create_extended',
+                        '-Wl,--wrap=aio_bh_schedule_oneshot_full',
+                        '-Wl,--wrap=qmu_session_invoke_host_work',
+                        '-Wl,--wrap=qmu_session_release_host_work',
+                        '-Wl,--export-dynamic-symbol=qmu_vk_set_direct_write_lease_callbacks',
+                        '-Wl,--export-dynamic-symbol=vkCreateFence',
+                        '-Wl,--export-dynamic-symbol=vkDestroyFence',
+                        '-Wl,--export-dynamic-symbol=vkQueueBindSparse',
+                        '-Wl,--export-dynamic-symbol=vkQueueSubmit',
+                        '-Wl,--export-dynamic-symbol=vkWaitForFences',
+                        '-Wl,--export-dynamic-symbol=vkAllocateMemory',
+                        '-Wl,--export-dynamic-symbol=vkFreeMemory'],
+          'install': false,
+        }]
+      endif
+    endif
     if host_os == 'windows' and (sdl.found() or gtk.found())
       execs += [{
         'name': 'qemu-system-' + target_name + 'w',
@@ -4411,13 +4524,60 @@ foreach target : target_dirs
     endif
 
     emulator = executable(exe_name, exe['sources'],
-               install: true,
-               c_args: c_args,
+               install: exe.get('install', true),
+               c_args: c_args + exe.get('c_args', []),
                dependencies: arch_deps + exe['dependencies'],
                objects: lib.extract_all_objects(recursive: true),
                link_depends: [block_syms, qemu_syms],
-               link_args: link_args,
+               link_args: link_args + exe.get('link_args', []),
                win_subsystem: exe['win_subsystem'])
+
+    if exe['name'] == 'test-apple-gfx-ml-memory'
+      test('apple-gfx-ml-memory', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-memory-baseline'
+      test('apple-gfx-ml-memory-baseline', emulator,
+           args: ['--tap', '-p', '/agfx/memory/repeated-dirty-keeps-pin'],
+           should_fail: true, timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-render-mode'
+      test('apple-gfx-ml-render-mode', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-cursor-visibility'
+      test('apple-gfx-ml-cursor-visibility', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-surface-backing'
+      test('apple-gfx-ml-surface-backing', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-realize-failure'
+      test('apple-gfx-ml-realize-failure', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-mmio-read'
+      test('apple-gfx-ml-mmio-read', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-frame-credit'
+      test('apple-gfx-ml-frame-credit', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 90, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-imported-dirty'
+      test('apple-gfx-ml-imported-dirty', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 60, suite: ['native-component'])
+      continue
+    endif
 
     if host_os == 'darwin'
       icon = 'pc-bios/qemu.rsrc'
