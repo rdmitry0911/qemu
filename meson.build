@@ -4473,6 +4473,30 @@ foreach target : target_dirs
                         '-Wl,--export-dynamic-symbol=vkWaitForFences'],
           'install': false,
         }, {
+          'name': 'test-apple-gfx-ml-owned-connected',
+          'win_subsystem': 'console',
+          'sources': files('tests/unit/test-apple-gfx-ml-owned-connected.c',
+                           'tests/unit/apple-gfx-ml-credit-test-bridge.cpp',
+                           'tests/unit/apple-gfx-ml-connected-gamma-test-bridge.cpp'),
+          'include_directories': target_inc,
+          'dependencies': [],
+          'link_args': ['-Wl,--wrap=qmu_create_extended',
+                        '-Wl,--wrap=qmu_create_extended_efi_v2',
+                        '-Wl,--wrap=qmu_vk_submit_captured_display_frame',
+                        '-Wl,--wrap=qmu_vk_prepare_owned_display_frame',
+                        '-Wl,--wrap=qmu_vk_encode_submit_owned_display_frame',
+                        '-Wl,--wrap=qmu_session_invoke_host_work',
+                        '-Wl,--wrap=qmu_display_copy_selected_current_target',
+                        '-Wl,--wrap=qmu_owned_display_frame_release',
+                        '-Wl,--wrap=qmu_iosfc_present_tick',
+                        '-Wl,--wrap=qmu_session_quiesce_host_callback_producers_deferred',
+                        '-Wl,--wrap=thread_pool_submit_immediate',
+                        '-Wl,--export-dynamic-symbol=vkCreateFence',
+                        '-Wl,--export-dynamic-symbol=vkDestroyFence',
+                        '-Wl,--export-dynamic-symbol=vkQueueSubmit',
+                        '-Wl,--export-dynamic-symbol=vkWaitForFences'],
+          'install': false,
+        }, {
           'name': 'test-apple-gfx-ml-imported-dirty',
           'win_subsystem': 'console',
           'sources': files('tests/unit/test-apple-gfx-ml-imported-dirty.c',
@@ -4496,6 +4520,33 @@ foreach target : target_dirs
           'install': false,
         }]
       endif
+    endif
+    # The only new native supplier gate calls the actual normally built
+    # QMetal C++ adapter/provider, not a copied mock or its session factory.
+    if host_os == 'linux' and target_name == 'x86_64' and \
+       'CONFIG_APPLE_GFX_ML' in config_target
+      if 'cpp' not in all_languages
+        add_languages('cpp', required: true, native: false)
+        all_languages += ['cpp']
+        cxx = meson.get_compiler('cpp')
+      endif
+      qmetal_join_source_dir = get_option('apple_virgl_qmetal_source_dir')
+      if qmetal_join_source_dir == ''
+        qmetal_join_source_dir = meson.project_source_root() / '../qmetal'
+      endif
+      execs += [{
+        'name': 'test-apple-gfx-eeee-qmetal-join',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-eeee-qmetal-join.c',
+                         'tests/unit/apple-gfx-eeee-qmetal-test-bridge.cpp'),
+        'include_directories': include_directories(qmetal_join_source_dir / 'src/unified'),
+        'dependencies': [],
+        'link_args': ['-Wl,--wrap=mmap64', '-Wl,--wrap=open64',
+                      '-Wl,--wrap=fcntl64', '-Wl,--wrap=fstat64',
+                      '-Wl,--wrap=ioctl', '-Wl,--wrap=close',
+                      '-Wl,--wrap=g_try_malloc0'],
+        'install': false,
+      }]
     endif
     if host_os == 'windows' and (sdl.found() or gtk.found())
       execs += [{
@@ -4538,6 +4589,11 @@ foreach target : target_dirs
                link_args: link_args + exe.get('link_args', []),
                win_subsystem: exe['win_subsystem'])
 
+    if exe['name'] == 'test-apple-gfx-eeee-qmetal-join'
+      test('apple-gfx-eeee-qmetal-join', emulator, args: ['--tap'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
+      continue
+    endif
     if exe['name'] == 'test-apple-gfx-ml-memory'
       test('apple-gfx-ml-memory', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 45, suite: ['native-component'])
@@ -4577,6 +4633,16 @@ foreach target : target_dirs
     if exe['name'] == 'test-apple-gfx-ml-frame-credit'
       test('apple-gfx-ml-frame-credit', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 90, suite: ['native-component'])
+      continue
+    endif
+    if exe['name'] == 'test-apple-gfx-ml-owned-connected'
+      # Actual wrapper/normal QMetal construction and serial executor. No EFI
+      # source is published/read; mode construction may use native utilities.
+      # Active HOST MMIO/native and Image/overlap cases in the same executable
+      # require a separately selected exact native tuple and ROOT admission.
+      test('apple-gfx-ml-owned-connected-serial', emulator,
+           args: ['--tap', '-p', '/agfx/owned-connected/serial-stop-reset-inline'],
+           protocol: 'tap', timeout: 45, suite: ['native-component'])
       continue
     endif
     if exe['name'] == 'test-apple-gfx-ml-imported-dirty'

@@ -1,0 +1,55 @@
+{
+  "status": "SOURCE_COMPLETE_WHOLE_FOUNDATION_PLUS_ACCEPTED_MAIN_UNION_PENDING_ROOT_REVIEW_BUILD_AND_GATES",
+  "base": "2004056975469a9356ba194e314fb7f431a5a573 whole historical active source plus tested frame input/oracle",
+  "accepted_main_reconciled": "8b24fe7f13add54dc621bfe2669f16d18d3e7f9d",
+  "required_provider": "QMetal main69875b7bab5fffd8f385a7f3ca348d94813d7f17, AIRmaincc3c29ce6cb806d5764ac58caf6d369f7db85723. Prior198f/31-case artifacts are not new candidate/main build receipts.",
+  "authority": "Host-owned repair/whole-accepted-union1033-20261020. Main refs untouched. Parent root owns full review, builds, tests, acceptance, package, integration and publication. This document records source reconciliation only.",
+  "selection": "Reuse whole200 plus ready current-main late/native/platform units. Rebuilding main plus ~23827 historical lines repeats completed whole caller reconciliation; no quantified time promise or P score.",
+  "unit_closure": [
+    {
+      "unit": "Typed original EFI+owned output",
+      "source": "Restored complete f150/8b24 modules, source capture, explicit x-efi-task-source constructor/property, BQL mode target, owned prepare before threadpool, background late CURRENT selection, actual terminal callback and both QEMU inner/outer BH RETURN ownership. Original legacy branch and disabled-by-default opt-in preserved; not a fallback or new NoCopy path."
+    },
+    {
+      "unit": "Native processVM/export/extent",
+      "source": "Complete current-main processVM, immutable alias capture, saved MR/dupFD pieces, literal view/allocation extents, sourceDMA export and BQL final physical pin release. Provider created before newconstructor and retired only after actual NULL or quiesce+destroyRETURN. Native callback tables whole18 copied unchanged. No defaultlegacy activation."
+    },
+    {
+      "unit": "Caller/lifetime envelope",
+      "source": "Retains complete200 accepted work descendants, concurrent reads, serial writes, original IRQ callback/counters, pendingcredits, original completionFIFO, mainAIO dirty/unpinRETURN, quiesce exception and teardown. EFI serial restart/stop is complete current-main control with samework, synchronous stop caller packet and no lock around retirement leaf. Original historical shutdown/debug lifecycle retained."
+    },
+    {
+      "unit": "Native eee1/virtio",
+      "source": "All current-main bridge/protocol/framepump/present/cursor headers and source, capset/context/resource/submit/cursor/flush/scanout paths, reset/unrealize and tests restored as complete accepted units with original Linux QMetal dependencies, not orphaned stubs."
+    },
+    {
+      "unit": "Platform/UI",
+      "source": "All current-main SMC keys/test, Thunderbolt root/bridge/VGA/virtio hotplug types and PCI/virtio integration, console init hooks, screendump surface selection, EGL handling/frame capture and QMP seqbridge restored. PCI vendor/device override body/properties restored without changing stockeeee default."
+    },
+    {
+      "unit": "Metadata+historical diagnostics",
+      "source": "Current-main capture bridge/clockAB/receipt helpers and per-completion metadata/selected-current read restored. Historical env-gated frame-content report and all old diagnostic functions/state/MMIO/IRQ/lifecycle bodies retained. Staged-frame body reuses accepted selected-current/nil/ABA semantics and capture windows, plus original historical frame-content block; no new localization diagnostic invented."
+    },
+    {
+      "unit": "Build/testgraph",
+      "source": "Current-main top-level normal executable graphs and all deleted component/unit/qtest sources restored; early C++ admission from200 preserved. Whole explicit absolute source/build/DSO authority and verifier retained. hw/display graph includes complete EFI/DMA/nativevirtio modules; explicit tuple admission covers actual APPLE_GFX and Linux virtioGL consumers, no pkgconfig/name/relative fallback reintroduced."
+    },
+    {
+      "unit": "Testcontract intersections",
+      "source": "Original frame-credit and shared rendered-source bridge from200 stay byte-identical. Restored owned-connected's stale port oracle migrated by reusing exact200 explicit SETvsinvalidate helper/status assertions/test_port; dispose remains explicit invalidate. All11 registrations and six specific owned/provider/serial/HOST/Gamma/ABA bodies retained. Source-only change, not passing new tests."
+    }
+  ],
+  "reconciliation_notes": "FIX-CANDIDATE1033-WHOLE-ACCEPTED-UNION enumerates75 original main-delta paths before edits. 62 independent files directly restored from main; owned-connected later has scoped source-derived oracle migration. Initial category label for apple-gfx-eeee-qmetal-test-bridge.cpp/.h was too generic: they were absent in200 and are restored accepted main join dependencies, not preexisting corrected200 inputs. Initial artifacts remain immutable; this correction is explicit.",
+  "source_checks": "Read-only exact donor/source inventory, retained original and main function inventory, common16-core-intersection source review, balanced lexical delimiters and git diff --check. Macro G_GNUC_PRINTF appears twice in simplistic function inventory as annotations for distinct preexisting logging functions, not duplicate function definitions. None is compiler/test/runtime acceptance.",
+  "gates_required": [
+    "Root full source/diff review and exact final source/build/header/provider/AIR/ICD/dependency identity.",
+    "Normal production and all restored C/C++ component graph build against reviewed main QMetal698+modernAIR; C ABI/export/relocation/dependency checks and source-authority verifier.",
+    "All retained31 connected cases on new exact candidate; original importedMR/native/both mappings/oncecredit/RETURN/ownerstop/exception scope preserved.",
+    "All11 owned-connected registrations under their selected compatible/typed contexts: providerNULL, doneBH-before-encodeRETURN, serialstop/resetinline, actualHOST/MMIO/native/Gamma exactRGB, modeABA selectedCURRENT; preserve original Intel/NVIDIA route proof and explicitly qualify any other adapter. Corrected port tests must not repeat superseded full-reset/fencewait assumption.",
+    "Original processVM/qmetaljoin/immutablecapture/HOST+DmaFD/extent/export/import/retirement component gates, including actual fd0, original MR, BQL and sourceowner terminal assertions.",
+    "Nativeeee1 protocol/framepump/present/cursor unit tests, SMC and TB/VGA hotplug qtests, actual UI/screendump/late-console paths where applicable.",
+    "Working-path costs against actual accepted baseline and strongest preserved candidate; no failed-work timing or allplatform speed claim.",
+    "Only root after applicable component acceptance: integrate sourcecomplete wholeunit to main, immediatepush, exact committed-main package. Stockeeee then separateeee1 preflight/runtime, stableAB then reference/Desktop/Finder/Screensaver remain separate."
+  ],
+  "no_claims": "No build/test/GPU/VM/network/process action or main/push by source owner; no graphical/runtime/performance parity, guest977 attribution, modernQMetal0d closure or newAIRcoverage. Old historical401frame login scope and newer accepted native/type/Gamma scope remain distinct until exact new-package verification."
+}

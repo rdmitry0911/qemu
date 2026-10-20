@@ -151,6 +151,7 @@ struct VirtIOPCIProxy {
     uint32_t flags;
     bool disable_modern;
     OnOffAuto disable_legacy;
+    bool apple_virgl_pci_identity;
     /* Transitional device id */
     uint16_t trans_devid;
     uint32_t class_code;

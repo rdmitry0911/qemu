@@ -29,6 +29,7 @@ typedef struct ThreadPool ThreadPool;
 
 #define AGFX_GUEST_SCHED_APV_EVENT_WP_SEEN_MAX 64
 #define AGFX_PCB_PARSE_SEG_SHMEM_METHOD_MAX 3
+typedef struct qmu_display_target qmu_display_target;
 
 typedef struct AgfxHostWork {
     struct AppleGfxMLState *state;
@@ -67,10 +68,73 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleGfxMLState, APPLE_GFX_ML)
 #define APPLE_GFX_ML_MSI_CAP_AUTO       0x0   /* Let QEMU auto-select capability offset */
 #define APPLE_GFX_ML_DEFAULT_VRAM_MB    512
 
+typedef struct AppleGfxMLCaptureBridge {
+    uint64_t qmp_ordinal;
+    uint64_t host_apply_seq;
+    uint64_t qmetal_host_delivery_seq;
+    uint64_t display_cookie;
+    uint64_t txn3_seq;
+    uint64_t txn3_digest_lo;
+    uint64_t txn3_digest_hi;
+    uint32_t source_texture_id;
+    uint64_t source_vk_image;
+    uint64_t source_vk_image_view;
+    uint32_t source_aspect;
+    uint32_t source_mip;
+    uint32_t source_layer;
+    uint64_t image_lifetime_generation;
+    uint32_t backing_id;
+    uint64_t backing_generation;
+    uint64_t backing_va;
+    uint64_t backing_span;
+    uint32_t backing_task;
+    uint32_t backing_resource;
+    uint32_t backing_plane;
+    uint64_t writer_seq;
+    uint64_t queue_submit_seq;
+    uint64_t request_epoch;
+    uint64_t frame_serial;
+    uint64_t qemu_frame_count;
+    uint64_t qemu_present_count;
+    uint32_t clockab_metadata_version;
+    uint32_t clockab_source_kind;
+    uint64_t clockab_boot_uuid_lo;
+    uint64_t clockab_boot_uuid_hi;
+    uint64_t clockab_selection_seq;
+    uint64_t clockab_qmetal_submit_seq;
+    uint64_t clockab_qmetal_queue_submit_seq;
+    uint64_t clockab_source_raw_image;
+    uint64_t clockab_source_generation;
+    uint32_t clockab_source_format;
+    uint32_t clockab_source_width;
+    uint32_t clockab_source_height;
+    uint32_t clockab_source_rect_x;
+    uint32_t clockab_source_rect_y;
+    uint32_t clockab_source_rect_width;
+    uint32_t clockab_source_rect_height;
+    uint32_t clockab_destination_rect_x;
+    uint32_t clockab_destination_rect_y;
+    uint32_t clockab_destination_rect_width;
+    uint32_t clockab_destination_rect_height;
+    uint32_t clockab_orientation;
+    uint32_t clockab_filter;
+    uint32_t clockab_copy_path;
+    uint32_t clockab_composite_flags;
+    int valid;
+} AppleGfxMLCaptureBridge;
+
+bool apple_gfx_ml_get_qmp_capture_bridge(AppleGfxMLCaptureBridge *out);
 /* Existing host callback entrypoints; also used by native console controls.
  * No QMetal session or physical GPU is needed to exercise the UI handoff. */
 void apple_gfx_ml_cursor_show(void *ctx, uint32_t display_id, int visible);
 void apple_gfx_ml_cursor_move(void *ctx, uint32_t display_id);
+/* Final physical RAM pin release, not logical task destruction. Caller must
+ * drop the provider task mutex before entry; it owns the call to RETURN.
+ * The outer lifecycle must permit main-loop dispatch while a worker waits,
+ * just like ordinary unmap_gpa/iosfc_unmap; no BQL wait on the caller's locks.
+ * Reuses the synchronous main-loop/BQL unpin leaf, with no State borrow in BH.
+ * NULL is an immediate no-op (retired alias removal may hold the task lock). */
+void apple_gfx_ml_memory_region_unref_bql(MemoryRegion *region);
 void agfx_publish_display_mode(AppleGfxMLState *s,
                                uint32_t width, uint32_t height,
                                uint32_t iosurface_pixel_format,
@@ -89,9 +153,14 @@ struct AppleGfxMLState {
     /* QMetal unified library handle - contains ALL protocol logic */
     qmu_session *qmu_dev;
 
-    /* Reserved for the indivisible EEEE provider/session cutover.  It is not
-     * initialized or passed to QMetal by the legacy path. */
+    /* Constructed only for an explicitly selected complete owning Session:
+     * the separate PCI EFI constructor is not a partial legacy/all39 tail.
+     * State exists before that constructor and retires after its proper NULL
+     * or successful quiescence+destroy RETURN, never on an entered escape. */
     AgfxEeeeProviderState *eeee_provider_state;
+    /* Temporary integration switch, NOT a ready default or vendor fallback.
+     * Paired constructor/native-source/runtime gates remain mandatory. */
+    bool efi_task_source;
 
     /* QEMU display */
     QemuConsole *con;
@@ -106,6 +175,9 @@ struct AppleGfxMLState {
      * by pixman image refs, never independently freed/reallocated by Device. */
     uint8_t *display_fb;
     size_t display_fb_size;
+    /* BQL-owned CURRENT physical output. A frame retains its own target;
+     * completion may instead read this target after an A/B/A mode change. */
+    qmu_display_target *display_target;
     
     /* Current display parameters */
     uint32_t fb_width;
@@ -126,6 +198,11 @@ struct AppleGfxMLState {
     uint32_t vram_size_mb;
     uint32_t display_width;
     uint32_t display_height;
+    /* Optional PCI identity override.  0xffffffff = keep the class default
+     * (0x106b:0xeeee).  Used to steer guest driver matching away from the
+     * stock AppleParavirtGPU personality during native-transport bring-up. */
+    uint32_t pci_vendor_id_override;
+    uint32_t pci_device_id_override;
     /* NOTE: romfile is inherited from PCIDevice, don't redefine! */
     bool vsync_enabled;
     uint32_t debug_level;
@@ -443,15 +520,15 @@ struct AppleGfxMLState {
     QemuMutex session_mutex;   /* Serializes wrapper-owned owner-render capture/submit */
     int mmio_wait_active;      /* Main thread is inside AIO_WAIT_WHILE for MMIO */
 
-    /* Reference PGDisplayDescriptor.queue publishes one callback item at a time
-     * on a serial host queue. Keep FIFO ordering without collapsing several
-     * queued items into one BH drain. */
+    /* One original Display callback per main-AIO dispatch, in publication
+     * order. Active covers the original fn's whole call, including nested AIO.
+     * Each envelope owns the SAME Session lineage and the actual State. */
     QemuMutex completion_mutex;
     AgfxCompletionJob *completion_head;
     AgfxCompletionJob *completion_tail;
+    QEMUBH *completion_bh;
     bool completion_scheduled;
     bool completion_dispatch_active;
-    QEMUBH *completion_bh;
 
     int iosfc_bootstrap_active;
 
@@ -526,6 +603,9 @@ static inline bool agfx_render_start_mode_is_current(const AppleGfxMLState *s)
     DEFINE_PROP_BOOL("vsync", AppleGfxMLState, vsync_enabled, true), \
     DEFINE_PROP_UINT32("debug", AppleGfxMLState, debug_level, 0), \
     DEFINE_PROP_BOOL("direct_scanout", AppleGfxMLState, direct_scanout, false), \
-    DEFINE_PROP_STRING("spirv_cache_dir", AppleGfxMLState, spirv_cache_dir)
+    DEFINE_PROP_BOOL("x-efi-task-source", AppleGfxMLState, efi_task_source, false), \
+    DEFINE_PROP_STRING("spirv_cache_dir", AppleGfxMLState, spirv_cache_dir), \
+    DEFINE_PROP_UINT32("x-pci-vendor-id", AppleGfxMLState, pci_vendor_id_override, 0xffffffff), \
+    DEFINE_PROP_UINT32("x-pci-device-id", AppleGfxMLState, pci_device_id_override, 0xffffffff)
 
 #endif /* HW_DISPLAY_APPLE_GFX_ML_H */

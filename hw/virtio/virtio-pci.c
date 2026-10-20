@@ -2096,6 +2096,14 @@ static void virtio_pci_device_plugged(DeviceState *d, Error **errp)
                      PCI_DEVICE_ID_VIRTIO_10_BASE + virtio_bus_get_vdev_id(bus));
         pci_config_set_revision(config, 1);
     }
+    if (proxy->apple_virgl_pci_identity) {
+        pci_set_word(config + PCI_VENDOR_ID, 0x106b);
+        pci_set_word(config + PCI_DEVICE_ID, 0xeeee);
+        pci_set_word(config + PCI_SUBSYSTEM_VENDOR_ID,
+                     PCI_SUBVENDOR_ID_REDHAT_QUMRANET);
+        pci_set_word(config + PCI_SUBSYSTEM_ID, 0x1100);
+        pci_config_set_revision(config, 0);
+    }
     config[PCI_INTERRUPT_PIN] = 1;
 
 
@@ -2436,6 +2444,8 @@ static void virtio_pci_bus_reset_hold(Object *obj, ResetType type)
 }
 
 static const Property virtio_pci_properties[] = {
+    DEFINE_PROP_BOOL("x-apple-virgl-pci-identity", VirtIOPCIProxy,
+                     apple_virgl_pci_identity, false),
     DEFINE_PROP_BIT("virtio-pci-bus-master-bug-migration", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_BUS_MASTER_BUG_MIGRATION_BIT, false),
     DEFINE_PROP_BIT("modern-pio-notify", VirtIOPCIProxy, flags,
@@ -2712,4 +2722,3 @@ static void virtio_pci_register_types(void)
 }
 
 type_init(virtio_pci_register_types)
-

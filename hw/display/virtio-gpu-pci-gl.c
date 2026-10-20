@@ -22,6 +22,7 @@
 #include "qom/object.h"
 
 #define TYPE_VIRTIO_GPU_GL_PCI "virtio-gpu-gl-pci"
+#define TYPE_THUNDERBOLT_VIRTIO_GPU_GL_PCI "thunderbolt-virtio-gpu-gl-pci"
 typedef struct VirtIOGPUGLPCI VirtIOGPUGLPCI;
 DECLARE_INSTANCE_CHECKER(VirtIOGPUGLPCI, VIRTIO_GPU_GL_PCI,
                          TYPE_VIRTIO_GPU_GL_PCI)
@@ -33,10 +34,19 @@ struct VirtIOGPUGLPCI {
 
 static void virtio_gpu_gl_initfn(Object *obj)
 {
-    VirtIOGPUGLPCI *dev = VIRTIO_GPU_GL_PCI(obj);
+    VirtIOGPUGLPCI *dev = (VirtIOGPUGLPCI *)obj;
 
     virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
                                 TYPE_VIRTIO_GPU_GL);
+    VIRTIO_GPU_PCI_BASE(obj)->vgpu = VIRTIO_GPU_BASE(&dev->vdev);
+}
+
+static void thunderbolt_virtio_gpu_gl_initfn(Object *obj)
+{
+    VirtIOGPUGLPCI *dev = (VirtIOGPUGLPCI *)obj;
+
+    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
+                                TYPE_THUNDERBOLT_VIRTIO_GPU_GL);
     VIRTIO_GPU_PCI_BASE(obj)->vgpu = VIRTIO_GPU_BASE(&dev->vdev);
 }
 
@@ -49,9 +59,28 @@ static const VirtioPCIDeviceTypeInfo virtio_gpu_gl_pci_info = {
 module_obj(TYPE_VIRTIO_GPU_GL_PCI);
 module_kconfig(VIRTIO_PCI);
 
+static void thunderbolt_virtio_gpu_gl_pci_class_init(ObjectClass *klass,
+                                                     const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->desc = "Thunderbolt hotpluggable virtio-gpu-gl PCI";
+    dc->hotpluggable = true;
+}
+
+static const VirtioPCIDeviceTypeInfo thunderbolt_virtio_gpu_gl_pci_info = {
+    .generic_name = TYPE_THUNDERBOLT_VIRTIO_GPU_GL_PCI,
+    .parent = TYPE_VIRTIO_GPU_PCI_BASE,
+    .instance_size = sizeof(VirtIOGPUGLPCI),
+    .instance_init = thunderbolt_virtio_gpu_gl_initfn,
+    .class_init = thunderbolt_virtio_gpu_gl_pci_class_init,
+};
+module_obj(TYPE_THUNDERBOLT_VIRTIO_GPU_GL_PCI);
+
 static void virtio_gpu_gl_pci_register_types(void)
 {
     virtio_pci_types_register(&virtio_gpu_gl_pci_info);
+    virtio_pci_types_register(&thunderbolt_virtio_gpu_gl_pci_info);
 }
 
 type_init(virtio_gpu_gl_pci_register_types)

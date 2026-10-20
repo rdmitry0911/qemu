@@ -48,6 +48,18 @@ tests = {
   'test-qapi-util': [],
   'test-interval-tree': [],
   'test-fifo': [],
+  'test-apple-virgl-protocol': [
+    meson.project_source_root() / 'hw/display/apple-virgl-protocol.c'
+  ],
+  'test-apple-virgl-frame-pump': [
+    meson.project_source_root() / 'hw/display/apple-virgl-frame-pump.c'
+  ],
+  'test-apple-virgl-present-stage': [
+    meson.project_source_root() / 'hw/display/apple-virgl-present-stage.c'
+  ],
+  'test-apple-virgl-cursor-stage': [
+    meson.project_source_root() / 'hw/display/apple-virgl-cursor-stage.c'
+  ],
 }
 
 if have_system or have_tools

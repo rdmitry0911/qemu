@@ -7,6 +7,8 @@
 #include "ui/egl-context.h"
 #include "ui/shader.h"
 
+#include <inttypes.h>
+
 typedef struct egl_dpy {
     DisplayChangeListener dcl;
     DisplaySurface *ds;
@@ -20,6 +22,91 @@ typedef struct egl_dpy {
 } egl_dpy;
 
 /* ------------------------------------------------------------------ */
+
+static void apple_virgl_frame_dump(DisplaySurface *surface)
+{
+    static bool initialized;
+    static bool enabled;
+    static char dir[PATH_MAX];
+    static uint64_t frame_index;
+    static uint32_t last_hash;
+    static FILE *manifest;
+    uint8_t *data;
+    uint32_t hash = 0x811c9dc5;
+    int width;
+    int height;
+    int stride;
+    int bpp;
+    FILE *fp;
+
+    if (!initialized) {
+        const char *env = getenv("APPLE_VIRGL_FRAME_DIR");
+
+        initialized = true;
+        if (env && *env && snprintf(dir, sizeof(dir), "%s", env) < sizeof(dir) &&
+            g_mkdir_with_parents(dir, 0755) == 0) {
+            g_autofree char *manifest_path = g_build_filename(dir, "frames.tsv", NULL);
+
+            enabled = true;
+            manifest = fopen(manifest_path, "w");
+            if (manifest) {
+                fprintf(manifest,
+                        "index\twidth\theight\tformat\tstride\tfnv1a\tpath\n");
+                fflush(manifest);
+            }
+        }
+    }
+
+    if (!enabled || !surface) {
+        return;
+    }
+
+    width = surface_width(surface);
+    height = surface_height(surface);
+    stride = surface_stride(surface);
+    bpp = surface_bytes_per_pixel(surface);
+    data = surface_data(surface);
+    if (!data || width <= 0 || height <= 0 || bpp != 4) {
+        return;
+    }
+
+    for (int y = 0; y < height; y += 4) {
+        uint8_t *row = data + (size_t)y * stride;
+
+        for (int x = 0; x < width; x += 4) {
+            uint32_t px;
+
+            memcpy(&px, row + (size_t)x * bpp, sizeof(px));
+            hash ^= px;
+            hash *= 0x01000193;
+        }
+    }
+    if (hash == last_hash && frame_index > 0) {
+        return;
+    }
+    last_hash = hash;
+    frame_index++;
+
+    g_autofree char *frame_name = g_strdup_printf("%06" PRIu64 ".bgra",
+                                                  frame_index);
+    g_autofree char *frame_path = g_build_filename(dir, frame_name, NULL);
+
+    fp = fopen(frame_path, "wb");
+    if (!fp) {
+        return;
+    }
+    for (int y = 0; y < height; y++) {
+        fwrite(data + (size_t)y * stride, 1, (size_t)width * bpp, fp);
+    }
+    fclose(fp);
+
+    if (manifest) {
+        fprintf(manifest, "%" PRIu64 "\t%d\t%d\t0x%x\t%d\t0x%08x\t%s\n",
+                frame_index, width, height, surface_format(surface), stride,
+                hash, frame_name);
+        fflush(manifest);
+    }
+}
 
 static void egl_refresh(DisplayChangeListener *dcl)
 {
@@ -42,9 +129,24 @@ static void egl_gfx_switch(DisplayChangeListener *dcl,
 static QEMUGLContext egl_create_context(DisplayGLCtx *dgc,
                                         QEMUGLParams *params)
 {
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   qemu_egl_rn_ctx);
-    return qemu_egl_create_context(dgc, params);
+    QEMUGLContext ctx;
+
+    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        qemu_egl_rn_ctx)) {
+        error_report("egl-headless: eglMakeCurrent rendernode failed: %s",
+                     qemu_egl_get_error_string());
+        return NULL;
+    }
+
+    ctx = qemu_egl_create_context(dgc, params);
+
+    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        EGL_NO_CONTEXT)) {
+        error_report("egl-headless: eglMakeCurrent no-context failed: %s",
+                     qemu_egl_get_error_string());
+    }
+
+    return ctx;
 }
 
 static void egl_scanout_disable(DisplayChangeListener *dcl)
@@ -163,6 +265,7 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
     }
 
     egl_fb_read(edpy->ds, &edpy->blit_fb);
+    apple_virgl_frame_dump(edpy->ds);
     dpy_gfx_update(edpy->dcl.con, x, y, w, h);
 }
 
@@ -205,6 +308,39 @@ static const DisplayGLCtxOps eglctx_ops = {
     .dpy_gl_ctx_make_current = qemu_egl_make_context_current,
 };
 
+static void egl_headless_attach_console(QemuConsole *con)
+{
+    DisplayGLCtx *ctx;
+    egl_dpy *edpy;
+
+    if (!qemu_console_is_graphic(con) || console_has_gl(con)) {
+        return;
+    }
+
+    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        qemu_egl_rn_ctx)) {
+        error_report("egl-headless: eglMakeCurrent rendernode failed: %s",
+                     qemu_egl_get_error_string());
+        return;
+    }
+
+    edpy = g_new0(egl_dpy, 1);
+    edpy->dcl.con = con;
+    edpy->dcl.ops = &egl_ops;
+    edpy->gls = qemu_gl_init_shader();
+
+    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        EGL_NO_CONTEXT)) {
+        error_report("egl-headless: eglMakeCurrent no-context failed: %s",
+                     qemu_egl_get_error_string());
+    }
+
+    ctx = g_new0(DisplayGLCtx, 1);
+    ctx->ops = &eglctx_ops;
+    qemu_console_set_display_gl_ctx(con, ctx);
+    register_displaychangelistener(&edpy->dcl);
+}
+
 static void early_egl_headless_init(DisplayOptions *opts)
 {
     DisplayGLMode mode = DISPLAY_GL_MODE_ON;
@@ -219,25 +355,21 @@ static void early_egl_headless_init(DisplayOptions *opts)
 static void egl_headless_init(DisplayState *ds, DisplayOptions *opts)
 {
     QemuConsole *con;
-    egl_dpy *edpy;
     int idx;
+    static bool hook_registered;
 
     for (idx = 0;; idx++) {
-        DisplayGLCtx *ctx;
-
         con = qemu_console_lookup_by_index(idx);
         if (!con || !qemu_console_is_graphic(con)) {
             break;
         }
 
-        edpy = g_new0(egl_dpy, 1);
-        edpy->dcl.con = con;
-        edpy->dcl.ops = &egl_ops;
-        edpy->gls = qemu_gl_init_shader();
-        ctx = g_new0(DisplayGLCtx, 1);
-        ctx->ops = &eglctx_ops;
-        qemu_console_set_display_gl_ctx(con, ctx);
-        register_displaychangelistener(&edpy->dcl);
+        egl_headless_attach_console(con);
+    }
+
+    if (!hook_registered) {
+        graphic_console_add_init_hook(egl_headless_attach_console);
+        hook_registered = true;
     }
 }
 
