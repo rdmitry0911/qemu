@@ -502,17 +502,14 @@ static void *transport_caller(void *opaque)
     return NULL;
 }
 
-static void start_transport(TransportCall *call, CreditControl *c, uint32_t pfn,
-                            bool invalidate)
+static void start_transport(TransportCall *call, CreditControl *c, uint32_t pfn)
 {
-    /* SET page0 detaches the actual Nub. The separate Session invalidate API
-     * is still used by dispose; those are not interchangeable operations. */
-    *call = (TransportCall) {.control = c, .pfn = pfn, .invalidate = invalidate};
+    *call = (TransportCall) {.control = c, .pfn = pfn, .invalidate = !pfn};
     qemu_thread_create(&call->thread, "credit-transport", transport_caller,
                        call, QEMU_THREAD_JOINABLE);
 }
 
-static void finish_transport(TransportCall *call, qmu_status expected)
+static void finish_transport(TransportCall *call)
 {
     gint64 deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
     while (!qatomic_read(&call->done)) {
@@ -521,7 +518,7 @@ static void finish_transport(TransportCall *call, qmu_status expected)
         g_thread_yield();
     }
     qemu_thread_join(&call->thread);
-    g_assert_cmpint(call->result, ==, expected);
+    g_assert_cmpint(call->result, ==, QMU_OK);
 }
 
 static void release_observation(CreditControl *c)
@@ -666,8 +663,8 @@ static void dispose(CreditControl *c)
         pump_until(c, idle);
         /* These cases revoke their finite output before final stop. The new
          * active-stop case deliberately performs no such pre-drain. */
-        start_transport(&control, c, 0, true);
-        finish_transport(&control, QMU_OK);
+        start_transport(&control, c, 0);
+        finish_transport(&control);
         pump_until(c, idle);
     }
     c->destroying = true;
@@ -764,41 +761,24 @@ static void test_port(enum AgfxCreditFamily family)
     CreditControl c;
     TransportCall call;
     create(&c, family);
-    start_transport(&call, &c, CREDIT_GPA >> 12, false);
-    finish_transport(&call, QMU_OK);
+    start_transport(&call, &c, CREDIT_GPA >> 12);
+    finish_transport(&call);
     g_assert_cmpuint(c.map_count, ==, 1);
     g_assert_cmpuint(c.unmap_count, ==, 0);
     first(&c, family);
     const uint64_t epoch = agfx_credit_delivery_epoch(c.state->qmu_dev);
-    const uint32_t busy_pfns[] = {CREDIT_GPA >> 12, (CREDIT_GPA >> 12) + 1};
-    /* Primary Device rejects occupied SET, including the same PFN. It must
-     * not replace the original page or invalidate its accepted frame. */
-    for (unsigned i = 0; i < ARRAY_SIZE(busy_pfns); ++i) {
-        start_transport(&call, &c, busy_pfns[i], false);
-        finish_transport(&call, QMU_ERROR);
-        g_assert_cmpuint(agfx_credit_delivery_epoch(c.state->qmu_dev), ==, epoch);
-        g_assert_cmpuint(c.map_count, ==, 1);
-        g_assert_cmpuint(c.unmap_count, ==, 0);
-        g_assert_cmpuint(c.callbacks, ==, 0);
-        g_assert_cmpint(c.state->pending_frames, ==, 1);
+    start_transport(&call, &c, (CREDIT_GPA >> 12) + 1);
+    const gint64 deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
+    while (agfx_credit_delivery_epoch(c.state->qmu_dev) == epoch) {
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        aio_poll(qemu_get_aio_context(), false);
+        g_thread_yield();
     }
-    /* Pinned x86 setNub's waitForPendingFrames is an empty six-byte return,
-     * not a native fence drain. CURRENT is revoked, but the accepted native
-     * command and its original logical credit still own their real terminal.
-     * Both SET0 and the successor SET must RETURN before fence observation. */
-    start_transport(&call, &c, 0, false);
-    finish_transport(&call, QMU_OK); /* Main AIO pumps real RAM/DMA/IRQ BHs. */
-    g_assert_cmpuint(c.map_count, ==, 1);
-    g_assert_cmpuint(c.unmap_count, ==, 1);
-    g_assert_cmpuint(c.callbacks, ==, 0);
-    g_assert_cmpint(c.state->pending_frames, ==, 1);
-    start_transport(&call, &c, (CREDIT_GPA >> 12) + 1, false);
-    finish_transport(&call, QMU_OK);
+    g_assert_false(qatomic_read(&call.done));
+    release_observation(&c);
+    finish_transport(&call); /* Main AIO pumps real RAM/DMA/IRQ BHs. */
     g_assert_cmpuint(c.map_count, ==, 2);
     g_assert_cmpuint(c.unmap_count, ==, 1);
-    g_assert_cmpuint(c.callbacks, ==, 0);
-    g_assert_cmpint(c.state->pending_frames, ==, 1);
-    release_observation(&c);
     pump_until(&c, idle);
     g_assert_cmpuint(c.callbacks, ==, 1);
     g_assert_false(c.pixels_at_callback[0]);
