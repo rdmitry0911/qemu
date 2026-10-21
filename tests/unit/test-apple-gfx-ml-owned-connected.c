@@ -1539,6 +1539,10 @@ static void resolved(const char *label, void *symbol, const char *expected)
 
 int main(int argc, char **argv)
 {
+    int capture_setup = agfx_credit_exit_capture_initialize(argc, argv);
+    if (capture_setup != 0) {
+        return capture_setup;
+    }
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
                           "-display", "none", "-S"};
     char *qemu_argv[] = {argv[0], options[0], options[1], options[2], options[3],
@@ -1618,5 +1622,5 @@ int main(int argc, char **argv)
     qemu_cleanup(status);
     bql_unlock();
     replay_mutex_unlock();
-    return status;
+    return agfx_credit_exit_capture_result(status);
 }

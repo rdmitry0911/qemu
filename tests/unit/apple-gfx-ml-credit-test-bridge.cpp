@@ -4,10 +4,21 @@
  */
 #define QMU_TEST_ACCESS 1
 #include "apple-gfx-ml-credit-test-bridge.h"
+#include "apple-gfx-ml-test-exit-capture.h"
 #include "qmu/qmu_vulkan.h"
 
 #include <cstdint>
 #include <vector>
+
+extern "C" int agfx_credit_exit_capture_initialize(int argc, char **argv)
+{
+    return qmetal_exit_capture::initialize(argc, argv);
+}
+
+extern "C" int agfx_credit_exit_capture_result(int status)
+{
+    return qmetal_exit_capture::result(status);
+}
 
 extern "C" uint32_t agfx_credit_prepare_texture(
     qmu_session *session, uint32_t width, uint32_t height)
