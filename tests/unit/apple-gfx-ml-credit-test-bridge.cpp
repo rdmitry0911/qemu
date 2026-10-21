@@ -16,10 +16,23 @@ extern "C" uint32_t agfx_credit_prepare_texture(
     if (!vk || qmu_vk_create_swapchain(vk, width, height, 2) != 1) {
         return 0;
     }
-    // Public RT creation has data_va/data_size/task_id0: no fabricated guest
-    // upload or unconfigured task/PT mapping is claimed. Pixel content of this
-    // native image is not a visual witness; this case tests its record family.
-    return qmu_vk_create_render_target(vk, width, height, 44);
+    // A real rendered source, not a newly allocated UNDEFINED image. Reuse
+    // the ordinary clear/store producer before arming display observation;
+    // never invent a layout or a completed native submit in fixture state.
+    const auto texture = qmu_vk_create_render_target(vk, width, height, 44);
+    if (!texture || qmu_vk_begin_exec_commands(vk) != 0 ||
+        qmu_vk_begin_render_pass(vk, texture, 0, width, height,
+            0.125f, 0.25f, 0.5f, 1.0f, 1.0f, 0, 1, 0) != 0) {
+        return 0;
+    }
+    qmu_vk_end_render_pass(vk);
+    qmu_vk_flush(vk);
+    const auto submitted = qmu_vk_get_last_submitted_seq(vk);
+    if (!submitted) {
+        return 0;
+    }
+    qmu_vk_wait_submit_seq(vk, submitted);
+    return texture;
 }
 
 extern "C" int agfx_credit_publish(
