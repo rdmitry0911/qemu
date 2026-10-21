@@ -1,7 +1,0 @@
-{
-  "status": "TEST_SOURCE_RECONCILIATION_NOT_PRODUCT_OR_RUNTIME_ACCEPTANCE",
-  "baseline": "60ca44145632b2477dd4e727eb27607b01cf8356",
-  "reuse": "Primary lc48936..49040 and existing Nub lifetime450 plan; accepted a88500cd qmu_display occupied SET test; ready24a0c955 ordered Session explicit detach/fresh attach fixture. Old QEMU frame test was unchanged8f and still expected live replacement forbidden by primary.",
-  "oracles": "Keep all five frame cases, original deadlines, real submit/fence/terminal, SAME work/RETURN/reset/stop ownership and map/unmap assertions. Strengthen both port families with busy same/different PFN refusal and unchanged epoch/maps/old credit, then actual SET0 detach and fresh SET B. Session invalidate used in disposal stays a separate operation.",
-  "scope": "Only test stimulus/oracle and this document changed. No product or AIR source change, timeout increase, skipped oracle, fabricated epoch/fence or fallback. Old1019 production build and25 successful1020 tests retain their exact tuple scope; old frame1020 remains failed and is not retroactively accepted. New test binary and actual results require separate receipts."
-}

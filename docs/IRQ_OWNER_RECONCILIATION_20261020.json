@@ -1,8 +1,0 @@
-{
-  "status": "SOURCE_CORRECTION_CANDIDATE_NOT_RUNTIME_ACCEPTANCE",
-  "baseline": "e2c76a1237ef6d036a8264fd0bbe8b1fca7149b3",
-  "reused": "Complete non-dropping IRQ callback structure from8f33076170ded4579baf0beda8eb7702a08bfc49, already present in modern main. Preserve old normal request/delivery diagnostic counters and MSI behavior.",
-  "correction": "Remove obsolete drop-exit arm left under if(!s) by1011 reconciliation; it dereferenced null for diagnostic atomic counters. Original queued owner retains exact State and SessionWork through callback RETURN. It is contradictory to admit null-only body requiring State or discard accepted work during exit.",
-  "scope": "One impossible obsolete arm removed; no warning suppression, replacement root, new lookup, dropped real IRQ, new diagnostic activation or AIR change. All earlier source/custody/control and whole-E2E runtime holds remain until their exact changed tuple gates pass.",
-  "evidence": "apple-virgl/evidence/runs/20261014-qemu-parallel/whole1017-custody-build/END.json records real compiler failure; FIX-CANDIDATE1018 and NEGATIVE1017-688 preserve cause and scope. Later build receipt must identify this new commit, not relabel failed prior artifacts."
-}

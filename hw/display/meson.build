@@ -90,18 +90,13 @@ else
     apple_gfx_ml_ss.add(files(
         'apple-gfx-ml.c',
         'apple-gfx-eeee-process-vm.c',
-        'apple-gfx-efi-capture.c',
-        'apple-gfx-efi-source.c',
-        'apple-gfx-eeee-source-dmabuf.c',
     ))
 
     # ──────────────── mlapi/qmetal unified ────────────────
     # This device is valid only with the reviewed QMetal source and its exact
     # build output.  A host-installed mlapi or a neighboring checkout would
     # make the QEMU/QMetal ABI unprovable, so neither is a fallback.
-    if config_all_devices.has_key('CONFIG_APPLE_GFX_ML') or \
-       (host_os == 'linux' and config_all_devices.has_key('CONFIG_VIRTIO_GPU') and \
-        virgl.found() and opengl.found())
+    if config_all_devices.has_key('CONFIG_APPLE_GFX_ML')
         qmetal_source_dir = get_option('apple_virgl_qmetal_source_dir')
         qmetal_build_dir = get_option('apple_virgl_qmetal_build_dir')
         if qmetal_source_dir == '' or qmetal_build_dir == ''
@@ -153,18 +148,8 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
 
   if virgl.found() and opengl.found()
     virtio_gpu_gl_ss = ss.source_set()
-    virtio_gpu_gl_sources = files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c')
-    virtio_gpu_gl_deps = [pixman, virgl]
-    if host_os == 'linux'
-      virtio_gpu_gl_sources += files('apple-virgl-protocol.c',
-                                     'apple-virgl-bridge.c',
-                                     'apple-virgl-frame-pump.c',
-                                     'apple-virgl-present-stage.c',
-                                     'apple-virgl-cursor-stage.c')
-      virtio_gpu_gl_deps += mlapi_dep
-    endif
     virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl, opengl],
-                         if_true: [virtio_gpu_gl_sources, virtio_gpu_gl_deps])
+                         if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c'), pixman, virgl])
     hw_display_modules += {'virtio-gpu-gl': virtio_gpu_gl_ss}
   endif
 

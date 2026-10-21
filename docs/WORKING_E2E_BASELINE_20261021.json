@@ -1,0 +1,11 @@
+{
+  "decision": "Restore the preserved matched working E2E foundation first, as explicitly requested by the user; port later blocks onto this main afterward.",
+  "functional_sources": {"QMetal": "eb057a7e0b4ccb18163bfd316d4a0b06c52227d5", "QEMU": "5582c052ade72689cb6470a77098bce54db70e09", "AIR": "8ef6712612c190966b5049ed83f06608f376e123"},
+  "preserved_previous_mains": {"QMetal": "71db8e41234384b04e12938d170c9901b7bdb488", "QEMU": "670a4ffeeb691214f7189b080c9dd10864dc8619", "AIR": "cc3c29ce6cb806d5764ac58caf6d369f7db85723"},
+  "reuse_receipts": {"QEMU": "whole985-qemu-reference-finish/END.json", "AIR": "whole988-air-reference-finish/END.json", "unchanged_QMetal_contracts": "whole990-matched-air/END.json (completed individual checks only; aggregate remains STOP)", "unchanged_QEMU_foundation": "whole992-qemu-matched-tuple/END.json"},
+  "historical_scope": "Two stock eeee LoginUI runs, 401 native frames each; no native eee1, Desktop/Finder/Screensaver or reference-parity claim.",
+  "preservation": "Previous main remains in ancestry and a named donor ref. Combined QMetal source is separately committed as 3beb1b3c55c894f6b6cc013613941c34fbadd284. Later accepted contracts remain deferred porting debts, not erased or declared closed.",
+  "verification": "Reuse unchanged prior-stage evidence. Build only the missing exact QMetal pair, check the changed loader tuple once, then one short stock eeee control from committed main revisions. Current reconstructed tuple has no guest PASS yet.",
+  "later_work": ["Port preserved independently accepted causal blocks in Pareto order", "Retain explicit stronger per-input coverage as the porting baseline", "Resolve combined-candidate sRGB failure740 separately", "Desktop/Finder/Screensaver and native eee1 closure", "Stable A/B and reference graphical parity"],
+  "policy": "Each next block starts from the advanced main and ends with proportionate delta verification, main commit and immediate host push. Never repeat unchanged gates solely for a stage or commit identity change."
+}
