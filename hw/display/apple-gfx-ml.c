@@ -22701,9 +22701,12 @@ static void agfx_kick_display_render(AppleGfxMLState *s, struct qmu_vulkan_ctx *
         return;
     }
 
-    /* Reference apple_gfx_render_new_frame retains the exact current-frame
-     * object on the BH/BQL edge, then moves only the encode/submit work to the
-     * background queue. qmetal mirrors that with a captured request FIFO. */
+    agfx_record_render_start_mode(s);
+
+    /* Preserve the existing content capture/submit split here. It is a
+     * separate open contract: reference BH retains the output texture and
+     * command buffer; PG current-source selection happens in background encode,
+     * not on this BH edge. This mode-snapshot repair does not close that debt. */
     qemu_mutex_lock(&s->session_mutex);
     rc = qmu_vk_capture_display_frame_request(vk);
     qemu_mutex_unlock(&s->session_mutex);
@@ -23070,8 +23073,7 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
      * that immutable per-submit payload to this callback; copy it into the
      * visible QEMU surface on the BH edge instead of late-reading a mutable
      * global latest-frame slot that may already hold another completion. */
-    if (s->rendering_frame_width != s->fb_width ||
-        s->rendering_frame_height != s->fb_height) {
+    if (!agfx_render_start_mode_is_current(s)) {
         return false;
     }
 
@@ -23967,8 +23969,6 @@ static void agfx_new_frame_handler_bh(void *opaque)
                  "[apple-gfx-ml] new_frame_handler_bh: queue_render pending_frames=%d\n",
                  pending);
     }
-    s->rendering_frame_width = s->fb_width;
-    s->rendering_frame_height = s->fb_height;
     const uint64_t _subk_t_pre_kick = _subk_on ? subk_sig_timing_now_ns() : 0ULL;
     agfx_kick_display_render(s, vk);
     if (_subk_on) {
