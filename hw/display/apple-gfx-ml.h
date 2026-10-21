@@ -21,6 +21,12 @@
 
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
+typedef struct qmu_session_work qmu_session_work;
+
+typedef struct AgfxHostWork {
+    struct AppleGfxMLState *state;
+    qmu_session_work *work;
+} AgfxHostWork;
 typedef struct AgfxEeeeProviderState AgfxEeeeProviderState;
 struct AppleGfxMLFrameCompletionJob;
 struct AgfxBootstrapPresentCommand;
@@ -31,6 +37,7 @@ typedef struct ThreadPool ThreadPool;
 
 typedef struct AgfxBootstrapPresentSource {
     bool pending;
+    AgfxHostWork owner;
 } AgfxBootstrapPresentSource;
 
 typedef struct AgfxBootstrapPresentTimer {
@@ -40,12 +47,17 @@ typedef struct AgfxBootstrapPresentTimer {
 
 typedef struct AgfxCompletionJob {
     struct AgfxCompletionJob *next;
+    AgfxHostWork owner;
     void (*fn)(void *);
     void *ctx;
 } AgfxCompletionJob;
 
 #define TYPE_APPLE_GFX_ML "apple-gfx-ml"
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGfxMLState, APPLE_GFX_ML)
+
+void agfx_publish_display_mode(AppleGfxMLState *s, uint32_t width, uint32_t height,
+                               uint32_t iosurface_pixel_format,
+                               uint64_t protection_requirements);
 
 /* PCI IDs - must match guest driver expectations */
 #define APPLE_GFX_ML_VENDOR_ID          0x106b  /* Apple */
@@ -84,12 +96,10 @@ struct AppleGfxMLState {
     int32_t cursor_x;
     int32_t cursor_y;
 
-    /* display_fb is published to the QEMU surface from main-loop BHs only.
-     * Owner completion BH late-reads the latest mutable frame state from
-     * qmetal on the BH edge, mirroring reference frame_completed_bh reading
-     * from one shared display texture object instead of consuming immutable
-     * per-submit frame payload snapshots. */
-    uint8_t *display_fb;        /* Used by QEMU DisplaySurface */
+    /* Borrow of the current Console-owned surface data. Main-loop completion
+     * BHs copy their immutable per-submit payload here. Pixel memory is held
+     * by pixman image refs, never independently freed/reallocated by Device. */
+    uint8_t *display_fb;
     size_t display_fb_size;
     
     /* Current display parameters */
@@ -103,6 +113,7 @@ struct AppleGfxMLState {
     bool new_frame_ready;       /* Frame copied to display_fb, awaiting gfx_update poll */
     bool gfx_update_requested;  /* gfx_update was called while frame was in-flight */
     int pending_frames;         /* Number of frames in flight (max 2, reference pattern) */
+    AgfxHostWork deferred_frame_owner;
 
     /* Configuration properties */
     uint32_t vram_size_mb;
@@ -432,6 +443,7 @@ struct AppleGfxMLState {
     AgfxCompletionJob *completion_head;
     AgfxCompletionJob *completion_tail;
     bool completion_bh_scheduled;
+    bool completion_dispatch_active;
     QEMUBH *completion_bh;
 
     int iosfc_bootstrap_active;
@@ -448,6 +460,7 @@ struct AppleGfxMLState {
     QemuMutex bootstrap_present_mutex;
     QemuCond bootstrap_present_cond;
     bool bootstrap_present_worker_stop;
+    bool bootstrap_present_roots_stopped;
     struct AgfxBootstrapPresentCommand *bootstrap_present_cmd_head;
     struct AgfxBootstrapPresentCommand *bootstrap_present_cmd_tail;
     AgfxBootstrapPresentTimer bootstrap_present_timer;
@@ -471,6 +484,14 @@ struct AppleGfxMLState {
     uint64_t render_worker_log_count;
     uint64_t bootstrap_present_log_count;
 };
+
+/* Only clear after the existing producer-stop sequence. Console and deferred
+ * image owners retain the allocation; clearing this borrow never frees it. */
+static inline void agfx_clear_display_surface_borrow(AppleGfxMLState *s)
+{
+    s->display_fb = NULL;
+    s->display_fb_size = 0;
+}
 
 /* Properties macro for device registration
  * NOTE: romfile is already defined by PCIDevice parent class!
