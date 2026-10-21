@@ -493,21 +493,6 @@ static inline void agfx_clear_display_surface_borrow(AppleGfxMLState *s)
     s->display_fb_size = 0;
 }
 
-/* Called at every actual render kickoff on the main-loop/BQL edge, including
- * completion-chain starts. A mode change invalidates only the already-started
- * frame; the next start must not inherit its predecessor's dimensions. */
-static inline void agfx_record_render_start_mode(AppleGfxMLState *s)
-{
-    s->rendering_frame_width = s->fb_width;
-    s->rendering_frame_height = s->fb_height;
-}
-
-static inline bool agfx_render_start_mode_is_current(const AppleGfxMLState *s)
-{
-    return s->rendering_frame_width == s->fb_width &&
-           s->rendering_frame_height == s->fb_height;
-}
-
 /* Properties macro for device registration
  * NOTE: romfile is already defined by PCIDevice parent class!
  * Use: -device apple-gfx-ml,romfile=/path/to/AppleParavirtEFI.rom

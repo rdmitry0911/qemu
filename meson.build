@@ -4404,12 +4404,6 @@ foreach target : target_dirs
         'c_args': ['-DAGFX_MEMORY_BASELINE_CONTROL'],
         'install': false,
       }, {
-        'name': 'test-apple-gfx-ml-render-mode',
-        'win_subsystem': 'console',
-        'sources': files('tests/unit/test-apple-gfx-ml-render-mode.c'),
-        'dependencies': [],
-        'install': false,
-      }, {
           'name': 'test-apple-gfx-ml-surface-backing',
           'win_subsystem': 'console',
           'sources': files('tests/unit/test-apple-gfx-ml-surface-backing.c',
@@ -4537,11 +4531,6 @@ foreach target : target_dirs
       test('apple-gfx-ml-memory-baseline', emulator,
            args: ['--tap', '-p', '/agfx/memory/repeated-dirty-keeps-pin'],
            should_fail: true, timeout: 45, suite: ['native-component'])
-      continue
-    endif
-    if exe['name'] == 'test-apple-gfx-ml-render-mode'
-      test('apple-gfx-ml-render-mode', emulator, args: ['--tap'],
-           protocol: 'tap', timeout: 45, suite: ['native-component'])
       continue
     endif
     if exe['name'] == 'test-apple-gfx-ml-surface-backing'
