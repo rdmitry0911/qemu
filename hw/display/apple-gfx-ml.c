@@ -24687,6 +24687,22 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     agfx_log(s, "[apple-gfx-ml] Realizing device: %ux%u, VRAM=%uMB\n",
              s->display_width, s->display_height, s->vram_size_mb);
     
+    /* Optional PCI identity override. pci_qdev_realize already wrote the
+     * class defaults. Preserve accepted native-driver personality selection
+     * without changing the MMIO/FIFO backend or the default stock eeee ID. */
+    if (s->pci_vendor_id_override != 0xffffffff) {
+        pci_config_set_vendor_id(pci_dev->config,
+                                 (uint16_t)s->pci_vendor_id_override);
+        agfx_log(s, "[apple-gfx-ml] PCI vendor id overridden to 0x%04x\n",
+                 (uint16_t)s->pci_vendor_id_override);
+    }
+    if (s->pci_device_id_override != 0xffffffff) {
+        pci_config_set_device_id(pci_dev->config,
+                                 (uint16_t)s->pci_device_id_override);
+        agfx_log(s, "[apple-gfx-ml] PCI device id overridden to 0x%04x\n",
+                 (uint16_t)s->pci_device_id_override);
+    }
+    
     /* OptionROM is handled via inherited 'romfile' property from PCIDevice.
      * Just like Apple does in apple-gfx-pci.m:
      *   pci->romfile = apple_gfx_pci_option_rom_path;
