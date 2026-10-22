@@ -83,4 +83,27 @@ bool agfx_eeee_provider_state_destroy(AgfxEeeeProviderState *state);
  * caller owns user_ctx and the versioned ABI prefix. */
 void agfx_eeee_provider_fill_callbacks(qmu_extended_callbacks *callbacks);
 
+
+/* Dormant private full18 context owner; no active Session/PCI exit insertion.
+ * The explicit owner caller must retire BEFORE its callback fields disappear.
+ * Production publication requires the separately source-complete root/caller.
+ * This is not a qmu public ABI or Session factory.
+ * create/retire run under BQL and require an actual QOM AppleGfxMLState.
+ * Acquire copies the real complete table and adds a context reference. Its
+ * caller must release only AFTER all callback/provider/root destructors return.
+ * stop prevents new acquisitions; existing owners may share their receipt.
+ * retire pumps main AIO until acquired owners return, then preserves false
+ * provider-destroy busy as false. It must precede callback-field destruction.
+ * No new read/dirty producer may start after Session quiesce; those calls still
+ * require their original accepted SessionWork/TLS scope. Destructor UNMAP/MR
+ * callbacks use the existing no-new-root BQL path. */
+typedef struct AgfxEeeeNativeContext AgfxEeeeNativeContext;
+struct AppleGfxMLState;
+AgfxEeeeNativeContext *agfx_eeee_native_context_create(struct AppleGfxMLState *s);
+bool agfx_eeee_native_context_acquire(AgfxEeeeNativeContext *context,
+                                     qmu_extended_callbacks *callbacks);
+void agfx_eeee_native_context_release(void *context);
+void agfx_eeee_native_context_stop_acquiring(AgfxEeeeNativeContext *context);
+bool agfx_eeee_native_context_retire(AgfxEeeeNativeContext *context);
+
 #endif /* HW_DISPLAY_APPLE_GFX_EEEE_PROCESS_VM_H */

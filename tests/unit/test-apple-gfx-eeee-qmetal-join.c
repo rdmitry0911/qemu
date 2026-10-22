@@ -501,6 +501,246 @@ static void test_persistent_source_backing(void)
     bql_lock();
 }
 
+
+/* Independent dormant-context gates. No device realize, session, GPU or
+ * canonical task/MAP activation. All context/provider calls are real. */
+static unsigned owned_context_release_calls;
+
+static void owned_context_release_counted(void *context)
+{
+    g_assert_cmpuint(qatomic_fetch_inc(&owned_context_release_calls), ==, 0);
+    agfx_eeee_native_context_release(context);
+}
+
+static void owned_gfx_finalized(Object *object, const char *name, void *opaque)
+{
+    unsigned *finalized = opaque;
+
+    (void)object;
+    (void)name;
+    g_assert_true(bql_locked());
+    g_assert_cmpuint((*finalized)++, ==, 0);
+}
+
+static AppleGfxMLState *new_owned_gfx(unsigned *finalized)
+{
+    AppleGfxMLState *state = APPLE_GFX_ML(object_new(TYPE_APPLE_GFX_ML));
+
+    object_property_add(OBJECT(state), "owned-context-test-finalize", "bool",
+                        NULL, NULL, owned_gfx_finalized, finalized);
+    qatomic_set(&owned_context_release_calls, 0);
+    return state;
+}
+
+static AgfxTestOwnedContext *new_owned_bridge(AgfxEeeeNativeContext *context,
+                                              qmu_extended_callbacks *callbacks)
+{
+    g_assert_true(agfx_eeee_native_context_acquire(context, callbacks));
+    AgfxTestOwnedContext *bridge = agfx_test_owned_context_adopt(
+        callbacks, context, owned_context_release_counted);
+
+    g_assert_nonnull(bridge);
+    g_assert_cmpint(agfx_test_owned_context_drop_parent(bridge), ==, 0);
+    /* The original shared owner is now gone. Only its actual descendant
+     * owns the same compiled facilities and real acquired context token. */
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 0);
+    return bridge;
+}
+
+static void assert_owned_acquisition_stopped(AgfxEeeeNativeContext *context)
+{
+    qmu_extended_callbacks sentinel = { .abi_magic = 0x12345678 };
+    qmu_extended_callbacks before = sentinel;
+
+    agfx_eeee_native_context_stop_acquiring(context);
+    g_assert_false(agfx_eeee_native_context_acquire(context, &sentinel));
+    g_assert_cmpmem(&sentinel, sizeof(sentinel), &before, sizeof(before));
+}
+
+static JoinRamOwner *new_owned_source_ram(uint64_t page)
+{
+    JoinRamOwner *owner = new_source_ram(4 * page, page);
+
+    memset(memory_region_get_ram_ptr(&owner->ram), 0x47, 4 * page);
+    memory_region_add_subregion(get_system_memory(), JOIN_RAM_GPA, &owner->ram);
+    memory_region_init_alias(&owner->alias, OBJECT(owner), "owned-context-alias",
+                             &owner->ram, page, page);
+    memory_region_add_subregion(get_system_memory(), JOIN_ALIAS_GPA, &owner->alias);
+    bql_unlock();
+    drain_call_rcu();
+    bql_lock();
+    return owner;
+}
+
+static void detach_owned_source_ram(JoinRamOwner *owner)
+{
+    memory_region_del_subregion(get_system_memory(), &owner->alias);
+    memory_region_del_subregion(get_system_memory(), &owner->ram);
+    object_unref(OBJECT(owner));
+    bql_unlock();
+    drain_call_rcu();
+    bql_lock();
+}
+
+static void assert_owned_native_window(AgfxTestOwnedContext *bridge,
+                                       JoinRamOwner *owner, uint64_t page,
+                                       bool keep_alias)
+{
+    void *actual_region = NULL;
+    uint64_t actual_offset = UINT64_MAX;
+    uint8_t *canonical = memory_region_get_ram_ptr(&owner->ram);
+
+    g_assert_cmpint(agfx_test_owned_context_native_window(bridge,
+        JOIN_ALIAS_GPA, page, 2 * page, 0x47, 0x69, keep_alias,
+        &actual_region, &actual_offset), ==, 0);
+    g_assert_true(actual_region == &owner->ram);
+    g_assert_cmpuint(actual_offset, ==, page);
+    for (uint64_t index = 0; index < 4 * page; ++index) {
+        const uint8_t expected = index >= page && index < 2 * page ? 0x69 : 0x47;
+        g_assert_cmpuint(canonical[index], ==, expected);
+    }
+}
+
+static void test_owned_context_descendant_native_window(void)
+{
+    unsigned gfx_finalized = 0;
+    AppleGfxMLState *state = new_owned_gfx(&gfx_finalized);
+    AgfxEeeeNativeContext *context = agfx_eeee_native_context_create(state);
+    qmu_extended_callbacks callbacks = {};
+
+    g_assert_nonnull(context);
+    AgfxTestOwnedContext *bridge = new_owned_bridge(context, &callbacks);
+    const uint64_t page = callbacks.eeee_task_host_page_size(state);
+    JoinRamOwner *owner = new_owned_source_ram(page);
+
+    assert_owned_acquisition_stopped(context);
+    assert_owned_native_window(bridge, owner, page, false);
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 0);
+    agfx_test_owned_context_destroy(bridge);
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 1);
+    detach_owned_source_ram(owner);
+    object_unref(OBJECT(state));
+    g_assert_cmpuint(gfx_finalized, ==, 0);
+    g_assert_cmpuint(OBJECT(state)->ref, ==, 1); /* actual context QOM root */
+    g_assert_true(agfx_eeee_native_context_retire(context));
+    g_assert_cmpuint(gfx_finalized, ==, 1);
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 1);
+}
+
+typedef struct OwnedContextRelease {
+    AgfxTestOwnedContext *bridge;
+    QemuEvent go;
+    unsigned *ram_finalized;
+    int retire_entered, retire_returned, release_bh_seen, done;
+} OwnedContextRelease;
+
+static void owned_context_allow_final_return(void *opaque)
+{
+    OwnedContextRelease *release = opaque;
+
+    g_assert_true(bql_locked());
+    g_assert_cmpint(qatomic_read(&release->retire_entered), ==, 1);
+    g_assert_cmpint(qatomic_read(&release->retire_returned), ==, 0);
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 0);
+    qatomic_set(&release->release_bh_seen, 1);
+    qemu_event_set(&release->go);
+}
+
+static void *owned_context_final_return_worker(void *opaque)
+{
+    OwnedContextRelease *release = opaque;
+
+    rcu_register_thread();
+    g_assert_false(bql_locked());
+    qemu_event_wait(&release->go);
+    /* Provider destruction drops the last actual RAM MR off BQL. The real
+     * leaf waits for main-AIO/BQL RETURN before releasing its context token. */
+    agfx_test_owned_context_destroy(release->bridge);
+    g_assert_cmpuint(*release->ram_finalized, ==, 1);
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 1);
+    qatomic_set(&release->done, 1);
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static void test_owned_context_retire_waits_last_mr_return(void)
+{
+    unsigned gfx_finalized = 0, ram_finalized = 0;
+    AppleGfxMLState *state = new_owned_gfx(&gfx_finalized);
+    AgfxEeeeNativeContext *context = agfx_eeee_native_context_create(state);
+    qmu_extended_callbacks callbacks = {};
+    QemuThread worker;
+
+    g_assert_nonnull(context);
+    AgfxTestOwnedContext *bridge = new_owned_bridge(context, &callbacks);
+    const uint64_t page = callbacks.eeee_task_host_page_size(state);
+    JoinRamOwner *owner = new_owned_source_ram(page);
+    owner->finalized = &ram_finalized;
+    assert_owned_native_window(bridge, owner, page, true);
+    detach_owned_source_ram(owner);
+    g_assert_cmpuint(ram_finalized, ==, 0);
+    object_unref(OBJECT(state));
+    g_assert_cmpuint(gfx_finalized, ==, 0);
+    g_assert_cmpuint(OBJECT(state)->ref, ==, 1);
+    assert_owned_acquisition_stopped(context);
+
+    OwnedContextRelease release = {
+        .bridge = bridge, .ram_finalized = &ram_finalized,
+    };
+    qemu_event_init(&release.go, false);
+    qemu_thread_create(&worker, "eeee-owned-last", owned_context_final_return_worker,
+                       &release, QEMU_THREAD_JOINABLE);
+    /* This BH cannot run until retire really enters its pending-owner AIO
+     * wait. Only then can the worker begin its last MR/provider release. */
+    aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                            owned_context_allow_final_return, &release);
+    qatomic_set(&release.retire_entered, 1);
+    g_assert_true(agfx_eeee_native_context_retire(context));
+    qatomic_set(&release.retire_returned, 1);
+    qemu_thread_join(&worker);
+    g_assert_cmpint(qatomic_read(&release.release_bh_seen), ==, 1);
+    g_assert_cmpint(qatomic_read(&release.done), ==, 1);
+    g_assert_cmpuint(ram_finalized, ==, 1);
+    g_assert_cmpuint(gfx_finalized, ==, 1);
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 1);
+    qemu_event_destroy(&release.go);
+}
+
+static void test_owned_context_busy_preserves_root_retry(void)
+{
+    unsigned gfx_finalized = 0;
+    AppleGfxMLState *state = new_owned_gfx(&gfx_finalized);
+    AgfxEeeeNativeContext *context = agfx_eeee_native_context_create(state);
+    qmu_extended_callbacks callbacks = {};
+    uint64_t address = 0;
+
+    g_assert_nonnull(context);
+    AgfxTestOwnedContext *bridge = new_owned_bridge(context, &callbacks);
+    const uint64_t page = callbacks.eeee_task_host_page_size(state);
+    void *provider_state = state->eeee_provider_state;
+    g_assert_cmpint(callbacks.eeee_task_allocate(state, &address, page,
+        QMU_EEEE_TASK_ALLOCATE_ANYWHERE), ==, 1);
+    memset((void *)(uintptr_t)address, 0x5d, page);
+    agfx_test_owned_context_destroy(bridge);
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 1);
+    assert_owned_acquisition_stopped(context);
+    object_unref(OBJECT(state));
+    g_assert_false(agfx_eeee_native_context_retire(context));
+    g_assert_true(state->eeee_native_context == context);
+    g_assert_true(state->eeee_provider_state == provider_state);
+    g_assert_cmpuint(OBJECT(state)->ref, ==, 1);
+    g_assert_cmpuint(gfx_finalized, ==, 0);
+    for (uint64_t index = 0; index < page; ++index) {
+        g_assert_cmpuint(((uint8_t *)(uintptr_t)address)[index], ==, 0x5d);
+    }
+    /* Prior acquired table remains valid under the SAME preserved root.
+     * No reacquisition, reconstructed provider or replacement context. */
+    g_assert_cmpint(callbacks.eeee_task_deallocate(state, address, page), ==, 0);
+    g_assert_true(agfx_eeee_native_context_retire(context));
+    g_assert_cmpuint(gfx_finalized, ==, 1);
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 1);
+}
+
 int main(int argc, char **argv)
 {
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
@@ -524,6 +764,12 @@ int main(int argc, char **argv)
         GINT_TO_POINTER(FINAL_ALIAS_REMAP_OVERWRITE), test_worker_final_physical_release);
     g_test_add_func("/eeee/persistent-source/exact-backing-independent-of-task",
                     test_persistent_source_backing);
+    g_test_add_func("/eeee/owned-context/descendant-native-window",
+                    test_owned_context_descendant_native_window);
+    g_test_add_func("/eeee/owned-context/retire-waits-last-mr-return",
+                    test_owned_context_retire_waits_last_mr_return);
+    g_test_add_func("/eeee/owned-context/busy-preserves-root-retry",
+                    test_owned_context_busy_preserves_root_retry);
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();
