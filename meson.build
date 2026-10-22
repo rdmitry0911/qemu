@@ -3467,6 +3467,22 @@ endif
 config_host_h = configure_file(output: 'config-host.h', configuration: config_host_data)
 genh += config_host_h
 
+# Exact opaque provider declarations are a separate build input. Keep the
+# common mlapi include root stable while a candidate provider is qualified.
+qmetal_owned_display_header = []
+if config_all_devices.has_key('CONFIG_APPLE_GFX_ML')
+  qmetal_owned_display_header_input = get_option('apple_virgl_qmetal_owned_header')
+  if qmetal_owned_display_header_input == '' or \
+     not qmetal_owned_display_header_input.startswith('/') or \
+     not fs.is_file(qmetal_owned_display_header_input)
+    error('Apple GFX ML requires an explicit absolute reviewed owned-header input')
+  endif
+  qmetal_owned_display_header = configure_file(
+    input: qmetal_owned_display_header_input,
+    output: 'qmetal-owned-display-provider.h',
+    copy: true)
+endif
+
 devenv = environment()
 devenv.set('MESON_BUILD_ROOT', meson.project_build_root())
 devenv.set('VIRTUAL_ENV', meson.project_build_root() / 'pyvenv')
@@ -4445,11 +4461,16 @@ foreach target : target_dirs
           'name': 'test-apple-gfx-ml-frame-credit',
           'win_subsystem': 'console',
           'sources': files('tests/unit/test-apple-gfx-ml-frame-credit.c',
-                           'tests/unit/apple-gfx-ml-credit-test-bridge.cpp'),
+                           'tests/unit/apple-gfx-ml-credit-test-bridge.cpp') +
+                     [qmetal_owned_display_header],
           'include_directories': target_inc,
           'dependencies': [],
           'link_args': ['-Wl,--wrap=qmu_create_extended',
-                        '-Wl,--wrap=qmu_vk_submit_captured_display_frame',
+                        '-Wl,--wrap=qmu_vk_prepare_owned_display_frame',
+                        '-Wl,--wrap=qmu_vk_encode_submit_owned_display_frame',
+                        '-Wl,--wrap=qmu_session_invoke_host_work',
+                        '-Wl,--wrap=qmu_display_copy_selected_current_target',
+                        '-Wl,--wrap=qmu_owned_display_frame_release',
                         '-Wl,--wrap=qmu_session_quiesce_host_callback_producers_deferred',
                         '-Wl,--wrap=thread_pool_submit_immediate',
                         '-Wl,--export-dynamic-symbol=vkCreateFence',

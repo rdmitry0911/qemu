@@ -29,6 +29,7 @@ import sys
 # defaults.  Try not to add any.
 SKIP_OPTIONS = {
     "apple_virgl_qmetal_build_dir",
+    "apple_virgl_qmetal_owned_header",
     "apple_virgl_qmetal_source_dir",
     "default_devices",
     "fuzzing_engine",

@@ -23,6 +23,7 @@
 #include "ui/console.h"
 #include "pvg/pvg_fifo.h"
 #include "qmu/pvg_regs.h"
+#include "qmetal-owned-display-provider.h"
 #include "apple-gfx-ml-credit-test-bridge.h"
 
 #define TYPE_CREDIT_HOST "test-agfx-credit-host"
@@ -42,9 +43,26 @@ typedef struct FenceObservation {
     bool submitted, terminal, destroyed;
     unsigned waits;
 } FenceObservation;
+typedef struct OwnedDoneSlot {
+    void *control;
+    qmu_owned_display_done original;
+    void *context;
+    bool entered, returned;
+    qmu_owned_display_frame *frame;
+    qmu_display_target *prepared_target;
+    qmu_display_target *selected_target;
+    bool read_entered, leaf_returned, bh_released;
+} OwnedDoneSlot;
+typedef struct OwnedInvoke {
+    struct OwnedInvoke *parent;
+    OwnedDoneSlot *slot;
+} OwnedInvoke;
+static __thread OwnedInvoke *owned_invoke;
 typedef struct CreditControl {
     AppleGfxMLState *state;
     qmu_extended_callbacks original;
+    OwnedDoneSlot owned[MAX_FENCES];
+    unsigned preparations;
     GMutex mutex;
     GCond cond;
     FenceObservation fences[MAX_FENCES];
@@ -101,8 +119,22 @@ qmu_session *__real_qmu_create_extended(const qmu_extended_config *,
                                        const qmu_extended_callbacks *);
 qmu_session *__wrap_qmu_create_extended(const qmu_extended_config *,
                                        const qmu_extended_callbacks *);
-int __real_qmu_vk_submit_captured_display_frame(void *);
-int __wrap_qmu_vk_submit_captured_display_frame(void *);
+int __real_qmu_vk_encode_submit_owned_display_frame(qmu_owned_display_frame *);
+int __wrap_qmu_vk_encode_submit_owned_display_frame(qmu_owned_display_frame *);
+int __real_qmu_vk_prepare_owned_display_frame(qmu_vulkan_ctx *, qmu_display_target *,
+    qmu_owned_display_done, void *, qmu_owned_display_frame **);
+int __wrap_qmu_vk_prepare_owned_display_frame(qmu_vulkan_ctx *, qmu_display_target *,
+    qmu_owned_display_done, void *, qmu_owned_display_frame **);
+void __real_qmu_session_invoke_host_work(qmu_session_work *, void (*)(void *), void *);
+void __wrap_qmu_session_invoke_host_work(qmu_session_work *, void (*)(void *), void *);
+void __real_qmu_owned_display_frame_release(qmu_owned_display_frame *);
+void __wrap_qmu_owned_display_frame_release(qmu_owned_display_frame *);
+qmu_status __real_qmu_display_copy_selected_current_target(qmu_owned_display_frame *,
+    qmu_display_target *, void *, uint32_t, uint32_t, uint32_t,
+    qmu_render_frame_completion *);
+qmu_status __wrap_qmu_display_copy_selected_current_target(qmu_owned_display_frame *,
+    qmu_display_target *, void *, uint32_t, uint32_t, uint32_t,
+    qmu_render_frame_completion *);
 void __real_thread_pool_submit_immediate(ThreadPool *, ThreadPoolFunc *, void *,
                                          GDestroyNotify);
 void __wrap_thread_pool_submit_immediate(ThreadPool *, ThreadPoolFunc *, void *,
@@ -284,13 +316,17 @@ static void observe_schedule(void *opaque, void (*fn)(void *), void *context)
     g_mutex_unlock(&c->mutex);
 }
 
-static void observe_completion(void *opaque,
+static void observe_owned_done(void *opaque, qmu_owned_display_frame *frame,
                                 const qmu_render_frame_completion *completion)
 {
-    CreditControl *c = active;
-    g_assert_true(opaque == c->state);
+    OwnedDoneSlot *slot = opaque;
+    CreditControl *c = slot->control;
+    g_assert_nonnull(frame);
     g_assert_nonnull(qmu_session_current_host_work(c->state->qmu_dev));
     g_mutex_lock(&c->mutex);
+    g_assert_false(slot->entered);
+    slot->entered = true;
+    slot->frame = frame;
     unsigned index = c->callbacks++;
     g_assert_cmpuint(index, <, MAX_FENCES);
     c->pending_at_callback[index] =
@@ -303,12 +339,91 @@ static void observe_completion(void *opaque,
     }
     changed(c);
     g_mutex_unlock(&c->mutex);
-    /* Never called independently and never blocked during reset. */
-    c->original.render_frame_complete(opaque, completion);
+    /* Actual transferred frame and pre-native QEMU packet, no substitute. */
+    slot->original(slot->context, frame, completion);
     g_mutex_lock(&c->mutex);
+    slot->returned = true;
     ++c->callback_returns;
     changed(c);
     g_mutex_unlock(&c->mutex);
+}
+
+void __wrap_qmu_session_invoke_host_work(qmu_session_work *work,
+    void (*fn)(void *), void *opaque)
+{
+    OwnedInvoke call = {.parent=owned_invoke};
+    owned_invoke = &call;
+    __real_qmu_session_invoke_host_work(work, fn, opaque);
+    if (call.slot) {
+        g_assert_true(bql_locked());
+        call.slot->leaf_returned = true;
+    }
+    owned_invoke = call.parent;
+}
+
+qmu_status __wrap_qmu_display_copy_selected_current_target(
+    qmu_owned_display_frame *frame, qmu_display_target *target, void *pixels,
+    uint32_t width, uint32_t height, uint32_t stride,
+    qmu_render_frame_completion *metadata)
+{
+    CreditControl *c = active;
+    g_assert_true(bql_locked());
+    g_assert_nonnull(owned_invoke);
+    OwnedDoneSlot *slot = NULL;
+    for (unsigned i=0; i<c->preparations; ++i) {
+        if (c->owned[i].frame == frame) slot=&c->owned[i];
+    }
+    g_assert_nonnull(slot);
+    g_assert_false(slot->leaf_returned);
+    g_assert_false(slot->read_entered);
+    slot->read_entered = true;
+    slot->selected_target = target;
+    g_assert_true(target == c->state->display_target);
+    owned_invoke->slot = slot;
+    /* Real CURRENT read, original arguments and original status. */
+    return __real_qmu_display_copy_selected_current_target(frame, target,
+        pixels, width, height, stride, metadata);
+}
+
+void __wrap_qmu_owned_display_frame_release(qmu_owned_display_frame *frame)
+{
+    OwnedDoneSlot *slot = NULL;
+    CreditControl *c = active;
+    if (c && frame && bql_locked()) {
+        for (unsigned i=0; i<c->preparations; ++i) {
+            if (c->owned[i].frame == frame) {
+                slot=&c->owned[i];
+            }
+        }
+        if (slot && !slot->read_entered) slot=NULL;
+        if (slot) {
+            /* This specifically rejects donor release inside the leaf: the
+             * original invoke must actually RETURN before terminal release. */
+            g_assert_true(slot->leaf_returned);
+            g_assert_false(slot->bh_released);
+        }
+    }
+    __real_qmu_owned_display_frame_release(frame);
+    if (slot) slot->bh_released = true; /* only release RETURN */
+}
+
+int __wrap_qmu_vk_prepare_owned_display_frame(qmu_vulkan_ctx *context,
+    qmu_display_target *target, qmu_owned_display_done done, void *opaque,
+    qmu_owned_display_frame **out)
+{
+    CreditControl *c = active;
+    g_assert_true(bql_locked());
+    g_assert_nonnull(done);
+    g_assert_nonnull(opaque);
+    g_assert_nonnull(qmu_session_current_host_work(c->state->qmu_dev));
+    g_mutex_lock(&c->mutex);
+    g_assert_cmpuint(c->preparations, <, MAX_FENCES);
+    OwnedDoneSlot *slot = &c->owned[c->preparations++];
+    *slot = (OwnedDoneSlot) {.control=c, .original=done, .context=opaque,
+        .prepared_target=target};
+    g_mutex_unlock(&c->mutex);
+    return __real_qmu_vk_prepare_owned_display_frame(context, target,
+        observe_owned_done, slot, out);
 }
 
 static void observe_irq(void *opaque, uint32_t vector)
@@ -373,7 +488,6 @@ qmu_session *__wrap_qmu_create_extended(const qmu_extended_config *config,
     c->original = *callbacks;
     qmu_extended_callbacks observed = *callbacks;
     observed.schedule_display_completion = observe_schedule;
-    observed.render_frame_complete = observe_completion;
     observed.raise_irq = observe_irq;
     observed.map_gpa = observe_map;
     observed.unmap_gpa = observe_unmap;
@@ -381,14 +495,14 @@ qmu_session *__wrap_qmu_create_extended(const qmu_extended_config *config,
     return __real_qmu_create_extended(config, &observed);
 }
 
-int __wrap_qmu_vk_submit_captured_display_frame(void *context)
+int __wrap_qmu_vk_encode_submit_owned_display_frame(qmu_owned_display_frame *context)
 {
     CreditControl *c = render_caller;
     g_assert_nonnull(c);
     g_assert_false(bql_locked());
     g_assert_nonnull(render_work);
     g_assert_true(qmu_session_current_host_work(c->state->qmu_dev) == render_work);
-    int result = __real_qmu_vk_submit_captured_display_frame(context);
+    int result = __real_qmu_vk_encode_submit_owned_display_frame(context);
     g_mutex_lock(&c->mutex);
     if (result > 0) {
         ++c->positive;
@@ -456,6 +570,15 @@ static bool idle(CreditControl *c)
         c->positive == c->callbacks && c->callbacks == c->callback_returns;
     for (unsigned i = 0; i < c->fence_count; ++i) {
         result &= c->fences[i].submitted && c->fences[i].terminal;
+    }
+    for (unsigned i = 0; i < c->preparations; ++i) {
+        OwnedDoneSlot *slot = &c->owned[i];
+        if (slot->entered) {
+            result &= slot->returned;
+            if (slot->read_entered) {
+                result &= slot->leaf_returned && slot->bh_released;
+            }
+        }
     }
     irq_calls = c->irq_calls;
     g_mutex_unlock(&c->mutex);
@@ -874,8 +997,14 @@ int main(int argc, char **argv)
     resolved("real-destroy", (void *)real_destroy_fence, loader_provider);
     resolved("real-submit", (void *)real_submit, loader_provider);
     resolved("real-wait", (void *)real_wait, loader_provider);
-    resolved("normal-capture-submit",
-             (void *)&__real_qmu_vk_submit_captured_display_frame, dso_provider);
+    resolved("normal-owned-encode",
+             (void *)&__real_qmu_vk_encode_submit_owned_display_frame, dso_provider);
+    resolved("normal-owned-prepare",
+             (void *)&__real_qmu_vk_prepare_owned_display_frame, dso_provider);
+    resolved("normal-selected-current-read",
+             (void *)&__real_qmu_display_copy_selected_current_target, dso_provider);
+    resolved("normal-owned-frame-release",
+             (void *)&__real_qmu_owned_display_frame_release, dso_provider);
     resolved("real-factory", (void *)&__real_qmu_create_extended, dso_provider);
     resolved("real-owner-barrier",
              (void *)&__real_qmu_session_quiesce_host_callback_producers_deferred,

@@ -43,6 +43,8 @@ option('apple_virgl_qmetal_source_dir', type: 'string', value: '',
        description: 'Source directory for the reviewed AppleVirgl QMetal build')
 option('apple_virgl_qmetal_build_dir', type: 'string', value: '',
        description: 'Build directory for the reviewed AppleVirgl QMetal library')
+option('apple_virgl_qmetal_owned_header', type: 'string', value: '',
+       description: 'Exact reviewed owned-display header input, independent of common includes')
 
 # Everything else can be set via --enable/--disable-* option
 # on the configure script command line.  After adding an option

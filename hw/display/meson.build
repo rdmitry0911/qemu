@@ -125,6 +125,7 @@ else
             dependencies: [vulkan_dep],
             link_args: [mlapi_lib_so, '-Wl,-rpath,' + qmetal_build_dir],
         )
+        apple_gfx_ml_ss.add(qmetal_owned_display_header)
         apple_gfx_ml_ss.add(mlapi_dep)
         message('Using reviewed Apple GFX ML QMetal tuple: ' + mlapi_lib_so)
     endif
