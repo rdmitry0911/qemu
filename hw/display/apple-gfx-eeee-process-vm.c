@@ -1,7 +1,7 @@
 /*
  * EEEE process-VM provider for Apple ParavirtualizedGraphics.
  *
- * Stock PGMappingTask owns persistent native virtual address ranges.  The
+ * The selected legacy PGTask owns persistent native virtual address ranges. The
  * host adapter below translates that contract to QEMU's address-space and
  * MemoryRegion model without turning a host pointer into an identity.  A
  * retained MemoryRegion, shared RAM file descriptor, file offset, native VA
@@ -32,7 +32,9 @@ typedef struct AgfxEeeeAlias {
 
 typedef struct AgfxEeeeAllocation {
     uint64_t address;
+    /* Source task length is literal; mmap/munmap use native page rounding. */
     uint64_t length;
+    uint64_t mapped_length;
     GPtrArray *aliases;
 } AgfxEeeeAllocation;
 
@@ -44,6 +46,9 @@ struct AgfxEeeeProviderState {
     GHashTable *regions;
     /* opaque QMetal LegacyTaskProvider pointer -> itself */
     GHashTable *published_tasks;
+    /* Retired aliases still own these refs until task_unlock/fixed overwrite
+     * releases them outside the task mutex.  QOM finalizers may reenter. */
+    GPtrArray *retired_regions;
     bool destroying;
 };
 
@@ -66,7 +71,23 @@ static bool agfx_eeee_contains(uint64_t outer_address, uint64_t outer_length,
     return agfx_eeee_range(outer_address, outer_length) &&
            agfx_eeee_range(inner_address, inner_length) &&
            inner_address >= outer_address &&
+           inner_address - outer_address <= outer_length &&
            inner_length <= outer_length - (inner_address - outer_address);
+}
+
+/* Recovered from the earlier native bridge (8ad0fc7).  Do not narrow the
+ * source's literal allocation length to page multiples at the public ABI. */
+static bool agfx_eeee_round_length(uint64_t length, uint64_t page_size,
+                                    uint64_t *rounded)
+{
+    const uint64_t mask = page_size - 1;
+
+    if (!length || !page_size || (page_size & mask) ||
+        length > UINT64_MAX - mask) {
+        return false;
+    }
+    *rounded = (length + mask) & ~mask;
+    return *rounded <= SIZE_MAX;
 }
 
 static bool agfx_eeee_intersects(uint64_t left_address, uint64_t left_length,
@@ -80,7 +101,28 @@ static bool agfx_eeee_intersects(uint64_t left_address, uint64_t left_length,
 
 static void agfx_eeee_alias_destroy(gpointer data)
 {
-    g_free(data);
+    AgfxEeeeAlias *alias = data;
+
+    memory_region_unref(alias->region);
+    g_free(alias);
+}
+
+static void agfx_eeee_retired_region_destroy(gpointer data)
+{
+    memory_region_unref(data);
+}
+
+static GPtrArray *agfx_eeee_take_retired_regions(AgfxEeeeProviderState *state)
+{
+    GPtrArray *retired;
+
+    if (state->retired_regions->len == 0) {
+        return NULL;
+    }
+    retired = state->retired_regions;
+    state->retired_regions =
+        g_ptr_array_new_with_free_func(agfx_eeee_retired_region_destroy);
+    return retired;
 }
 
 static void agfx_eeee_allocation_destroy(gpointer data)
@@ -103,6 +145,8 @@ AgfxEeeeProviderState *agfx_eeee_provider_state_create(void)
                                                NULL, agfx_eeee_allocation_destroy);
     state->regions = g_hash_table_new(g_direct_hash, g_direct_equal);
     state->published_tasks = g_hash_table_new(g_direct_hash, g_direct_equal);
+    state->retired_regions =
+        g_ptr_array_new_with_free_func(agfx_eeee_retired_region_destroy);
     return state;
 }
 
@@ -114,10 +158,13 @@ bool agfx_eeee_provider_state_destroy(AgfxEeeeProviderState *state)
         return true;
     }
     qemu_mutex_lock(&state->lock);
-    state->destroying = true;
     empty = g_hash_table_size(state->allocations) == 0 &&
             g_hash_table_size(state->regions) == 0 &&
-            g_hash_table_size(state->published_tasks) == 0;
+            g_hash_table_size(state->published_tasks) == 0 &&
+            state->retired_regions->len == 0;
+    if (empty) {
+        state->destroying = true;
+    }
     qemu_mutex_unlock(&state->lock);
     if (!empty) {
         return false;
@@ -125,6 +172,7 @@ bool agfx_eeee_provider_state_destroy(AgfxEeeeProviderState *state)
     g_hash_table_destroy(state->published_tasks);
     g_hash_table_destroy(state->regions);
     g_hash_table_destroy(state->allocations);
+    g_ptr_array_unref(state->retired_regions);
     qemu_mutex_destroy(&state->lock);
     g_free(state);
     return true;
@@ -168,11 +216,12 @@ static AgfxEeeeAllocation *agfx_eeee_allocation_containing(
     return NULL;
 }
 
-/* A fresh-zero overwrite removes exactly the overwritten alias interval.  A
- * surviving prefix/suffix remains an alias to the same retained region; it
- * is not copied and does not obtain an additional MemoryRegion reference. */
-static void agfx_eeee_remove_overwritten_aliases(AgfxEeeeAllocation *allocation,
-                                                 uint64_t address, uint64_t length)
+/* Each surviving interval owns its backing reference independently of the
+ * provider's unique region set (8ad0fc7).  Retirement moves that reference,
+ * without dropping it under the task mutex or changing RAM bytes. */
+static void agfx_eeee_remove_overwritten_aliases(AgfxEeeeProviderState *state,
+                                               AgfxEeeeAllocation *allocation,
+                                               uint64_t address, uint64_t length)
 {
     const uint64_t end = address + length;
     guint index = 0;
@@ -189,6 +238,7 @@ static void agfx_eeee_remove_overwritten_aliases(AgfxEeeeAllocation *allocation,
             AgfxEeeeAlias *suffix = g_new(AgfxEeeeAlias, 1);
 
             *suffix = *alias;
+            memory_region_ref(suffix->region);
             suffix->target = end;
             suffix->region_offset += end - alias->target;
             suffix->length = alias_end - end;
@@ -209,6 +259,8 @@ static void agfx_eeee_remove_overwritten_aliases(AgfxEeeeAllocation *allocation,
             ++index;
             continue;
         }
+        g_ptr_array_add(state->retired_regions, alias->region);
+        alias->region = NULL;
         g_ptr_array_remove_index(allocation->aliases, index);
     }
 }
@@ -221,8 +273,11 @@ static int agfx_eeee_task_allocate(void *ctx, uint64_t *address,
     void *mapped;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     AgfxEeeeAllocation *allocation;
+    uint64_t mapped_length;
+    GPtrArray *retired;
 
-    if (!address || !agfx_eeee_page_range(0, length) || length > SIZE_MAX) {
+    if (!address || !agfx_eeee_round_length(length, qemu_real_host_page_size(),
+                                           &mapped_length)) {
         return 0;
     }
     switch (placement) {
@@ -261,15 +316,19 @@ static int agfx_eeee_task_allocate(void *ctx, uint64_t *address,
             qemu_mutex_unlock(&state->lock);
             return 0;
         }
-        agfx_eeee_remove_overwritten_aliases(allocation, *address, length);
+        agfx_eeee_remove_overwritten_aliases(state, allocation, *address, length);
+        retired = agfx_eeee_take_retired_regions(state);
         qemu_mutex_unlock(&state->lock);
+        if (retired) {
+            g_ptr_array_unref(retired);
+        }
         return 1;
     }
 
-    mapped = mmap(requested, length, PROT_READ | PROT_WRITE, flags, -1, 0);
+    mapped = mmap(requested, mapped_length, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (mapped == MAP_FAILED || (requested && mapped != requested)) {
         if (mapped != MAP_FAILED) {
-            munmap(mapped, length);
+            munmap(mapped, mapped_length);
         }
         return 0;
     }
@@ -277,12 +336,13 @@ static int agfx_eeee_task_allocate(void *ctx, uint64_t *address,
     qemu_mutex_lock(&state->lock);
     if (state->destroying) {
         qemu_mutex_unlock(&state->lock);
-        munmap(mapped, length);
+        munmap(mapped, mapped_length);
         return 0;
     }
     allocation = g_new0(AgfxEeeeAllocation, 1);
     allocation->address = (uint64_t)(uintptr_t)mapped;
     allocation->length = length;
+    allocation->mapped_length = mapped_length;
     allocation->aliases = g_ptr_array_new_with_free_func(agfx_eeee_alias_destroy);
     g_hash_table_insert(state->allocations, &allocation->address, allocation);
     qemu_mutex_unlock(&state->lock);
@@ -329,6 +389,7 @@ static int agfx_eeee_task_remap_shared_fixed_overwrite(
     fd = qemu_ram_get_fd(ram_block);
     file_offset = qemu_ram_get_fd_offset(ram_block);
     if (fd < 0 || file_offset > UINT64_MAX - region_offset ||
+        file_offset + region_offset > INT64_MAX ||
         !agfx_eeee_page_range(file_offset + region_offset, length)) {
         return 0;
     }
@@ -349,7 +410,10 @@ static int agfx_eeee_task_remap_shared_fixed_overwrite(
         }
         return 0;
     }
-    agfx_eeee_remove_overwritten_aliases(allocation, *address, length);
+    /* Keep the exact RAM owner across the provider's earlier region_unref
+     * and through the eventual native overwrite/deallocation. */
+    memory_region_ref(region);
+    agfx_eeee_remove_overwritten_aliases(state, allocation, *address, length);
     alias = g_new(AgfxEeeeAlias, 1);
     *alias = (AgfxEeeeAlias){
         .region = region,
@@ -371,9 +435,6 @@ static int agfx_eeee_task_protect(void *ctx, uint64_t address,
     int native_protection;
     AgfxEeeeAllocation *allocation;
 
-    if (!agfx_eeee_page_range(address, length)) {
-        return 0;
-    }
     switch (protection) {
     case QMU_EEEE_TASK_PROTECT_NONE:
         native_protection = PROT_NONE;
@@ -387,8 +448,15 @@ static int agfx_eeee_task_protect(void *ctx, uint64_t address,
     default:
         abort();
     }
-    /* All source protect calls are made by QMetal under task_lock: initial
-     * no-access, final map protection, and post-zero-overwrite no-access. */
+    /* Generic facilities also serve the separate mapped profile.  Selected
+     * legacy PGTask never invokes this callback.  Preserve the earlier
+     * mapped-profile zero-length no-op without imposing protect on legacy. */
+    if (length == 0) {
+        return 1;
+    }
+    if (!agfx_eeee_page_range(address, length)) {
+        return 0;
+    }
     allocation = agfx_eeee_allocation_containing(state, address, length);
     if (!allocation || state->destroying ||
         mprotect((void *)(uintptr_t)address, length, native_protection) != 0) {
@@ -403,18 +471,21 @@ static int agfx_eeee_task_deallocate(void *ctx, uint64_t address,
     AgfxEeeeProviderState *state = agfx_eeee_state(ctx);
     AgfxEeeeAllocation *allocation;
 
-    if (!agfx_eeee_page_range(address, length)) {
+    if (!agfx_eeee_range(address, length)) {
         return -1;
     }
     qemu_mutex_lock(&state->lock);
     allocation = agfx_eeee_allocation_exact(state, address);
     if (!allocation || allocation->length != length || state->destroying ||
-        munmap((void *)(uintptr_t)address, length) != 0) {
+        munmap((void *)(uintptr_t)address, allocation->mapped_length) != 0) {
         qemu_mutex_unlock(&state->lock);
         return -1;
     }
-    g_hash_table_remove(state->allocations, &address);
+    g_hash_table_steal(state->allocations, &address);
     qemu_mutex_unlock(&state->lock);
+    /* Alias refs may finalize a QOM owner.  Release them after native munmap
+     * and outside the non-recursive task mutex. */
+    agfx_eeee_allocation_destroy(allocation);
     return 0;
 }
 
@@ -446,8 +517,12 @@ static void agfx_eeee_task_lock(void *ctx)
 static void agfx_eeee_task_unlock(void *ctx)
 {
     AgfxEeeeProviderState *state = agfx_eeee_state(ctx);
+    GPtrArray *retired = agfx_eeee_take_retired_regions(state);
 
     qemu_mutex_unlock(&state->lock);
+    if (retired) {
+        g_ptr_array_unref(retired);
+    }
 }
 
 static int agfx_eeee_task_translate(void *ctx, uint64_t gpa, uint64_t length,
