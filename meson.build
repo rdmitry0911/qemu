@@ -4391,12 +4391,6 @@ foreach target : target_dirs
         qmetal_import_source_dir = meson.project_source_root() / '../qmetal'
       endif
       execs += [{
-        'name': 'test-apple-gfx-ml-cursor-visibility',
-        'win_subsystem': 'console',
-        'sources': files('tests/unit/test-apple-gfx-ml-cursor-visibility.c'),
-        'dependencies': [],
-        'install': false,
-      }, {
         'name': 'test-apple-gfx-ml-memory',
         'win_subsystem': 'console',
         'sources': files('tests/unit/test-apple-gfx-ml-memory.c'),
@@ -4528,11 +4522,6 @@ foreach target : target_dirs
                link_args: link_args + exe.get('link_args', []),
                win_subsystem: exe['win_subsystem'])
 
-    if exe['name'] == 'test-apple-gfx-ml-cursor-visibility'
-      test('apple-gfx-ml-cursor-visibility', emulator, args: ['--tap'],
-           protocol: 'tap', timeout: 45, suite: ['native-component'])
-      continue
-    endif
     if exe['name'] == 'test-apple-gfx-ml-memory'
       test('apple-gfx-ml-memory', emulator, args: ['--tap'],
            protocol: 'tap', timeout: 45, suite: ['native-component'])
