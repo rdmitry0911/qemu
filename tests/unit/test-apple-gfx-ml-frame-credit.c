@@ -23,7 +23,7 @@
 #include "ui/console.h"
 #include "pvg/pvg_fifo.h"
 #include "qmu/pvg_regs.h"
-#include "qmetal-owned-display-provider.h"
+#include "qmu/qmu_owned_display_frame.h"
 #include "apple-gfx-ml-credit-test-bridge.h"
 
 #define TYPE_CREDIT_HOST "test-agfx-credit-host"

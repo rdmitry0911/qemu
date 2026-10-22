@@ -49,7 +49,7 @@
 #include "apple-gfx-ml.h"
 #include "qmu/pvg_regs.h"
 #include "qmu/qmetal_unified.h"
-#include "qmetal-owned-display-provider.h"
+#include "qmu/qmu_owned_display_frame.h"
 
 /* Forward declarations from qmu_vulkan.h (C++ header, can't include directly) */
 struct qmu_vulkan_ctx;
