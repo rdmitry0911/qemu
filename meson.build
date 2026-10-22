@@ -4514,6 +4514,30 @@ foreach target : target_dirs
           'install': false,
         }]
     endif
+    # The only new native supplier gate calls the actual normally built
+    # QMetal C++ adapter/provider, not a copied mock or its session factory.
+    if host_os == 'linux' and target_name == 'x86_64' and \
+       'CONFIG_APPLE_GFX_ML' in config_target
+      if 'cpp' not in all_languages
+        add_languages('cpp', required: true, native: false)
+        all_languages += ['cpp']
+        cxx = meson.get_compiler('cpp')
+      endif
+      qmetal_join_source_dir = get_option('apple_virgl_qmetal_source_dir')
+      if qmetal_join_source_dir == ''
+        qmetal_join_source_dir = meson.project_source_root() / '../qmetal'
+      endif
+      execs += [{
+        'name': 'test-apple-gfx-eeee-qmetal-join',
+        'win_subsystem': 'console',
+        'sources': files('tests/unit/test-apple-gfx-eeee-qmetal-join.c',
+                         'tests/unit/apple-gfx-eeee-qmetal-test-bridge.cpp'),
+        'include_directories': include_directories(qmetal_join_source_dir / 'src/unified'),
+        'dependencies': [],
+        'link_args': ['-Wl,--wrap=mmap64'],
+        'install': false,
+      }]
+    endif
     if host_os == 'windows' and (sdl.found() or gtk.found())
       execs += [{
         'name': 'qemu-system-' + target_name + 'w',
