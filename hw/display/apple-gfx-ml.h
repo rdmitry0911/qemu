@@ -72,6 +72,11 @@ void agfx_publish_display_mode(AppleGfxMLState *s, uint32_t width, uint32_t heig
 #define APPLE_GFX_ML_MSI_CAP_AUTO       0x0   /* Let QEMU auto-select capability offset */
 #define APPLE_GFX_ML_DEFAULT_VRAM_MB    512
 
+/* Existing host callback entrypoints; also used by native console controls.
+ * No QMetal session or physical GPU is needed to exercise the UI handoff. */
+void apple_gfx_ml_cursor_show(void *ctx, uint32_t display_id, int visible);
+void apple_gfx_ml_cursor_move(void *ctx, uint32_t display_id);
+
 /* Device state - minimal, all logic in qmetal */
 struct AppleGfxMLState {
     /*< private >*/
