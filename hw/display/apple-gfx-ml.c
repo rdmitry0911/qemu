@@ -47,6 +47,7 @@
 #include <linux/kvm.h>
 
 #include "apple-gfx-ml.h"
+#include "apple-gfx-eeee-process-vm.h"
 #include "qmu/pvg_regs.h"
 #include "qmu/qmetal_unified.h"
 #include "qmu/qmu_owned_display_frame.h"
@@ -22577,6 +22578,124 @@ static int qemu_write_memory_mainloop(void *ctx, uint64_t gpa, const void *buf,
 {
     return address_space_write(&address_space_memory, gpa,
                                 MEMTXATTRS_UNSPECIFIED, buf, size) == MEMTX_OK ? 0 : -1;
+}
+
+/* Private native-memory context. Dormant until the real caller owns it.
+ * The root owns one reference; each acquired facilities object owns another.
+ * Intentional storage/operation descendants share that acquired object and
+ * do not add permanent SessionWork or reselect a numeric task. */
+struct AgfxEeeeNativeContext {
+    AppleGfxMLState *state;
+    QemuMutex lock;
+    unsigned references;
+    bool acquiring_stopped;
+    qmu_extended_callbacks callbacks;
+};
+
+AgfxEeeeNativeContext *agfx_eeee_native_context_create(AppleGfxMLState *s)
+{
+    AgfxEeeeNativeContext *context;
+
+    assert(bql_locked());
+    if (!s || s->eeee_native_context || s->eeee_provider_state ||
+        qatomic_read(&s->exiting)) {
+        return NULL; /* Private owner-binding failure, not a task outcome. */
+    }
+    context = g_new0(AgfxEeeeNativeContext, 1);
+    object_ref(OBJECT(s));
+    context->state = s;
+    qemu_mutex_init(&context->lock);
+    qatomic_set(&context->references, 1); /* Actual caller root, not SessionWork. */
+    context->callbacks = (qmu_extended_callbacks) {
+        .abi_magic = QMU_EXTENDED_CALLBACKS_ABI_MAGIC,
+        .abi_version = QMU_EXTENDED_ABI_VERSION,
+        .struct_size = sizeof(qmu_extended_callbacks),
+        .user_ctx = s,
+        .map_gpa = qemu_map_gpa,
+        .unmap_gpa = qemu_unmap_gpa,
+        .mark_mapped_memory_dirty = qemu_mark_mapped_memory_dirty,
+        .read_memory = qemu_read_memory,
+    };
+    s->eeee_provider_state = agfx_eeee_provider_state_create();
+    agfx_eeee_provider_fill_callbacks(&context->callbacks);
+    s->eeee_native_context = context;
+    return context;
+}
+
+bool agfx_eeee_native_context_acquire(AgfxEeeeNativeContext *context,
+                                     qmu_extended_callbacks *callbacks)
+{
+    bool acquired = false;
+
+    /* The caller already owns the QEMU root or an acquired context lease;
+     * a borrowed pointer after root retirement is not an acquisition API. */
+    if (!context || !callbacks) {
+        return false;
+    }
+    qemu_mutex_lock(&context->lock);
+    if (!context->acquiring_stopped) {
+        g_assert_cmpuint(qatomic_read(&context->references), >, 0);
+        qatomic_inc(&context->references);
+        *callbacks = context->callbacks;
+        acquired = true;
+    }
+    qemu_mutex_unlock(&context->lock);
+    return acquired;
+}
+
+void agfx_eeee_native_context_release(void *opaque)
+{
+    AgfxEeeeNativeContext *context = opaque;
+
+    /* The original native callback/destructor has RETURNED before this leaf.
+     * Never release the lifecycle root here or tear down callback state. */
+    qemu_mutex_lock(&context->lock);
+    g_assert_cmpuint(qatomic_read(&context->references), >, 1);
+    qatomic_dec(&context->references);
+    qemu_mutex_unlock(&context->lock);
+    aio_wait_kick();
+}
+
+void agfx_eeee_native_context_stop_acquiring(AgfxEeeeNativeContext *context)
+{
+    if (context) {
+        qemu_mutex_lock(&context->lock);
+        context->acquiring_stopped = true;
+        qemu_mutex_unlock(&context->lock);
+    }
+}
+
+bool agfx_eeee_native_context_retire(AgfxEeeeNativeContext *context)
+{
+    AppleGfxMLState *s;
+
+    assert(bql_locked());
+    if (!context) {
+        return true;
+    }
+    agfx_eeee_native_context_stop_acquiring(context);
+    /* Same main-AIO-pumped wait as existing lifecycle work. A worker's last
+     * MR unpin can require BQL before its owned facilities reference returns.
+     * Hold no context/provider/Session mutex across this wait. */
+    AIO_WAIT_WHILE(NULL, qatomic_read(&context->references) != 1);
+    /* The last releaser publishes count==1 before unlocking this mutex.
+     * Join that exact critical section before destroying its storage. After
+     * unlock the release leaf touches no context bytes, only aio_wait_kick. */
+    qemu_mutex_lock(&context->lock);
+    g_assert_cmpuint(qatomic_read(&context->references), ==, 1);
+    qemu_mutex_unlock(&context->lock);
+    s = context->state;
+    if (!agfx_eeee_provider_state_destroy(s->eeee_provider_state)) {
+        /* Preserve actual busy state, context and QOM root. This cannot be
+         * reported as successful teardown or converted to a Local result. */
+        return false;
+    }
+    s->eeee_provider_state = NULL;
+    s->eeee_native_context = NULL;
+    qemu_mutex_destroy(&context->lock);
+    object_unref(OBJECT(s));
+    g_free(context);
+    return true;
 }
 
 /* ============================================================

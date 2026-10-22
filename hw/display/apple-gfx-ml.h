@@ -28,6 +28,7 @@ typedef struct AgfxHostWork {
     qmu_session_work *work;
 } AgfxHostWork;
 typedef struct AgfxEeeeProviderState AgfxEeeeProviderState;
+typedef struct AgfxEeeeNativeContext AgfxEeeeNativeContext;
 typedef struct qmu_display_target qmu_display_target;
 struct AppleGfxMLFrameCompletionJob;
 struct AgfxBootstrapPresentCommand;
@@ -100,6 +101,7 @@ struct AppleGfxMLState {
     /* Reserved for the indivisible EEEE provider/session cutover.  It is not
      * initialized or passed to QMetal by the legacy path. */
     AgfxEeeeProviderState *eeee_provider_state;
+    AgfxEeeeNativeContext *eeee_native_context;
 
     /* QEMU display */
     QemuConsole *con;
