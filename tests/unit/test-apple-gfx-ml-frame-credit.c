@@ -625,14 +625,17 @@ static void *transport_caller(void *opaque)
     return NULL;
 }
 
-static void start_transport(TransportCall *call, CreditControl *c, uint32_t pfn)
+static void start_transport(TransportCall *call, CreditControl *c, uint32_t pfn,
+                            bool invalidate)
 {
-    *call = (TransportCall) {.control = c, .pfn = pfn, .invalidate = !pfn};
+    /* SET page0 detaches the actual Nub. The separate Session invalidate API
+     * is still used by dispose; those are not interchangeable operations. */
+    *call = (TransportCall) {.control = c, .pfn = pfn, .invalidate = invalidate};
     qemu_thread_create(&call->thread, "credit-transport", transport_caller,
                        call, QEMU_THREAD_JOINABLE);
 }
 
-static void finish_transport(TransportCall *call)
+static void finish_transport(TransportCall *call, qmu_status expected)
 {
     gint64 deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
     while (!qatomic_read(&call->done)) {
@@ -641,7 +644,7 @@ static void finish_transport(TransportCall *call)
         g_thread_yield();
     }
     qemu_thread_join(&call->thread);
-    g_assert_cmpint(call->result, ==, QMU_OK);
+    g_assert_cmpint(call->result, ==, expected);
 }
 
 static void release_observation(CreditControl *c)
@@ -786,8 +789,8 @@ static void dispose(CreditControl *c)
         pump_until(c, idle);
         /* These cases revoke their finite output before final stop. The new
          * active-stop case deliberately performs no such pre-drain. */
-        start_transport(&control, c, 0);
-        finish_transport(&control);
+        start_transport(&control, c, 0, true);
+        finish_transport(&control, QMU_OK);
         pump_until(c, idle);
     }
     c->destroying = true;
@@ -884,27 +887,96 @@ static void test_port(enum AgfxCreditFamily family)
     CreditControl c;
     TransportCall call;
     create(&c, family);
-    start_transport(&call, &c, CREDIT_GPA >> 12);
-    finish_transport(&call);
+    start_transport(&call, &c, CREDIT_GPA >> 12, false);
+    finish_transport(&call, QMU_OK);
     g_assert_cmpuint(c.map_count, ==, 1);
     g_assert_cmpuint(c.unmap_count, ==, 0);
     first(&c, family);
+    /* first_accepted requires actual positive encode RETURN and the actual
+     * render worker destructor RETURN, while the real submitted fence's
+     * observation is held. SET0 therefore happens AFTER source encoding:
+     * this test does not infer that point from a source epoch or a timer. */
+    g_mutex_lock(&c.mutex);
+    g_assert_true(c.selected_valid);
+    g_assert_true(c.wait_entered);
+    g_assert_cmpuint(c.positive, ==, 1);
+    g_assert_cmpuint(c.render_jobs, ==, 1);
+    g_assert_cmpuint(c.render_retired, ==, 1);
+    g_assert_cmpuint(c.preparations, ==, 1);
+    const unsigned encoded_fence_index = c.selected;
+    const VkFence encoded_fence = c.fences[encoded_fence_index].fence;
+    const VkCommandBuffer encoded_command =
+        c.fences[encoded_fence_index].command;
+    g_assert_true(c.fences[encoded_fence_index].submitted);
+    g_assert_false(c.fences[encoded_fence_index].terminal);
+    g_assert_true(encoded_fence != VK_NULL_HANDLE);
+    g_assert_true(encoded_command != VK_NULL_HANDLE);
+    qmu_display_target *const encoded_output = c.owned[0].prepared_target;
+    g_assert_nonnull(encoded_output);
+    g_assert_false(c.owned[0].entered);
+    g_mutex_unlock(&c.mutex);
+    g_assert_true(encoded_output == c.state->display_target);
+    g_assert_cmpuint(c.state->fb_width, ==, CREDIT_WIDTH);
+    g_assert_cmpuint(c.state->fb_height, ==, CREDIT_HEIGHT);
+    const uint64_t frames_before_detach = c.state->frame_count;
     const uint64_t epoch = agfx_credit_delivery_epoch(c.state->qmu_dev);
-    start_transport(&call, &c, (CREDIT_GPA >> 12) + 1);
-    const gint64 deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
-    while (agfx_credit_delivery_epoch(c.state->qmu_dev) == epoch) {
-        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
-        aio_poll(qemu_get_aio_context(), false);
-        g_thread_yield();
+    const uint32_t busy_pfns[] = {CREDIT_GPA >> 12, (CREDIT_GPA >> 12) + 1};
+    /* Primary Device rejects occupied SET, including the same PFN. It must
+     * not replace the original page or invalidate its accepted frame. */
+    for (unsigned i = 0; i < ARRAY_SIZE(busy_pfns); ++i) {
+        start_transport(&call, &c, busy_pfns[i], false);
+        finish_transport(&call, QMU_ERROR);
+        g_assert_cmpuint(agfx_credit_delivery_epoch(c.state->qmu_dev), ==, epoch);
+        g_assert_cmpuint(c.map_count, ==, 1);
+        g_assert_cmpuint(c.unmap_count, ==, 0);
+        g_assert_cmpuint(c.callbacks, ==, 0);
+        g_assert_cmpint(c.state->pending_frames, ==, 1);
     }
-    g_assert_false(qatomic_read(&call.done));
-    release_observation(&c);
-    finish_transport(&call); /* Main AIO pumps real RAM/DMA/IRQ BHs. */
+    /* Pinned x86 setNub's waitForPendingFrames is an empty six-byte return,
+     * not a native fence drain. CURRENT is revoked, but the accepted native
+     * command and its original logical credit still own their real terminal.
+     * Both SET0 and the successor SET must RETURN before fence observation. */
+    start_transport(&call, &c, 0, false);
+    finish_transport(&call, QMU_OK); /* Main AIO pumps real RAM/DMA/IRQ BHs. */
+    g_assert_cmpuint(c.map_count, ==, 1);
+    g_assert_cmpuint(c.unmap_count, ==, 1);
+    g_assert_cmpuint(c.callbacks, ==, 0);
+    g_assert_cmpint(c.state->pending_frames, ==, 1);
+    start_transport(&call, &c, (CREDIT_GPA >> 12) + 1, false);
+    finish_transport(&call, QMU_OK);
     g_assert_cmpuint(c.map_count, ==, 2);
     g_assert_cmpuint(c.unmap_count, ==, 1);
+    g_assert_cmpuint(c.callbacks, ==, 0);
+    g_assert_cmpint(c.state->pending_frames, ==, 1);
+    /* Nub CURRENT changed; the already encoded physical OUTPUT and mode
+     * did not. No callback or synthetic terminal has been admitted yet. */
+    g_assert_true(c.state->display_target == encoded_output);
+    g_assert_cmpuint(c.state->fb_width, ==, CREDIT_WIDTH);
+    g_assert_cmpuint(c.state->fb_height, ==, CREDIT_HEIGHT);
+    g_assert_cmpuint(c.state->frame_count, ==, frames_before_detach);
+    release_observation(&c);
     pump_until(&c, idle);
     g_assert_cmpuint(c.callbacks, ==, 1);
-    g_assert_false(c.pixels_at_callback[0]);
+    /* Actual native outcome and the physical OUTPUT read/RETURN precede
+     * this publication oracle. SET0 is not Session invalidation and cannot
+     * cancel a command already encoded into this retained OUTPUT. */
+    g_assert_true(c.fences[encoded_fence_index].fence == encoded_fence);
+    g_assert_true(c.fences[encoded_fence_index].command == encoded_command);
+    g_assert_true(c.fences[encoded_fence_index].submitted);
+    g_assert_true(c.fences[encoded_fence_index].terminal);
+    g_assert_cmpuint(c.fences[encoded_fence_index].waits, >, 0);
+    g_assert_true(c.owned[0].entered);
+    g_assert_true(c.owned[0].returned);
+    g_assert_true(c.owned[0].prepared_target == encoded_output);
+    g_assert_true(c.owned[0].selected_target == encoded_output);
+    g_assert_true(c.owned[0].read_entered);
+    g_assert_true(c.owned[0].leaf_returned);
+    g_assert_true(c.owned[0].bh_released);
+    g_assert_true(c.state->display_target == encoded_output);
+    g_assert_cmpuint(c.state->fb_width, ==, CREDIT_WIDTH);
+    g_assert_cmpuint(c.state->fb_height, ==, CREDIT_HEIGHT);
+    g_assert_true(c.pixels_at_callback[0]);
+    g_assert_cmpuint(c.state->frame_count, ==, frames_before_detach + 1);
     g_assert_cmpuint(c.pending_at_callback[0], ==, 1);
     publish(&c, family, 0xff708090);
     pump_until(&c, second_completed);
