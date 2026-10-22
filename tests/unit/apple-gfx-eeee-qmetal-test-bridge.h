@@ -27,6 +27,27 @@ int agfx_test_owned_context_native_window(
     void **actual_region, uint64_t *actual_region_offset);
 void agfx_test_owned_context_destroy(AgfxTestOwnedContext *owner);
 
+/* Test-only transport. Every product call returns through a C++ catch. */
+typedef struct AgfxTestMapMMIO AgfxTestMapMMIO;
+typedef struct AgfxTestMapRead {
+    uint32_t vector, bytes, entered, returned;
+    uint64_t gpa;
+    int32_t result;
+    uint32_t prefix_bytes;
+    uint8_t prefix[8];
+} AgfxTestMapRead;
+typedef struct AgfxTestMapTask {
+    uint64_t epoch, address_space, binding_epoch;
+    uint32_t root_pfn, kind;
+} AgfxTestMapTask;
+AgfxTestMapMMIO *agfx_test_map_mmio_new(qmu_session *, uint32_t, uint64_t, int);
+qmu_session_work *agfx_test_map_mmio_work(AgfxTestMapMMIO *);
+void agfx_test_map_mmio_worker(AgfxTestMapMMIO *);
+int agfx_test_map_mmio_finish(AgfxTestMapMMIO *, uint64_t *);
+int agfx_test_map_task_snapshot(qmu_session *, AgfxTestMapTask *);
+int agfx_test_map_verify_records(int, const AgfxTestMapRead *, size_t,
+                                 const AgfxTestMapTask *);
+
 #ifdef __cplusplus
 }
 #endif

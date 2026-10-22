@@ -741,6 +741,249 @@ static void test_owned_context_busy_preserves_root_retry(void)
     g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 1);
 }
 
+/* New group only. Actual machine-none PCI factory from mmio-read323..357,
+ * actual RAM, original physical Root/child grammar, real callback transport. */
+#include "hw/pci/pci_host.h"
+#include "hw/pci/msi.h"
+#include "pvg/pvg_fifo.h"
+#include "pvg/pvg_regs.h"
+#include <fcntl.h>
+
+#define MAP_RAM_GPA UINT64_C(0x100000)
+#define MAP_RAM_SIZE UINT64_C(0x500000)
+#define MAP_ROOT_GPA UINT64_C(0x220000)
+#define MAP_NODE_GPA UINT64_C(0x36d414)
+#define MAP_TABLE_GPA UINT64_C(0x36e000)
+#define MAP_RING_GPA UINT64_C(0x36f000)
+
+typedef struct MapProbeControl {
+    AppleGfxMLState *state;
+    qmu_extended_callbacks original;
+    qmu_session_work *expected_work;
+    AgfxTestMapRead reads[128];
+    unsigned read_count;
+    int vector;
+} MapProbeControl;
+static MapProbeControl *map_probe;
+
+qmu_session *__real_qmu_create_extended(const qmu_extended_config *,
+                                        const qmu_extended_callbacks *);
+qmu_session *__wrap_qmu_create_extended(const qmu_extended_config *,
+                                        const qmu_extended_callbacks *);
+
+static int map_probe_read_memory(void *opaque, uint64_t gpa, void *bytes, size_t size)
+{
+    MapProbeControl *c = map_probe;
+    qmu_session_work *before = qmu_session_current_host_work(c->state->qmu_dev);
+    AgfxTestMapRead *row = NULL;
+    g_assert_true(opaque == c->state && c->original.user_ctx == opaque);
+    if (c->vector >= 0 && before == c->expected_work) {
+        g_assert_nonnull(before);
+        g_assert_false(bql_locked());
+        g_assert_cmpuint(c->read_count, <, G_N_ELEMENTS(c->reads));
+        row = &c->reads[c->read_count++];
+        *row = (AgfxTestMapRead) { .vector = c->vector, .gpa = gpa,
+                                  .bytes = size, .entered = 1 };
+    }
+    /* No injected value/failure: exact saved production callback and arguments. */
+    int result = c->original.read_memory(opaque, gpa, bytes, size);
+    if (row) {
+        g_assert_true(qmu_session_current_host_work(c->state->qmu_dev) == before);
+        row->result = result;
+        row->returned = 1;
+        if (result == 0) {
+            row->prefix_bytes = MIN(size, sizeof(row->prefix));
+            memcpy(row->prefix, bytes, row->prefix_bytes);
+        }
+    }
+    return result;
+}
+qmu_session *__wrap_qmu_create_extended(const qmu_extended_config *cfg,
+                                        const qmu_extended_callbacks *callbacks)
+{
+    if (!map_probe) return __real_qmu_create_extended(cfg, callbacks);
+    g_assert_true(callbacks->user_ctx == map_probe->state);
+    g_assert_nonnull(callbacks->read_memory);
+    g_assert_nonnull(callbacks->write_memory);
+    g_assert_nonnull(callbacks->raise_irq);
+    g_assert_cmpuint(callbacks->struct_size, ==, sizeof(*callbacks));
+    map_probe->original = *callbacks;
+    qmu_extended_callbacks observed = *callbacks;
+    observed.read_memory = map_probe_read_memory;
+    return __real_qmu_create_extended(cfg, &observed);
+}
+
+typedef struct MapProbeWorker { AgfxTestMapMMIO *call; int done; } MapProbeWorker;
+static void *map_probe_worker(void *opaque)
+{
+    MapProbeWorker *job = opaque;
+    rcu_register_thread();
+    g_assert_false(bql_locked());
+    agfx_test_map_mmio_worker(job->call); /* Entire product call/catch is C++. */
+    rcu_unregister_thread();
+    qatomic_set(&job->done, 1);
+    aio_wait_kick();
+    return NULL;
+}
+static uint64_t map_probe_mmio(uint32_t offset, uint64_t value, bool read)
+{
+    MapProbeControl *c = map_probe;
+    AgfxTestMapMMIO *call = agfx_test_map_mmio_new(c->state->qmu_dev, offset, value, read);
+    g_assert_nonnull(call);
+    c->expected_work = agfx_test_map_mmio_work(call);
+    MapProbeWorker job = { .call = call };
+    QemuThread worker;
+    qemu_thread_create(&worker, "map-observer", map_probe_worker, &job, QEMU_THREAD_JOINABLE);
+    const gint64 deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
+    while (!qatomic_read(&job.done)) {
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        aio_poll(qemu_get_aio_context(), false);
+        g_thread_yield();
+    }
+    qemu_thread_join(&worker); /* Not merely event-set / worker done-store. */
+    uint64_t result = 0;
+    g_assert_cmpint(agfx_test_map_mmio_finish(call, &result), ==, 1);
+    c->expected_work = NULL;
+    return result;
+}
+static uint8_t *map_probe_ram(JoinRamOwner *ram, uint64_t gpa, size_t bytes)
+{
+    g_assert_cmpuint(gpa, >=, MAP_RAM_GPA);
+    g_assert_cmpuint(gpa - MAP_RAM_GPA + bytes, <=, MAP_RAM_SIZE);
+    return (uint8_t *)memory_region_get_ram_ptr(&ram->ram) + (gpa - MAP_RAM_GPA);
+}
+static void map_probe_root(JoinRamOwner *ram, uint32_t *cursor, uint32_t stamp,
+                           uint16_t opcode, const void *payload, size_t length)
+{
+    PVGRootCmdHeader header = { .opcode = opcode, .total_size = sizeof(header) + length,
+                               .stamp_value = stamp };
+    g_assert_cmpuint(*cursor + header.total_size, <=, 4096);
+    uint8_t *out = map_probe_ram(ram, MAP_ROOT_GPA + *cursor, header.total_size);
+    memcpy(out, &header, sizeof(header));
+    memcpy(out + sizeof(header), payload, length);
+    *cursor += header.total_size;
+    (void)map_probe_mmio(PVG_REG_FIFO_WRITE, *cursor, false);
+}
+
+static void test_map_first_leaf_original_mmio(void)
+{
+    static const TypeInfo host_type = { .name = "test-map-first-leaf-host",
+        .parent = TYPE_PCI_HOST_BRIDGE, .instance_size = sizeof(PCIHostState) };
+    const char *path = g_getenv("AGFX_MAP_GATE_RECORDS");
+    g_assert_nonnull(path); /* Root-owned durable path; no silent /tmp artifact. */
+    int fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_APPEND | O_CLOEXEC, 0600);
+    g_assert_cmpint(fd, >=, 0);
+    char fd_text[32];
+    g_snprintf(fd_text, sizeof(fd_text), "%d", fd);
+    g_setenv("QMU_MAP_FIRST_LEAF_FD", fd_text, true);
+    g_setenv("QMU_MAP_FIRST_LEAF_TASK", "1", true);
+    g_setenv("QMU_MAP_FIRST_LEAF_LIMIT", "10", true);
+    type_register_static(&host_type);
+    PCIHostState *host = PCI_HOST_BRIDGE(object_new(host_type.name));
+    host->bus = pci_root_bus_new(DEVICE(host), "map.pcie", get_system_memory(),
+                                 get_system_io(), 0, TYPE_PCIE_BUS);
+    g_assert_true(qbus_realize(BUS(host->bus), &error_abort));
+    MapProbeControl c = { .vector = -1 };
+    map_probe = &c;
+    c.state = APPLE_GFX_ML(object_new(TYPE_APPLE_GFX_ML));
+    DEVICE(c.state)->hotplugged = false;
+    c.state->vram_size_mb = 1;
+    c.state->display_width = 16;
+    c.state->display_height = 12;
+    bool saved_msi = msi_nonbroken;
+    msi_nonbroken = true;
+    g_assert_true(qdev_realize(DEVICE(c.state), BUS(host->bus), &error_abort));
+    g_assert_nonnull(c.state->qmu_dev); /* Actual production factory, never skip. */
+    JoinRamOwner *ram = (JoinRamOwner *)object_new(TYPE_JOIN_RAM_OWNER);
+    g_assert_true(memory_region_init_ram_nomigrate(&ram->ram, OBJECT(ram),
+                    "map-first-leaf-input", MAP_RAM_SIZE, &error_abort));
+    memory_region_add_subregion(get_system_memory(), MAP_RAM_GPA, &ram->ram);
+    memset(memory_region_get_ram_ptr(&ram->ram), 0, MAP_RAM_SIZE);
+    bql_unlock(); drain_call_rcu(); bql_lock();
+    (void)map_probe_mmio(PVG_REG_IOSFC_ENABLE, 0, false);
+    (void)map_probe_mmio(PVG_REG_IOSFC_ENABLE, 1, false);
+    (void)map_probe_mmio(PVG_REG_IOSFC_TASK_PFN, 0x100, false);
+    (void)map_probe_mmio(PVG_REG_IOSFC_TASK_SIZE, 0x1000, false);
+    (void)map_probe_mmio(PVG_REG_PROTOCOL_VERSION, 6, false);
+    (void)map_probe_mmio(PVG_REG_FIFO_PFN, MAP_ROOT_GPA >> 12, false);
+    (void)map_probe_mmio(PVG_REG_FIFO_SIZE, 0x1000, false);
+    (void)map_probe_mmio(PVG_REG_FIFO_OFFSET, 0, false);
+    (void)map_probe_mmio(PVG_REG_FIFO_ENABLE, 1, false);
+    (void)map_probe_mmio(PVG_REG_SHARED_STATE_PFN, 0x36d, false);
+    uint32_t root_cursor = 0, root_stamp = 1;
+    PVGRootCmdDefineTask task = { .task_id_encoded = 2, .task_size = 0x400000,
+                                 .page_table_pfn = 0x445 };
+    map_probe_root(ram, &root_cursor, root_stamp++, PVG_ROOT_CMD_DEFINE_TASK, &task, sizeof(task));
+    uint32_t node[5] = { 0, 0, 0, 2, MAP_TABLE_GPA >> 12 };
+    uint32_t pfn_table[16] = { MAP_RING_GPA >> 12 };
+    memcpy(map_probe_ram(ram, MAP_NODE_GPA, sizeof(node)), node, sizeof(node));
+    memcpy(map_probe_ram(ram, MAP_TABLE_GPA, sizeof(pfn_table)), pfn_table, sizeof(pfn_table));
+    PVGRootCmdDefineChildFIFO child = { .channel_id = 2 };
+    map_probe_root(ram, &root_cursor, root_stamp++, PVG_ROOT_CMD_DEFINE_CHILD_FIFO,
+                   &child, sizeof(child));
+    const uint32_t root_info[2] = { 0x470, 1 };
+    memcpy(map_probe_ram(ram, 0x445000, sizeof(root_info)), root_info, sizeof(root_info));
+    uint32_t child_cursor = 0;
+    AgfxTestMapTask actual_tasks[3];
+    for (unsigned vector = 0; vector != 3; ++vector) {
+        if (vector == 2) {
+            PVGRootCmdDeleteTask erase = { .task_id = 1 };
+            map_probe_root(ram, &root_cursor, root_stamp++, PVG_ROOT_CMD_DELETE_TASK,
+                           &erase, sizeof(erase));
+            task.page_table_pfn = 0xdeadbeef; /* Unmapped real AS => actual DMA failure. */
+            map_probe_root(ram, &root_cursor, root_stamp++, PVG_ROOT_CMD_DEFINE_TASK,
+                           &task, sizeof(task));
+        } else {
+            const uint32_t raw = 0x80000000U | (vector ? 1 : 0x472);
+            memcpy(map_probe_ram(ram, 0x470008, sizeof(raw)), &raw, sizeof(raw));
+        }
+        struct QEMU_PACKED { uint32_t task; uint64_t offset, length; } map =
+            { 1, 0x2000, 0x1000 };
+        G_STATIC_ASSERT(sizeof(map) == 20);
+        PVGRootCmdHeader header = { .opcode = PVG_GPU_CMD_MAP_MEMORY2,
+            .total_size = sizeof(header) + sizeof(map), .stamp_value = 46 + vector };
+        uint8_t *packet = map_probe_ram(ram, MAP_RING_GPA + child_cursor, header.total_size);
+        memcpy(packet, &header, sizeof(header));
+        memcpy(packet + sizeof(header), &map, sizeof(map));
+        child_cursor += header.total_size;
+        memcpy(map_probe_ram(ram, MAP_NODE_GPA, sizeof(child_cursor)),
+               &child_cursor, sizeof(child_cursor)); // Preserve actual read/fault words.
+        g_assert_cmpint(agfx_test_map_task_snapshot(c.state->qmu_dev,
+                            &actual_tasks[vector]), ==, 0);
+        c.vector = vector;
+        (void)map_probe_mmio(PVG_REG_KICK, 2, false);
+        c.vector = -1;
+        uint32_t stamp, read, fault;
+        memcpy(&stamp, map_probe_ram(ram, MAP_ROOT_GPA + 8, 4), 4);
+        memcpy(&read, map_probe_ram(ram, MAP_NODE_GPA + 4, 4), 4);
+        memcpy(&fault, map_probe_ram(ram, MAP_NODE_GPA + 8, 4), 4);
+        g_assert_cmpuint(stamp, ==, 46 + vector);
+        g_assert_cmpuint(read, ==, child_cursor);
+        g_assert_cmpuint(fault, ==, UINT32_MAX);
+        g_assert_cmpuint(map_probe_mmio(PVG_REG_FAULT_STATUS, 0, true), ==, 0);
+    }
+    int oracle = agfx_test_map_verify_records(fd, c.reads, c.read_count, actual_tasks);
+    g_test_message("record_oracle_line=%d real_read_RETURNs=%u; PFN1 is observed, never D success",
+                   oracle, c.read_count);
+    g_assert_cmpint(oracle, ==, 0);
+    /* Same original actual lifecycle teardown; FD stays open until Session exit. */
+    qdev_unrealize(DEVICE(c.state));
+    g_assert_null(c.state->qmu_dev);
+    object_unparent(OBJECT(c.state)); object_unref(OBJECT(c.state));
+    memory_region_del_subregion(get_system_memory(), &ram->ram);
+    object_unref(OBJECT(ram));
+    bql_unlock(); drain_call_rcu(); bql_lock();
+    bql_unlock(); drain_call_rcu(); bql_lock();
+    pci_root_bus_cleanup(host->bus); object_unref(OBJECT(host));
+    bql_unlock(); drain_call_rcu(); bql_lock();
+    msi_nonbroken = saved_msi;
+    map_probe = NULL;
+    g_unsetenv("QMU_MAP_FIRST_LEAF_FD");
+    g_unsetenv("QMU_MAP_FIRST_LEAF_TASK");
+    g_unsetenv("QMU_MAP_FIRST_LEAF_LIMIT");
+    g_assert_cmpint(close(fd), ==, 0); // Retain artifact bytes; no unlink.
+}
+
 int main(int argc, char **argv)
 {
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
@@ -770,6 +1013,8 @@ int main(int argc, char **argv)
                     test_owned_context_retire_waits_last_mr_return);
     g_test_add_func("/eeee/owned-context/busy-preserves-root-retry",
                     test_owned_context_busy_preserves_root_retry);
+    g_test_add_func("/eeee/map-first-leaf/original-mmio-three-vectors",
+                    test_map_first_leaf_original_mmio);
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();
