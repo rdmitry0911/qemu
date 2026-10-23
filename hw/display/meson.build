@@ -90,6 +90,7 @@ else
     apple_gfx_ml_ss.add(files(
         'apple-gfx-ml.c',
         'apple-gfx-eeee-process-vm.c',
+        'apple-gfx-eeee-source-dmabuf.c',
     ))
 
     # ──────────────── mlapi/qmetal unified ────────────────

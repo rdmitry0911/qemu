@@ -48,6 +48,8 @@
 
 #include "apple-gfx-ml.h"
 #include "apple-gfx-eeee-process-vm.h"
+#include "apple-gfx-eeee-source-dmabuf.h"
+#include "apple-gfx-eeee-source-dmabuf-caps.h"
 #include "qmu/pvg_regs.h"
 #include "qmu/qmetal_unified.h"
 #include "qmu/qmu_owned_display_frame.h"
@@ -22703,6 +22705,68 @@ bool agfx_eeee_native_context_source_backing_caps(
             .release = agfx_eeee_context_release_source_backing,
             .describe = agfx_eeee_context_describe_source_backing,
             .mark_dirty = agfx_eeee_context_dirty_source_backing,
+        };
+        bound = true;
+    }
+    qemu_mutex_unlock(&context->lock);
+    return bound;
+}
+
+static void agfx_eeee_context_create_source_dmabuf(
+    void *saved_source, struct qmu_source_dmabuf_result_v1 *out)
+{
+    AgfxEeeeDmaBufFailure failure;
+    AgfxEeeeSourceDmaBuf *export;
+
+    g_assert_nonnull(out);
+    export = agfx_eeee_source_dmabuf_create(saved_source, &failure);
+    *out = (struct qmu_source_dmabuf_result_v1) {
+        .owner = export,
+        .failure_stage = failure.stage,
+        .error_no = failure.error_no,
+        .failed_interval = failure.interval,
+    };
+}
+
+static void agfx_eeee_context_release_source_dmabuf(void *export)
+{
+    agfx_eeee_source_dmabuf_unref(export);
+}
+
+static bool agfx_eeee_context_describe_source_dmabuf(
+    const void *opaque, struct qmu_source_dmabuf_view_v1 *out)
+{
+    const AgfxEeeeSourceDmaBuf *export = opaque;
+
+    if (!export || !out) {
+        return false;
+    }
+    *out = (struct qmu_source_dmabuf_view_v1) {
+        .borrowed_fd = agfx_eeee_source_dmabuf_fd(export),
+        .allocation_length = agfx_eeee_source_dmabuf_allocation_length(export),
+        .visible_offset = agfx_eeee_source_dmabuf_visible_offset(export),
+        .visible_length = agfx_eeee_source_dmabuf_length(export),
+    };
+    return true;
+}
+
+bool agfx_eeee_native_context_source_dmabuf_caps(
+    AgfxEeeeNativeContext *context, struct qmu_source_dmabuf_caps_v1 *caps)
+{
+    bool bound = false;
+
+    if (!context || !caps) {
+        return false;
+    }
+    qemu_mutex_lock(&context->lock);
+    if (qatomic_read(&context->references) > 1) {
+        *caps = (struct qmu_source_dmabuf_caps_v1) {
+            .version = QMU_PRIVATE_SOURCE_DMABUF_CAPS_VERSION,
+            .struct_size = sizeof(*caps),
+            .owner_context = context,
+            .create = agfx_eeee_context_create_source_dmabuf,
+            .release = agfx_eeee_context_release_source_dmabuf,
+            .describe = agfx_eeee_context_describe_source_dmabuf,
         };
         bound = true;
     }

@@ -109,6 +109,9 @@ struct AppleGfxMLState;
 AgfxEeeeNativeContext *agfx_eeee_native_context_create(struct AppleGfxMLState *s);
 bool agfx_eeee_native_context_acquire(AgfxEeeeNativeContext *context,
                                      qmu_extended_callbacks *callbacks);
+struct qmu_source_dmabuf_caps_v1;
+bool agfx_eeee_native_context_source_dmabuf_caps(
+    AgfxEeeeNativeContext *, struct qmu_source_dmabuf_caps_v1 *);
 void agfx_eeee_native_context_release(void *context);
 /* Caller already owns the SAME acquired Context through full18 facilities.
  * No new reference/public callback schema/active publication is introduced. */

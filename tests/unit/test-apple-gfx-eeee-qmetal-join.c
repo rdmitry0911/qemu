@@ -13,6 +13,7 @@
 #include "system/system.h"
 #include "hw/display/apple-gfx-ml.h"
 #include "hw/display/apple-gfx-eeee-process-vm.h"
+#include "hw/display/apple-gfx-eeee-source-dmabuf-caps.h"
 #include "apple-gfx-eeee-qmetal-test-bridge.h"
 #include <sys/mman.h>
 
@@ -845,6 +846,86 @@ static void test_owned_context_busy_preserves_root_retry(void)
     g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 1);
 }
 
+/* Only the new actual caps binding/export output/lifetime; no GPU/CPU access
+ * to exported bytes. Existing original-source and twelve owner controls are
+ * inherited with their original identities, not run again here. */
+static void test_owned_source_dmabuf_caps(void)
+{
+    unsigned gfx_finalized = 0, ram_finalized = 0;
+    AppleGfxMLState *state = new_owned_gfx(&gfx_finalized);
+    AgfxEeeeNativeContext *context = agfx_eeee_native_context_create(state);
+    qmu_extended_callbacks cb = {};
+    struct qmu_source_backing_caps_v1 backing = {};
+    struct qmu_source_dmabuf_caps_v1 dma = {};
+    struct qmu_source_dmabuf_result_v1 result = {};
+    struct qmu_source_dmabuf_view_v1 view = {};
+    void *saved = NULL;
+    uint64_t address;
+
+    g_assert_false(agfx_eeee_native_context_source_dmabuf_caps(context, &dma));
+    g_assert_true(agfx_eeee_native_context_acquire(context, &cb));
+    g_assert_true(agfx_eeee_native_context_source_backing_caps(context, &backing));
+    g_assert_true(agfx_eeee_native_context_source_dmabuf_caps(context, &dma));
+    g_assert_cmpuint(dma.version, ==, QMU_PRIVATE_SOURCE_DMABUF_CAPS_VERSION);
+    g_assert_cmpuint(dma.struct_size, ==, sizeof(dma));
+    g_assert_true(dma.owner_context == backing.owner_context);
+    const uint64_t page = cb.eeee_task_host_page_size(state);
+    JoinRamOwner *owner = (JoinRamOwner *)object_new(TYPE_JOIN_RAM_OWNER);
+    owner->finalized = &ram_finalized;
+    int fd = qemu_memfd_create("eeee-dma-caps1231-real-source", 3 * page,
+        false, 0, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL, &error_abort);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_true(memory_region_init_ram_from_fd(&owner->ram, OBJECT(owner),
+        "eeee-dma-caps1231", 2 * page, RAM_SHARED, fd, page, &error_abort));
+    uint8_t *canonical = memory_region_get_ram_ptr(&owner->ram);
+    memset(canonical, 0x47, 2 * page); /* before export, no CPU-sync claim */
+    memory_region_add_subregion(get_system_memory(), JOIN_RAM_GPA, &owner->ram);
+    cb.eeee_task_lock(state);
+    cb.eeee_task_region_ref(state, &owner->ram);
+    cb.eeee_task_unlock(state);
+    g_assert_cmpint(cb.eeee_task_allocate(state, &address, page,
+        QMU_EEEE_TASK_ALLOCATE_ANYWHERE), ==, 1);
+    source_remap(state, &cb, address, page, canonical + page);
+    backing.capture(context, address + 17, 32, page, &saved);
+    g_assert_nonnull(saved);
+    dma.create(saved, &result);
+    if (!result.owner) {
+        g_test_message("actual DMA export failed stage=%u errno=%d interval=%u",
+            result.failure_stage, result.error_no, result.failed_interval);
+    }
+    g_assert_nonnull(result.owner);
+    g_assert_cmpuint(result.failure_stage, ==, 0);
+    g_assert_cmpint(result.error_no, ==, 0);
+    g_assert_true(dma.describe(result.owner, &view));
+    g_assert_cmpint(view.borrowed_fd, >=, 0);
+    g_assert_cmpuint(view.allocation_length, ==, page);
+    g_assert_cmpuint(view.visible_offset, ==, 17);
+    g_assert_cmpuint(view.visible_length, ==, 32);
+    g_assert_cmpint(fcntl(view.borrowed_fd, F_GETFD), >=, 0);
+
+    backing.release(saved);
+    cb.eeee_task_region_unref(state, &owner->ram);
+    g_assert_cmpint(cb.eeee_task_deallocate(state, address, page), ==, 0);
+    memory_region_del_subregion(get_system_memory(), &owner->ram);
+    object_unref(OBJECT(owner));
+    bql_unlock(); drain_call_rcu(); bql_lock();
+    g_assert_cmpuint(ram_finalized, ==, 0);
+    agfx_eeee_native_context_release(context);
+    agfx_eeee_native_context_stop_acquiring(context);
+    g_assert_true(agfx_eeee_native_context_retire(context));
+    object_unref(OBJECT(state));
+    g_assert_cmpuint(gfx_finalized, ==, 1);
+    /* No context or provider is alive. Only exact saved export state is read. */
+    g_assert_true(dma.describe(result.owner, &view));
+    g_assert_cmpint(fcntl(view.borrowed_fd, F_GETFD), >=, 0);
+    dma.release(result.owner);
+    g_assert_cmpuint(ram_finalized, ==, 1);
+    errno = 0;
+    g_assert_cmpint(fcntl(view.borrowed_fd, F_GETFD), ==, -1);
+    g_assert_cmpint(errno, ==, EBADF);
+    bql_unlock(); drain_call_rcu(); bql_lock();
+}
+
 int main(int argc, char **argv)
 {
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
@@ -876,6 +957,8 @@ int main(int argc, char **argv)
                     test_owned_context_busy_preserves_root_retry);
     g_test_add_func("/eeee/persistent-source/owned-capability-g1-dirty",
                     test_owned_source_backing_dirty_g1);
+    g_test_add_func("/eeee/source-dma/owned-caps-context-independent",
+                    test_owned_source_dmabuf_caps);
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();
