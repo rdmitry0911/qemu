@@ -689,6 +689,12 @@ static void test_owned_source_backing_dirty_g1(void)
     memory_region_del_subregion(get_system_memory(), &replacement->ram);
     object_unref(OBJECT(owner));
     object_unref(OBJECT(replacement));
+    // Retired address-space views also own the MR until their RCU return.
+    // Use the original persistent-source fixture's real drain before proving
+    // that the saved G1 source is the last remaining RAM owner.
+    bql_unlock();
+    drain_call_rcu();
+    bql_lock();
     g_assert_cmpuint(ram_finalized, ==, 0);
     caps.release(source);
     g_assert_cmpuint(ram_finalized, ==, 1);
