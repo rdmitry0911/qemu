@@ -22643,6 +22643,73 @@ bool agfx_eeee_native_context_acquire(AgfxEeeeNativeContext *context,
     return acquired;
 }
 
+static void agfx_eeee_context_capture_source_backing(
+    void *opaque, uint64_t address, uint64_t length, uint64_t alignment,
+    void **output)
+{
+    AgfxEeeeNativeContext *context = opaque;
+
+    /* An acquired owner remains valid after stop_acquiring, through its
+     * original accepted operation. Retirement cannot free State meanwhile. */
+    assert(context && output && qatomic_read(&context->references) > 1);
+    *output = agfx_eeee_source_backing_capture(
+        context->state->eeee_provider_state, address, length, alignment);
+}
+
+static void agfx_eeee_context_release_source_backing(void *source)
+{
+    agfx_eeee_source_backing_unref(source);
+}
+
+static bool agfx_eeee_context_describe_source_backing(
+    const void *opaque, struct qmu_source_backing_view_v1 *view)
+{
+    const AgfxEeeeSourceBacking *source = opaque;
+
+    if (!source || !view) {
+        return false;
+    }
+    *view = (struct qmu_source_backing_view_v1) {
+        .allocation = agfx_eeee_source_backing_allocation(source),
+        .allocation_length = agfx_eeee_source_backing_allocation_length(source),
+        .visible_pointer = agfx_eeee_source_backing_pointer(source),
+        .visible_offset = agfx_eeee_source_backing_visible_offset(source),
+        .visible_length = agfx_eeee_source_backing_length(source),
+    };
+    return true;
+}
+
+static bool agfx_eeee_context_dirty_source_backing(
+    void *source, uint64_t offset, uint64_t length)
+{
+    return agfx_eeee_source_backing_mark_dirty(source, offset, length);
+}
+
+bool agfx_eeee_native_context_source_backing_caps(
+    AgfxEeeeNativeContext *context, struct qmu_source_backing_caps_v1 *caps)
+{
+    bool bound = false;
+
+    if (!context || !caps) {
+        return false;
+    }
+    qemu_mutex_lock(&context->lock);
+    if (qatomic_read(&context->references) > 1) {
+        *caps = (struct qmu_source_backing_caps_v1) {
+            .version = QMU_PRIVATE_SOURCE_BACKING_CAPS_VERSION,
+            .struct_size = sizeof(*caps),
+            .owner_context = context,
+            .capture = agfx_eeee_context_capture_source_backing,
+            .release = agfx_eeee_context_release_source_backing,
+            .describe = agfx_eeee_context_describe_source_backing,
+            .mark_dirty = agfx_eeee_context_dirty_source_backing,
+        };
+        bound = true;
+    }
+    qemu_mutex_unlock(&context->lock);
+    return bound;
+}
+
 void agfx_eeee_native_context_release(void *opaque)
 {
     AgfxEeeeNativeContext *context = opaque;

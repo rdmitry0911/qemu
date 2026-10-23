@@ -601,6 +601,104 @@ static void assert_owned_native_window(AgfxTestOwnedContext *bridge,
     }
 }
 
+static void test_owned_source_backing_dirty_g1(void)
+{
+    unsigned gfx_finalized = 0, ram_finalized = 0;
+    AppleGfxMLState *state = new_owned_gfx(&gfx_finalized);
+    AgfxEeeeNativeContext *context = agfx_eeee_native_context_create(state);
+    qmu_extended_callbacks cb = {};
+    struct qmu_source_backing_caps_v1 caps = {};
+    struct qmu_source_backing_view_v1 view = {};
+    void *source = NULL;
+    uint64_t address;
+
+    g_assert_true(agfx_eeee_native_context_acquire(context, &cb));
+    g_assert_true(agfx_eeee_native_context_source_backing_caps(context, &caps));
+    g_assert_true(caps.owner_context == context);
+    const uint64_t page = cb.eeee_task_host_page_size(state);
+    const uint64_t span = 2 * page;
+    JoinRamOwner *owner = new_source_ram(4 * page, page);
+    JoinRamOwner *replacement = new_source_ram(4 * page, page);
+    uint8_t *original = memory_region_get_ram_ptr(&owner->ram);
+    uint8_t *changed = memory_region_get_ram_ptr(&replacement->ram);
+
+    owner->finalized = &ram_finalized;
+    memset(original, 0x47, 4 * page);
+    memset(changed, 0xc2, 4 * page);
+    memory_region_add_subregion(get_system_memory(), JOIN_RAM_GPA, &owner->ram);
+    memory_region_add_subregion(get_system_memory(), JOIN_ALIAS_GPA, &replacement->ram);
+    cb.eeee_task_lock(state);
+    cb.eeee_task_region_ref(state, &owner->ram);
+    cb.eeee_task_region_ref(state, &replacement->ram);
+    cb.eeee_task_unlock(state);
+    g_assert_cmpint(cb.eeee_task_allocate(state, &address, span,
+        QMU_EEEE_TASK_ALLOCATE_ANYWHERE), ==, 1);
+    source_remap(state, &cb, address, page, original + page);
+    source_remap(state, &cb, address + page, page, original + 2 * page);
+    caps.capture(caps.owner_context, address + 17, span - 34, page, &source);
+    g_assert_nonnull(source);
+    g_assert_true(caps.describe(source, &view));
+    g_assert_cmpuint(view.visible_offset, ==, 17);
+    g_assert_cmpuint(view.visible_length, ==, span - 34);
+    g_assert_true(view.visible_pointer == (uint8_t *)view.allocation + 17);
+
+    /* The same logical VA now names G2; retained physical bytes/dirty marks
+     * must still reach G1, including a write crossing saved-piece boundary. */
+    source_remap(state, &cb, address, span, changed + page);
+    memory_region_set_log(&owner->ram, true, DIRTY_MEMORY_VGA);
+    memory_region_set_log(&replacement->ram, true, DIRTY_MEMORY_VGA);
+    memory_region_reset_dirty(&owner->ram, 0, 4 * page, DIRTY_MEMORY_VGA);
+    memory_region_reset_dirty(&replacement->ram, 0, 4 * page, DIRTY_MEMORY_VGA);
+    uint8_t *visible = view.visible_pointer;
+    visible[page - 18] = 0x6a;
+    visible[page - 17] = 0x9b;
+    g_assert_cmpuint(original[2 * page - 1], ==, 0x6a);
+    g_assert_cmpuint(original[2 * page], ==, 0x9b);
+    g_assert_cmpuint(changed[2 * page - 1], ==, 0xc2);
+    g_assert_cmpuint(changed[2 * page], ==, 0xc2);
+    g_assert_true(caps.mark_dirty(source, page - 18, 2));
+    DirtyBitmapSnapshot *old_dirty = memory_region_snapshot_and_clear_dirty(
+        &owner->ram, 0, 4 * page, DIRTY_MEMORY_VGA);
+    DirtyBitmapSnapshot *new_dirty = memory_region_snapshot_and_clear_dirty(
+        &replacement->ram, 0, 4 * page, DIRTY_MEMORY_VGA);
+    for (unsigned i = 0; i < 4; ++i) {
+        g_assert_cmpint(memory_region_snapshot_get_dirty(&owner->ram, old_dirty,
+            i * page, page), ==, i == 1 || i == 2);
+        g_assert_false(memory_region_snapshot_get_dirty(&replacement->ram, new_dirty,
+            i * page, page));
+    }
+    g_free(old_dirty);
+    g_free(new_dirty);
+
+    cb.eeee_task_region_unref(state, &owner->ram);
+    cb.eeee_task_region_unref(state, &replacement->ram);
+    g_assert_cmpint(cb.eeee_task_deallocate(state, address, span), ==, 0);
+    agfx_eeee_native_context_stop_acquiring(context);
+    agfx_eeee_native_context_release(context);
+    g_assert_true(agfx_eeee_native_context_retire(context));
+    /* Saved metadata/dirty callbacks do not use the now-retired Context. */
+    g_assert_true(caps.describe(source, &view));
+    g_assert_true(caps.mark_dirty(source, 0, 1));
+    old_dirty = memory_region_snapshot_and_clear_dirty(
+        &owner->ram, 0, 4 * page, DIRTY_MEMORY_VGA);
+    g_assert_true(memory_region_snapshot_get_dirty(&owner->ram, old_dirty, page, page));
+    g_free(old_dirty);
+    memory_region_set_log(&owner->ram, false, DIRTY_MEMORY_VGA);
+    memory_region_set_log(&replacement->ram, false, DIRTY_MEMORY_VGA);
+    memory_region_del_subregion(get_system_memory(), &owner->ram);
+    memory_region_del_subregion(get_system_memory(), &replacement->ram);
+    object_unref(OBJECT(owner));
+    object_unref(OBJECT(replacement));
+    g_assert_cmpuint(ram_finalized, ==, 0);
+    caps.release(source);
+    g_assert_cmpuint(ram_finalized, ==, 1);
+    object_unref(OBJECT(state));
+    g_assert_cmpuint(gfx_finalized, ==, 1);
+    bql_unlock();
+    drain_call_rcu();
+    bql_lock();
+}
+
 static void test_owned_context_descendant_native_window(void)
 {
     unsigned gfx_finalized = 0;
@@ -770,6 +868,8 @@ int main(int argc, char **argv)
                     test_owned_context_retire_waits_last_mr_return);
     g_test_add_func("/eeee/owned-context/busy-preserves-root-retry",
                     test_owned_context_busy_preserves_root_retry);
+    g_test_add_func("/eeee/persistent-source/owned-capability-g1-dirty",
+                    test_owned_source_backing_dirty_g1);
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();

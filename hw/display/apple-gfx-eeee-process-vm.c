@@ -459,6 +459,33 @@ bool agfx_eeee_source_backing_interval(const AgfxEeeeSourceBacking *source,
     return true;
 }
 
+bool agfx_eeee_source_backing_mark_dirty(AgfxEeeeSourceBacking *source,
+                                        uint64_t offset, uint64_t length)
+{
+    uint64_t begin, end;
+
+    if (!source || offset > source->length || length > source->length - offset) {
+        return false;
+    }
+    begin = source->view_offset + offset;
+    end = begin + length;
+    /* Capture proved complete coverage and retains each real MemoryRegion.
+     * No State/task/current VA lookup or aliased-HVA dirty callback is used. */
+    for (guint i = 0; i < source->pieces->len; ++i) {
+        const AgfxEeeeSourcePiece *piece = &g_array_index(source->pieces,
+                                                         AgfxEeeeSourcePiece, i);
+        const uint64_t first = MAX(begin, piece->mapping_offset);
+        const uint64_t last = MIN(end, piece->mapping_offset + piece->length);
+
+        if (first < last) {
+            memory_region_set_dirty(piece->backing->region,
+                piece->region_offset + first - piece->mapping_offset,
+                last - first);
+        }
+    }
+    return true;
+}
+
 /* Each surviving interval owns its backing reference independently of the
  * provider's unique region set (8ad0fc7).  Retirement moves that reference,
  * without dropping it under the task mutex or changing RAM bytes. */

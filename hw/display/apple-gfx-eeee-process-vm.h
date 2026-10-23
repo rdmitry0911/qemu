@@ -14,6 +14,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "apple-gfx-eeee-source-backing-caps.h"
 
 typedef struct AgfxEeeeProviderState AgfxEeeeProviderState;
 typedef struct qmu_extended_callbacks qmu_extended_callbacks;
@@ -66,6 +67,12 @@ bool agfx_eeee_source_backing_interval(const AgfxEeeeSourceBacking *source,
                                      unsigned index,
                                      AgfxEeeeSourceInterval *interval);
 
+/* Dirty only the exact saved physical pieces, including after overwrite,
+ * task deallocate or State destruction. Offsets are in the visible range.
+ * Caller supplies actual GPU completion/visibility; this function adds none. */
+bool agfx_eeee_source_backing_mark_dirty(AgfxEeeeSourceBacking *source,
+                                        uint64_t offset, uint64_t length);
+
 /* State creation has no device-visible effect.  Realize installs it only in
  * the atomic EEEE session cutover, after the complete QMetal session has
  * accepted its source-derived receivers and reverse teardown owner. */
@@ -103,6 +110,10 @@ AgfxEeeeNativeContext *agfx_eeee_native_context_create(struct AppleGfxMLState *s
 bool agfx_eeee_native_context_acquire(AgfxEeeeNativeContext *context,
                                      qmu_extended_callbacks *callbacks);
 void agfx_eeee_native_context_release(void *context);
+/* Caller already owns the SAME acquired Context through full18 facilities.
+ * No new reference/public callback schema/active publication is introduced. */
+bool agfx_eeee_native_context_source_backing_caps(
+    AgfxEeeeNativeContext *context, struct qmu_source_backing_caps_v1 *caps);
 void agfx_eeee_native_context_stop_acquiring(AgfxEeeeNativeContext *context);
 bool agfx_eeee_native_context_retire(AgfxEeeeNativeContext *context);
 
