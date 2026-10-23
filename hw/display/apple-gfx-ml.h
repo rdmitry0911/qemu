@@ -28,7 +28,6 @@ typedef struct AgfxHostWork {
     qmu_session_work *work;
 } AgfxHostWork;
 typedef struct AgfxEeeeProviderState AgfxEeeeProviderState;
-typedef struct AgfxEeeeNativeContext AgfxEeeeNativeContext;
 typedef struct qmu_display_target qmu_display_target;
 struct AppleGfxMLFrameCompletionJob;
 struct AgfxBootstrapPresentCommand;
@@ -57,13 +56,6 @@ typedef struct AgfxCompletionJob {
 #define TYPE_APPLE_GFX_ML "apple-gfx-ml"
 OBJECT_DECLARE_SIMPLE_TYPE(AppleGfxMLState, APPLE_GFX_ML)
 
-/* Final physical RAM pin release, not logical task destruction. Caller must
- * drop the provider task mutex before entry; it owns the call to RETURN.
- * The outer lifecycle must permit main-loop dispatch while a worker waits,
- * just like ordinary unmap_gpa/iosfc_unmap; no BQL wait on the caller's locks.
- * Reuses the synchronous main-loop/BQL unpin leaf, with no State borrow in BH.
- * NULL is an immediate no-op (retired alias removal may hold the task lock). */
-void apple_gfx_ml_memory_region_unref_bql(MemoryRegion *region);
 void agfx_publish_display_mode(AppleGfxMLState *s, uint32_t width, uint32_t height,
                                uint32_t iosurface_pixel_format,
                                uint64_t protection_requirements);
@@ -101,7 +93,6 @@ struct AppleGfxMLState {
     /* Reserved for the indivisible EEEE provider/session cutover.  It is not
      * initialized or passed to QMetal by the legacy path. */
     AgfxEeeeProviderState *eeee_provider_state;
-    AgfxEeeeNativeContext *eeee_native_context;
 
     /* QEMU display */
     QemuConsole *con;
