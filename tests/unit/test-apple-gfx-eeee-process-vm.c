@@ -5,7 +5,7 @@
  * factory, boots no guest and performs no GPU or graphical acceptance.
  */
 #include "qemu/osdep.h"
-#include "block/aio-wait.h"
+#include "qemu/aio-wait.h"
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
 #include "qemu/memfd.h"
