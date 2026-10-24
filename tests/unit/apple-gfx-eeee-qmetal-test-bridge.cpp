@@ -193,3 +193,202 @@ extern "C" void agfx_test_owned_context_destroy(AgfxTestOwnedContext *owner)
 {
     delete owner;
 }
+
+/* Append after the existing real AgfxTestOwnedContext definition/functions.
+ * No product TU is copied. All constructor/root/retirement calls below are
+ * the candidate's normally compiled production implementation. */
+#include "qmu_eeee_pending_native_local_task_internal.h"
+#include "qmu_session_p0_internal.h"
+#include <exception>
+#include <optional>
+#include <stdexcept>
+
+namespace {
+void pending_require(bool condition, const char *message)
+{
+    if (!condition) throw std::logic_error(message); // fixture oracle only
+}
+uint64_t pending_load64(const void *source)
+{
+    const auto *p=static_cast<const unsigned char *>(source);
+    uint64_t value=0;
+    for (unsigned n=0;n<8;++n) value|=uint64_t(p[n])<<(8*n);
+    return value;
+}
+}
+struct AgfxTestPendingParentCall {
+    std::shared_ptr<OwnedQemuTaskFacilities> facilities;
+    qmu_config config{};
+    qmu_session *session{};
+    qmu::eeee::TaskCreateRequest request;
+    void *expected_root;
+    uint32_t expected_page_table_root;
+    std::shared_ptr<qmu::eeee::SourceStandardMtlReceiver> receiver;
+    qmu::SessionWork transferred_work;
+    std::optional<qmu_status> quiesce;
+    std::exception_ptr worker_exception,main_exception;
+    bool worker_returned{},session_creation_returned{},parent_completed{},destroy_returned{};
+    AgfxTestPendingParentCall(std::shared_ptr<OwnedQemuTaskFacilities> source,
+        uint32_t encoded,uint64_t length,uint32_t root,void *host,uint32_t pt)
+        : facilities(std::move(source)),request{encoded,length,root,false},
+          expected_root(host),expected_page_table_root(pt)
+    { config.display_width=config.display_height=4; }
+};
+extern "C" AgfxTestPendingParentCall *agfx_test_pending_parent_new(
+    AgfxTestOwnedContext *actual,uint32_t encoded,uint64_t length,uint32_t root,
+    void *host,uint32_t pt)
+{
+    try {
+        if (!actual || !actual->descendant.owner || !length || !root || !host || !pt)
+            return nullptr; // test input refusal, never a source task outcome
+        return new AgfxTestPendingParentCall(actual->descendant.owner,encoded,length,root,host,pt);
+    } catch (...) { return nullptr; } // before any new Session/provider entry
+}
+extern "C" void agfx_test_pending_parent_worker_cpp(
+    AgfxTestPendingParentCall *call,AgfxTestPendingParentAction action)
+{
+    // This entire extern-C entry catches C++ objects before returning through C.
+    try {
+        pending_require(call && !call->worker_exception && !call->main_exception,"caller custody");
+        switch (action) {
+        case AGFX_PENDING_CREATE_SESSION: {
+            pending_require(!call->session && !call->session_creation_returned,"create once");
+            const auto memory=qmu::eeee::owned_task_memory_callbacks(call->facilities);
+            qmu_callbacks callbacks{};
+            callbacks.user_ctx=memory.callbacks.context;
+            callbacks.map_gpa=memory.callbacks.map_gpa;
+            callbacks.unmap_gpa=memory.callbacks.unmap_gpa;
+            callbacks.read_memory=memory.callbacks.read_memory;
+            callbacks.mark_mapped_memory_dirty=memory.callbacks.mark_mapped_memory_dirty;
+            call->session=qmu_create(&call->config,&callbacks);
+            call->session_creation_returned=true;
+            pending_require(call->session!=nullptr,"actual Session creation returned NULL");
+            break;
+        }
+        case AGFX_PENDING_RUN_PARENT_PHASE: {
+            using namespace qmu::eeee;
+            pending_require(call->session && call->transferred_work && !call->parent_completed,
+                "genuine invocation Work");
+            qmu::SessionWorkScope invocation(call->transferred_work);
+            call->receiver=make_standard_mtl_receiver(call->session,
+                SourceStandardMtlQueryProfile::inherited_standard_feature_queries);
+            pending_require(bool(call->receiver),"actual standard source receiver");
+            auto reservation=qmu_session_p0_reserve_native_local_construction(
+                call->session,call->request.encoded_task_id>>1);
+            pending_require(reservation && reservation->owned_by_current_thread() &&
+                qmu_session_p0_owns_native_local_construction(call->session,*reservation),
+                "production same-thread canonical reservation");
+            const auto generated_key=reservation->key(); // observed, never manufactured
+            pending_require(generated_key.valid() &&
+                !reservation->terminal().current_task(generated_key.task_id).valid(),
+                "pending is not numerically published");
+            auto record=std::make_shared<SourceNativeLocalTaskRecord>(*reservation,call->request,
+                call->facilities,call->receiver,SourceNativeParentAllocation::plain_cpp_phase_only);
+            std::weak_ptr<SourceNativeLocalTaskRecord> old_record=record;
+            auto pending=PendingNativeLocalTask::adopt(call->session,std::move(reservation),
+                std::move(record)); // sole actual record owner moves into source packet
+            auto *actual=pending->record().get(); // borrow only; retire requires sole owner
+            pending_require(actual && actual->key()==generated_key &&
+                pending->phase()==PendingNativeLocalPhase::native_memory_ready &&
+                actual->facilities()==call->facilities && actual->receiver()==call->receiver,
+                "actual native CREATE/facilities/receiver phase");
+            const auto *list=actual->native_legacy_list().get();
+            std::weak_ptr<SourceNativeLegacyObjectList> old_list=actual->native_legacy_list();
+            pending_require(list && list->borrowed_task()==actual &&
+                list->task_length()==call->request.address_space_length &&
+                !list->placement_supported() && actual->provider() &&
+                actual->provider()->length()==call->request.address_space_length &&
+                actual->provider()->base_address()!=0,"real nonnull parent/list/provider");
+            {   // Actual mutex objects; all guards leave before native destruction.
+                std::unique_lock<std::shared_mutex> operation(actual->operation_mutex());
+                std::lock_guard<std::recursive_mutex> recursive(actual->recursive_mutex());
+                std::lock_guard<std::mutex> prepare(actual->prepare_mutex());
+                pending_require(actual->key()==generated_key,"same pending owner under its locks");
+            }
+            const SourceAuxiliaryAllocationService allocation{
+                SourceAuxiliaryFailureProfile::core_foundation_throw};
+            pending->construct_manager(false,allocation); // real anchored production wrapper
+            auto *manager=actual->manager();
+            pending_require(manager && manager->identity()==generated_key &&
+                manager->borrowed_record()==actual && manager->borrowed_terminal()==&actual->terminal() &&
+                manager->borrowed_source_mtl_receiver()==call->receiver.get() &&
+                manager->supplied_native_legacy_list().get()==list && !manager->supplied_list(),
+                "same source manager/native list, no model list");
+            pending_require(pending->setup_task_root() &&
+                pending->phase()==PendingNativeLocalPhase::root_ready &&
+                actual->root_pointer()==call->expected_root &&
+                actual->page_table_root_pfn()==call->expected_page_table_root &&
+                actual->page_table_depth()==1 && actual->iterator() &&
+                pending_load64(static_cast<unsigned char *>(actual->root_pointer())+0x14)==
+                    call->request.address_space_length,"actual source root callback and metadata");
+            pending_require(!actual->terminal().current_task(generated_key.task_id).valid(),
+                "root-ready component still not numerically published");
+            pending->retire_cpp_phase(); // SAME worker: root unmap/dirty RETURN, provider destroy, ACK
+            pending.reset();
+            pending_require(old_record.expired() && old_list.expired(),"last canonical owner RETURN");
+            call->receiver.reset();
+            call->parent_completed=true;
+            break;
+        }
+        case AGFX_PENDING_QUIESCE_SESSION:
+            pending_require(call->session && call->parent_completed && !call->transferred_work,
+                "quiesce outside owned Work");
+            qmu_session_begin_shutdown(call->session);
+            call->quiesce=qmu_session_quiesce_host_callback_producers(call->session);
+            pending_require(*call->quiesce==QMU_OK,"actual quiesce RETURN");
+            break;
+        case AGFX_PENDING_DESTROY_SESSION:
+            pending_require(call->session && call->quiesce && *call->quiesce==QMU_OK &&
+                !call->transferred_work,"destroy only after actual quiesce");
+            qmu_destroy(call->session);
+            call->session=nullptr; // only after actual destroy RETURN
+            call->destroy_returned=true;
+            break;
+        default: throw std::logic_error("test action mismatch");
+        }
+    } catch (...) {
+        if (call) call->worker_exception=std::current_exception();
+        // Production anchor retains actual escaped graph; reservation guard
+        // unwinds on THIS worker. Caller/facilities/Session are not destroyed.
+    }
+    if (call) call->worker_returned=true;
+}
+extern "C" AgfxTestPendingParentReturn agfx_test_pending_parent_main_cpp(
+    AgfxTestPendingParentCall *call,AgfxTestPendingParentAction action,
+    AgfxTestPendingParentDrive drive,void *context)
+{
+    try {
+        pending_require(call && drive && !call->worker_exception && !call->main_exception,
+            "main caller custody");
+        call->worker_returned=false;
+        if (action==AGFX_PENDING_RUN_PARENT_PHASE) {
+            call->transferred_work=qmu::SessionWork::for_call(call->session);
+            pending_require(bool(call->transferred_work),"accepted Work before worker publication");
+        }
+        drive(context,call,action); // returns only after normal C worker join
+        pending_require(call->worker_returned,"actual C worker RETURN");
+        call->transferred_work={};
+        if (call->worker_exception) std::rethrow_exception(call->worker_exception);
+        return AGFX_PENDING_CPP_RETURNED;
+    } catch (...) {
+        if (call) {
+            call->transferred_work={};
+            call->main_exception=std::current_exception(); // SAME original object/type
+        }
+        return AGFX_PENDING_CPP_ESCAPE_RETAINED; // host custody only, no SourceNS/result conversion
+    }
+}
+extern "C" qmu_session *agfx_test_pending_parent_session(const AgfxTestPendingParentCall *call)
+{ return call?call->session:nullptr; }
+extern "C" int agfx_test_pending_parent_completed(const AgfxTestPendingParentCall *call)
+{ return call && call->parent_completed; }
+extern "C" int agfx_test_pending_parent_quiesced(const AgfxTestPendingParentCall *call)
+{ return call && call->quiesce && *call->quiesce==QMU_OK; }
+extern "C" int agfx_test_pending_parent_delete_returned(AgfxTestPendingParentCall *call)
+{
+    if (!call || call->session || !call->destroy_returned || !call->parent_completed ||
+        call->receiver || call->transferred_work || call->worker_exception || call->main_exception)
+        return 0;
+    delete call; // last acquired full18 owner returns only after all native leaves
+    return 1;
+}

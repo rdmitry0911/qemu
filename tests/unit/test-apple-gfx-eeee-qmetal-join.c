@@ -1,7 +1,9 @@
 /* One missing real producer->actual compiled adapter/provider invocation.
  * Reuses the actual QEMU RAM/QOM fixture mechanics from918; it does not
  * repeat its nine standalone groups, realize a graphics device, initialize
- * a QMetal session/GPU, boot a guest or claim the containing FIFO lifetime. */
+ * a QMetal session/GPU, boot a guest or claim the containing FIFO lifetime.
+ * The separately filtered pending-parent group below DOES create a genuine
+ * native Session/Device; no GPU dispatch or guest runtime is claimed. */
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
@@ -926,6 +928,119 @@ static void test_owned_source_dmabuf_caps(void)
     bql_unlock(); drain_call_rcu(); bql_lock();
 }
 
+/* New single group in existing real QOM/full18 target. Unlike the inherited
+ * dormant context groups, this case creates a genuine Session/native Device.
+ * It does not realize a guest graphics device or boot a VM. */
+typedef struct PendingParentWorker {
+    AgfxTestPendingParentCall *call;
+    AgfxTestPendingParentAction action;
+    int done;
+} PendingParentWorker;
+typedef struct PendingParentDriver { AppleGfxMLState *state; } PendingParentDriver;
+
+static void *pending_parent_worker(void *opaque)
+{
+    PendingParentWorker *job = opaque;
+    rcu_register_thread();
+    g_assert_false(bql_locked());
+    agfx_test_pending_parent_worker_cpp(job->call, job->action);
+    rcu_unregister_thread();
+    qatomic_set(&job->done, 1);
+    aio_wait_kick(); /* no job/context access after completion publication */
+    return NULL;
+}
+static void pending_parent_drive(void *opaque, AgfxTestPendingParentCall *call,
+                                  AgfxTestPendingParentAction action)
+{
+    PendingParentDriver *driver = opaque;
+    PendingParentWorker job = { .call = call, .action = action };
+    QemuThread worker;
+    g_assert_true(bql_locked());
+    if (action == AGFX_PENDING_CREATE_SESSION) {
+        g_assert_null(driver->state->qmu_dev);
+        g_assert_null(agfx_test_pending_parent_session(call));
+    } else {
+        g_assert_true(driver->state->qmu_dev == agfx_test_pending_parent_session(call));
+    }
+    qemu_thread_create(&worker, "eeee-parent", pending_parent_worker, &job,
+                       QEMU_THREAD_JOINABLE);
+    const gint64 deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (!qatomic_read(&job.done)) {
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        aio_poll(qemu_get_aio_context(), false);
+        g_thread_yield();
+    }
+    qemu_thread_join(&worker); /* full C worker RETURN, not just done-store */
+    if (action == AGFX_PENDING_CREATE_SESSION && agfx_test_pending_parent_session(call)) {
+        driver->state->qmu_dev = agfx_test_pending_parent_session(call);
+    }
+    if (action == AGFX_PENDING_DESTROY_SESSION && !agfx_test_pending_parent_session(call)) {
+        driver->state->qmu_dev = NULL; /* only after actual qmu_destroy RETURN */
+    }
+}
+static void pending_store_le(uint8_t *destination, uint64_t value, unsigned bytes)
+{
+    for (unsigned n = 0; n < bytes; ++n) {
+        destination[n] = value >> (8 * n);
+    }
+}
+static void test_pending_native_parent_root(void)
+{
+    unsigned gfx_finalized = 0, ram_finalized = 0;
+    AppleGfxMLState *state = new_owned_gfx(&gfx_finalized);
+    AgfxEeeeNativeContext *context = agfx_eeee_native_context_create(state);
+    qmu_extended_callbacks callbacks = {};
+    AgfxTestOwnedContext *bridge = new_owned_bridge(context, &callbacks);
+    const uint64_t page = callbacks.eeee_task_host_page_size(state);
+    /* This selected constructor/root input is explicitly the 4K profile.
+     * Other host-page profiles are not silently substituted or skipped. */
+    g_assert_cmpuint(page, ==, 0x1000);
+    JoinRamOwner *ram = new_owned_source_ram(page);
+    ram->finalized = &ram_finalized;
+    uint8_t *canonical = memory_region_get_ram_ptr(&ram->ram);
+    uint8_t *root = canonical + page; /* actual alias GPA's original RAM page */
+    const uint32_t pte_root = (JOIN_RAM_GPA + 2 * page) >> 12;
+    const uint64_t task_length = 0x200000;
+    uint8_t before[0x1000];
+    pending_store_le(root, pte_root, 4);
+    pending_store_le(root + 4, 1, 4);
+    pending_store_le(root + 0x14, UINT64_C(0x6162636465666768), 8);
+    memcpy(before, root, sizeof(before));
+    const int before_refs = OBJECT(ram)->ref;
+    PendingParentDriver driver = { .state = state };
+    AgfxTestPendingParentCall *call = agfx_test_pending_parent_new(bridge,
+        2 * 41, task_length, JOIN_ALIAS_GPA >> 12, root, pte_root);
+    g_assert_nonnull(call);
+    agfx_test_owned_context_destroy(bridge); /* new caller owns actual acquired token */
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 0);
+    g_assert_cmpint(agfx_test_pending_parent_main_cpp(call, AGFX_PENDING_CREATE_SESSION,
+        pending_parent_drive, &driver), ==, AGFX_PENDING_CPP_RETURNED);
+    g_assert_nonnull(state->qmu_dev);
+    g_assert_cmpint(agfx_test_pending_parent_main_cpp(call, AGFX_PENDING_RUN_PARENT_PHASE,
+        pending_parent_drive, &driver), ==, AGFX_PENDING_CPP_RETURNED);
+    g_assert_true(agfx_test_pending_parent_completed(call));
+    /* Exact new source root effect; no page-table walk, initialSET or MAP. */
+    pending_store_le(before + 0x14, task_length, 8);
+    g_assert_cmpmem(root, sizeof(before), before, sizeof(before));
+    g_assert_cmpint(OBJECT(ram)->ref, ==, before_refs); /* final root MR RETURN joined */
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 0);
+    g_assert_cmpint(agfx_test_pending_parent_main_cpp(call, AGFX_PENDING_QUIESCE_SESSION,
+        pending_parent_drive, &driver), ==, AGFX_PENDING_CPP_RETURNED);
+    g_assert_true(agfx_test_pending_parent_quiesced(call));
+    g_assert_cmpint(agfx_test_pending_parent_main_cpp(call, AGFX_PENDING_DESTROY_SESSION,
+        pending_parent_drive, &driver), ==, AGFX_PENDING_CPP_RETURNED);
+    g_assert_null(state->qmu_dev);
+    g_assert_true(agfx_test_pending_parent_delete_returned(call));
+    g_assert_cmpuint(qatomic_read(&owned_context_release_calls), ==, 1);
+    agfx_eeee_native_context_stop_acquiring(context);
+    g_assert_true(agfx_eeee_native_context_retire(context));
+    detach_owned_source_ram(ram);
+    g_assert_cmpuint(ram_finalized, ==, 1);
+    object_unref(OBJECT(state));
+    g_assert_cmpuint(gfx_finalized, ==, 1);
+    g_test_message("PENDING_NATIVE_PARENT_COMPONENT_PASS real_QOM_full18=1 real_Session_Work=1 canonical_pending=1 nonnull_record_list=1 provider_root_RETURN=1 fullLocal=0 publication=0");
+}
+
 int main(int argc, char **argv)
 {
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
@@ -959,6 +1074,8 @@ int main(int argc, char **argv)
                     test_owned_source_backing_dirty_g1);
     g_test_add_func("/eeee/source-dma/owned-caps-context-independent",
                     test_owned_source_dmabuf_caps);
+    g_test_add_func("/eeee/pending-native-parent/canonical-provider-root",
+                    test_pending_native_parent_root);
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();

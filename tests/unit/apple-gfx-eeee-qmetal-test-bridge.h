@@ -27,6 +27,33 @@ int agfx_test_owned_context_native_window(
     void **actual_region, uint64_t *actual_region_offset);
 void agfx_test_owned_context_destroy(AgfxTestOwnedContext *owner);
 
+/* Append inside the existing test bridge extern-C block. Test glue only. */
+typedef struct AgfxTestPendingParentCall AgfxTestPendingParentCall;
+typedef enum AgfxTestPendingParentAction {
+    AGFX_PENDING_CREATE_SESSION,
+    AGFX_PENDING_RUN_PARENT_PHASE,
+    AGFX_PENDING_QUIESCE_SESSION,
+    AGFX_PENDING_DESTROY_SESSION
+} AgfxTestPendingParentAction;
+typedef enum AgfxTestPendingParentReturn {
+    AGFX_PENDING_CPP_RETURNED,
+    AGFX_PENDING_CPP_ESCAPE_RETAINED
+} AgfxTestPendingParentReturn;
+typedef void (*AgfxTestPendingParentDrive)(void *, AgfxTestPendingParentCall *,
+                                           AgfxTestPendingParentAction);
+AgfxTestPendingParentCall *agfx_test_pending_parent_new(
+    AgfxTestOwnedContext *, uint32_t encoded_task_id, uint64_t task_length,
+    uint32_t root_pfn, void *actual_root_pointer, uint32_t page_table_root_pfn);
+void agfx_test_pending_parent_worker_cpp(AgfxTestPendingParentCall *,
+                                         AgfxTestPendingParentAction);
+AgfxTestPendingParentReturn agfx_test_pending_parent_main_cpp(
+    AgfxTestPendingParentCall *, AgfxTestPendingParentAction,
+    AgfxTestPendingParentDrive, void *);
+qmu_session *agfx_test_pending_parent_session(const AgfxTestPendingParentCall *);
+int agfx_test_pending_parent_completed(const AgfxTestPendingParentCall *);
+int agfx_test_pending_parent_quiesced(const AgfxTestPendingParentCall *);
+int agfx_test_pending_parent_delete_returned(AgfxTestPendingParentCall *);
+
 #ifdef __cplusplus
 }
 #endif
