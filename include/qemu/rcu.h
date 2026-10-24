@@ -72,8 +72,6 @@ struct rcu_reader_data {
      */
     NotifierList force_rcu;
 
-    /* Owned by this reader's thread; real registry membership, not depth. */
-    bool registered;
 };
 
 QEMU_DECLARE_CO_TLS(struct rcu_reader_data, rcu_reader)

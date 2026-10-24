@@ -66,6 +66,9 @@ static inline int rcu_gp_ongoing(unsigned long *ctr)
  * writers.
  */
 QEMU_DEFINE_CO_TLS(struct rcu_reader_data, rcu_reader)
+/* Registry membership belongs to the same reader thread. Keep the existing
+ * reader allocation and by-value accessors byte-for-byte in their old ABI. */
+QEMU_DEFINE_STATIC_CO_TLS(bool, rcu_reader_registered)
 
 /* Protected by rcu_registry_lock.  */
 typedef QLIST_HEAD(, rcu_reader_data) ThreadList;
@@ -375,7 +378,7 @@ void rcu_register_thread(void)
     assert(get_ptr_rcu_reader()->ctr == 0);
     qemu_mutex_lock(&rcu_registry_lock);
     QLIST_INSERT_HEAD(&registry, get_ptr_rcu_reader(), node);
-    get_ptr_rcu_reader()->registered = true;
+    set_rcu_reader_registered(true);
     qemu_mutex_unlock(&rcu_registry_lock);
 }
 
@@ -383,13 +386,13 @@ void rcu_unregister_thread(void)
 {
     qemu_mutex_lock(&rcu_registry_lock);
     QLIST_REMOVE(get_ptr_rcu_reader(), node);
-    get_ptr_rcu_reader()->registered = false;
+    set_rcu_reader_registered(false);
     qemu_mutex_unlock(&rcu_registry_lock);
 }
 
 bool rcu_thread_is_registered(void)
 {
-    return get_ptr_rcu_reader()->registered;
+    return get_rcu_reader_registered();
 }
 
 void rcu_add_force_rcu_notifier(Notifier *n)
