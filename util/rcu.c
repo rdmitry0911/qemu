@@ -375,6 +375,7 @@ void rcu_register_thread(void)
     assert(get_ptr_rcu_reader()->ctr == 0);
     qemu_mutex_lock(&rcu_registry_lock);
     QLIST_INSERT_HEAD(&registry, get_ptr_rcu_reader(), node);
+    get_ptr_rcu_reader()->registered = true;
     qemu_mutex_unlock(&rcu_registry_lock);
 }
 
@@ -382,7 +383,13 @@ void rcu_unregister_thread(void)
 {
     qemu_mutex_lock(&rcu_registry_lock);
     QLIST_REMOVE(get_ptr_rcu_reader(), node);
+    get_ptr_rcu_reader()->registered = false;
     qemu_mutex_unlock(&rcu_registry_lock);
+}
+
+bool rcu_thread_is_registered(void)
+{
+    return get_ptr_rcu_reader()->registered;
 }
 
 void rcu_add_force_rcu_notifier(Notifier *n)

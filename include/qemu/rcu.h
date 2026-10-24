@@ -71,6 +71,9 @@ struct rcu_reader_data {
      * the thread!
      */
     NotifierList force_rcu;
+
+    /* Owned by this reader's thread; real registry membership, not depth. */
+    bool registered;
 };
 
 QEMU_DECLARE_CO_TLS(struct rcu_reader_data, rcu_reader)
@@ -125,6 +128,7 @@ void synchronize_rcu(void);
  */
 void rcu_register_thread(void);
 void rcu_unregister_thread(void);
+bool rcu_thread_is_registered(void);
 
 /*
  * Support for fork().  fork() support is enabled at startup.

@@ -780,9 +780,21 @@ static uint64_t agfx_eeee_task_host_page_size(void *ctx)
     return qemu_real_host_page_size();
 }
 
+/* QMetal's accepted workers are not QEMU-created RCU readers. Register the
+ * actual reader for exactly the outer callback interval, preserving existing
+ * QEMU/main readers and nested facility scopes on the same thread. */
+static __thread unsigned agfx_eeee_rcu_depth;
+static __thread bool agfx_eeee_rcu_registered_here;
+
 static void agfx_eeee_task_rcu_enter(void *ctx)
 {
     (void)agfx_eeee_state(ctx);
+    if (agfx_eeee_rcu_depth++ == 0) {
+        agfx_eeee_rcu_registered_here = !rcu_thread_is_registered();
+        if (agfx_eeee_rcu_registered_here) {
+            rcu_register_thread();
+        }
+    }
     rcu_read_lock();
 }
 
@@ -790,6 +802,10 @@ static void agfx_eeee_task_rcu_leave(void *ctx)
 {
     (void)agfx_eeee_state(ctx);
     rcu_read_unlock();
+    if (--agfx_eeee_rcu_depth == 0 && agfx_eeee_rcu_registered_here) {
+        rcu_unregister_thread();
+        agfx_eeee_rcu_registered_here = false;
+    }
 }
 
 static void agfx_eeee_task_lock(void *ctx)

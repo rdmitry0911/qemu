@@ -5,6 +5,7 @@
  * factory, boots no guest and performs no GPU or graphical acceptance.
  */
 #include "qemu/osdep.h"
+#include "block/aio-wait.h"
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
 #include "qemu/memfd.h"
@@ -417,6 +418,72 @@ static void test_separate_protect_facility(void)
     g_assert_true(agfx_eeee_provider_state_destroy(ctx.eeee_provider_state));
 }
 
+static void native_callback_rcu_read(Fixture *f)
+{
+    void *region = NULL;
+    uint64_t offset = 0, covered = 0;
+
+    f->cb.eeee_task_rcu_enter(&f->ctx);
+    f->cb.eeee_task_rcu_enter(&f->ctx);
+    g_assert_true(rcu_thread_is_registered());
+    g_assert_cmpint(f->cb.eeee_task_translate(&f->ctx, RAM_GPA + 17, 32, 0,
+                                            &region, &offset, &covered), ==, 1);
+    g_assert_true(region == &f->owner->ram);
+    g_assert_cmpuint(offset, ==, 17);
+    g_assert_cmpuint(covered, ==, 32);
+    g_assert_cmpint(f->cb.eeee_task_direct(&f->ctx, region, 0), ==, 1);
+    const uint8_t *actual = f->cb.eeee_task_ram_pointer(&f->ctx, region);
+    for (unsigned i = 0; i < 32; ++i) {
+        g_assert_cmpuint(actual[offset + i], ==, 0x47);
+    }
+    f->cb.eeee_task_rcu_leave(&f->ctx);
+    g_assert_true(rcu_thread_is_registered()); /* inner leave keeps outer */
+    f->cb.eeee_task_rcu_leave(&f->ctx);
+}
+
+typedef struct NativeCallbackRcuWork {
+    Fixture *fixture;
+    int done;
+} NativeCallbackRcuWork;
+
+static void *native_callback_rcu_worker(void *opaque)
+{
+    NativeCallbackRcuWork *work = opaque;
+
+    /* Deliberately no external registration: this is the QMetal worker
+     * callback domain which the old dormant provider did not own. */
+    g_assert_false(rcu_thread_is_registered());
+    for (unsigned round = 0; round < 2; ++round) {
+        native_callback_rcu_read(work->fixture);
+        g_assert_false(rcu_thread_is_registered());
+    }
+    qatomic_set(&work->done, 1);
+    aio_wait_kick();
+    return NULL;
+}
+
+static void test_native_callback_rcu_thread_domains(void)
+{
+    Fixture *f = fixture_new();
+    NativeCallbackRcuWork work = { .fixture = f };
+    QemuThread worker;
+
+    /* Preserve an already-registered real QEMU reader across nested scopes. */
+    g_assert_true(rcu_thread_is_registered());
+    native_callback_rcu_read(f);
+    g_assert_true(rcu_thread_is_registered());
+    qemu_thread_create(&worker, "eeee-callback-rcu", native_callback_rcu_worker,
+                       &work, QEMU_THREAD_JOINABLE);
+    const gint64 deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (!qatomic_read(&work.done)) {
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        aio_poll(qemu_get_aio_context(), false);
+        g_thread_yield();
+    }
+    qemu_thread_join(&worker);
+    fixture_free(f);
+}
+
 int main(int argc, char **argv)
 {
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
@@ -441,6 +508,8 @@ int main(int argc, char **argv)
     g_test_add_func("/eeee/native/overwrite-finalizer", test_overwrite_finalizer);
     g_test_add_func("/eeee/native/remap-finalizer", test_remap_finalizer);
     g_test_add_func("/eeee/mapped/separate-protect", test_separate_protect_facility);
+    g_test_add_func("/eeee/native/callback-rcu-thread-domains",
+                    test_native_callback_rcu_thread_domains);
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();

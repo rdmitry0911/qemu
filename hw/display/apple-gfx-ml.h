@@ -102,6 +102,7 @@ struct AppleGfxMLState {
      * initialized or passed to QMetal by the legacy path. */
     AgfxEeeeProviderState *eeee_provider_state;
     AgfxEeeeNativeContext *eeee_native_context;
+    void *eeee_native_factory_receipt;
 
     /* QEMU display */
     QemuConsole *con;
