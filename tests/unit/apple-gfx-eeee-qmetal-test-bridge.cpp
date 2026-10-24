@@ -216,7 +216,7 @@ uint64_t pending_load64(const void *source)
     return value;
 }
 }
-struct AgfxTestPendingParentCall {
+struct __attribute__((visibility("hidden"))) AgfxTestPendingParentCall {
     std::shared_ptr<OwnedQemuTaskFacilities> facilities;
     qmu_config config{};
     qmu_session *session{};
