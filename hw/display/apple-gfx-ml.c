@@ -565,6 +565,8 @@ struct AppleGfxMLFrameCompletionJob {
     uint32_t width;
     uint32_t height;
     uint32_t stride;
+    /* Diagnostic POD only; assigned by the serial BH, never an owner. */
+    uint32_t owned_output_diag_seq;
 };
 
 static void agfx_free_frame_completion_job(AppleGfxMLFrameCompletionJob *job)
@@ -23392,6 +23394,33 @@ static void apple_gfx_ml_apply_mode_change(AppleGfxMLState *s,
     }
 }
 
+/* Only the existing serial BH calls this: no new lock or native lifetime.
+ * The cap counts actual owned terminal BHs, including no-frame terminals. */
+static uint32_t agfx_owned_output_diag_begin(AppleGfxMLState *s,
+                                            qmu_owned_display_frame *frame)
+{
+    static int enabled = -1;
+    static uint32_t count;
+
+    if (!frame) {
+        return 0;
+    }
+    if (enabled < 0) {
+        const char *env = getenv("QMU_DIAG_OWNED_OUTPUT");
+        enabled = env && !strcmp(env, "1");
+    }
+    if (!enabled || count > 2048) {
+        return 0;
+    }
+    if (count == 2048) {
+        count++;
+        agfx_log(s, "OWNED_OUTPUT1358 stage=QEMU_CAP frame=%p cap=2048 "
+                 "status=UNKNOWN reason=truncated\n", (void *)frame);
+        return 0;
+    }
+    return ++count;
+}
+
 static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                                             AppleGfxMLFrameCompletionJob *job)
 {
@@ -23400,6 +23429,7 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
     uint32_t stride = 0;
     size_t frame_size = 0;
     bool copy_pixels = true;
+    qmu_display_target *owned_output_diag_current = NULL;
 
     if (!s || !job || !s->qmu_dev) {
         return false;
@@ -23409,6 +23439,14 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
      * reading the CURRENT physical output. Equal dimensions do not imply the
      * completed output is still current (A/B/A creates a different target). */
     if (!agfx_render_start_mode_is_current(s)) {
+        if (job->owned_output_diag_seq) {
+            agfx_log(s, "OWNED_OUTPUT1358 stage=QEMU_MODE_MISMATCH frame=%p "
+                     "bh_seq=%u render_width=%u render_height=%u "
+                     "current_width=%u current_height=%u\n",
+                     (void *)job->terminal_frame, job->owned_output_diag_seq,
+                     s->rendering_frame_width, s->rendering_frame_height,
+                     s->fb_width, s->fb_height);
+        }
         return false;
     }
 
@@ -23431,6 +23469,16 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
         job->width = width;
         job->height = height;
         job->stride = stride;
+        if (job->owned_output_diag_seq) {
+            owned_output_diag_current = selected_current;
+            agfx_log(s, "OWNED_OUTPUT1358 stage=QEMU_BEFORE_COPY frame=%p "
+                     "bh_seq=%u current=%p render_width=%u render_height=%u "
+                     "width=%u height=%u stride=%u present_next=%lu\n",
+                     (void *)job->terminal_frame, job->owned_output_diag_seq,
+                     (void *)selected_current, s->rendering_frame_width,
+                     s->rendering_frame_height, width, height, stride,
+                     (unsigned long)(qatomic_read(&s->present_count) + 1));
+        }
         /* Valid call returns only after successful exact read. Native unknown
          * or read failure escapes through the existing accepted-work C++
          * boundary; do not free this envelope, fake RETURN/apply or chain.
@@ -23442,6 +23490,15 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
          * still execute below against the unchanged current Console bytes. */
         copy_pixels = actual_read.pixels != NULL;
         job->frame_expected = actual_read.frame_expected != 0;
+        if (job->owned_output_diag_seq) {
+            agfx_log(s, "OWNED_OUTPUT1358 stage=QEMU_AFTER_COPY frame=%p "
+                     "bh_seq=%u current=%p copy_pixels=%d frame_expected=%d "
+                     "read_width=%u read_height=%u read_stride=%u\n",
+                     (void *)job->terminal_frame, job->owned_output_diag_seq,
+                     (void *)selected_current, copy_pixels ? 1 : 0,
+                     job->frame_expected ? 1 : 0, actual_read.width,
+                     actual_read.height, actual_read.stride);
+        }
     } else {
         /* Compatibility producers retain their original immutable carrier.
          * This CPU-only leaf is deliberately NOT physical-mode publication. */
@@ -23458,6 +23515,12 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
     }
 
     if (frame_size > s->display_fb_size) {
+        if (job->owned_output_diag_seq) {
+            agfx_log(s, "OWNED_OUTPUT1358 stage=QEMU_APPLY_REJECT frame=%p "
+                     "bh_seq=%u reason=frame_size frame_size=%zu capacity=%zu\n",
+                     (void *)job->terminal_frame, job->owned_output_diag_seq,
+                     frame_size, s->display_fb_size);
+        }
         return false;
     }
     if (copy_pixels) {
@@ -23494,6 +23557,21 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                      (unsigned long)(qatomic_read(&s->present_count) + 1),
                      (unsigned)(h ^ (h >> 32)),
                      (int)(total ? (nonblack * 100 / total) : 0));
+            if (job->owned_output_diag_seq) {
+                agfx_log(s, "OWNED_OUTPUT1358 stage=QEMU_APPLIED_HASH frame=%p "
+                         "bh_seq=%u current=%p copy_pixels=%d present=%lu "
+                         "hash=0x%08x nonblack=%d width=%u height=%u stride=%u\n",
+                         (void *)job->terminal_frame, job->owned_output_diag_seq,
+                         (void *)owned_output_diag_current, copy_pixels ? 1 : 0,
+                         (unsigned long)(qatomic_read(&s->present_count) + 1),
+                         (unsigned)(h ^ (h >> 32)),
+                         (int)(total ? (nonblack * 100 / total) : 0),
+                         width, height, stride);
+            }
+        } else if (job->owned_output_diag_seq) {
+            agfx_log(s, "OWNED_OUTPUT1358 stage=QEMU_APPLIED_NO_HASH frame=%p "
+                     "bh_seq=%u status=UNKNOWN reason=FRAME_CONTENT_disabled\n",
+                     (void *)job->terminal_frame, job->owned_output_diag_seq);
         }
     }
     {
@@ -23628,8 +23706,23 @@ static void apple_gfx_ml_frame_completed_bh(void *opaque)
     }
     _subk_t_after_pending = _subk_on ? subk_sig_timing_now_ns() : 0ULL;
 
+    job->owned_output_diag_seq = agfx_owned_output_diag_begin(s,
+                                                           job->terminal_frame);
+    if (job->owned_output_diag_seq && !job->frame_expected) {
+        agfx_log(s, "OWNED_OUTPUT1358 stage=QEMU_NO_FRAME frame=%p bh_seq=%u "
+                 "frame_expected=0 chain_needed=%d\n",
+                 (void *)job->terminal_frame, job->owned_output_diag_seq,
+                 job->chain_needed ? 1 : 0);
+    }
     frame_applied = job->frame_expected ? apple_gfx_ml_apply_staged_frame(s, job) : false;
     _subk_t_after_apply = _subk_on ? subk_sig_timing_now_ns() : 0ULL;
+    if (job->owned_output_diag_seq) {
+        agfx_log(s, "OWNED_OUTPUT1358 stage=QEMU_AFTER_APPLY frame=%p bh_seq=%u "
+                 "frame_expected=%d frame_applied=%d chain_needed=%d\n",
+                 (void *)job->terminal_frame, job->owned_output_diag_seq,
+                 job->frame_expected ? 1 : 0, frame_applied ? 1 : 0,
+                 job->chain_needed ? 1 : 0);
+    }
 
     if (agfx_log_should_emit(&s->frame_completed_log_count)) {
         agfx_log(s,
