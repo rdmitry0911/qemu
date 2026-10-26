@@ -25100,78 +25100,6 @@ static const GraphicHwOps agfx_gfx_ops = {
  * Device Lifecycle
  * ============================================================ */
 
-#include "qmu_native_eeee_factory_v1.h"
-static void agfx_run_lifecycle_work(void (*fn)(void*),void* opaque);
-typedef struct AgfxNativeEeeeOpenWork {
-    const struct qmu_private_native_eeee_factory_v1* factory;
-    void* receipt;
-    uint32_t result;
-} AgfxNativeEeeeOpenWork;
-static void agfx_native_eeee_open_work(void* opaque)
-{
-    AgfxNativeEeeeOpenWork* work=opaque;
-    work->result=work->factory->open(work->receipt); // noexcept C protocol
-}
-static qmu_session* agfx_create_native_eeee_host_session(AppleGfxMLState* s,
-    const qmu_extended_config* config,const qmu_extended_callbacks* legacy,
-    bool* retained_unknown,Error** errp)
-{
-    const struct qmu_private_native_eeee_factory_v1* factory=
-        qmu_get_private_native_eeee_factory_v1();
-    struct qmu_native_eeee_handoff_v1 handoff={
-        .version=QMU_PRIVATE_NATIVE_EEEE_FACTORY_VERSION,.struct_size=sizeof(handoff),
-        .prepare_profile=QMU_NATIVE_EEEE_PREPARE_IOACCEL_CONFIG14_NATIVE_OPTIONS0};
-    AgfxEeeeNativeContext* context;
-    qmu_session* result;
-    *retained_unknown=false;
-    if (!factory || factory->version!=QMU_PRIVATE_NATIVE_EEEE_FACTORY_VERSION ||
-        factory->struct_size!=sizeof(*factory) || !factory->prepare || !factory->open ||
-        !factory->take_returned_host_session || !factory->dispose_returned_receipt) {
-        error_setg(errp,"Private native EEEE factory ABI mismatch");return NULL;
-    }
-    context=agfx_eeee_native_context_create(s); // actual QOM/root owner
-    if (!context) { error_setg(errp,"Native EEEE Context binding unavailable");return NULL; }
-    if (!agfx_eeee_native_context_acquire(context,&handoff.full18)) {
-        error_setg(errp,"Native EEEE Context acquire unavailable");goto fail_root;
-    }
-    handoff.acquired_context=context;
-    handoff.release_context=agfx_eeee_native_context_release;
-    if (!agfx_eeee_native_context_source_backing_caps(context,&handoff.backing) ||
-        !agfx_eeee_native_context_source_dmabuf_caps(context,&handoff.dmabuf)) {
-        agfx_eeee_native_context_release(context);goto fail_caps;
-    }
-    s->eeee_native_factory_receipt=factory->prepare(config,legacy,&handoff);
-    if (!s->eeee_native_factory_receipt) {
-        // prepare NULL leaves acquired token on THIS real C caller.
-        agfx_eeee_native_context_release(context);goto fail_caps;
-    }
-    AgfxNativeEeeeOpenWork work={factory,s->eeee_native_factory_receipt,0};
-    agfx_run_lifecycle_work(agfx_native_eeee_open_work,&work); // main AIO pumps
-    if (work.result==QMU_NATIVE_EEEE_CPP_ESCAPE_RETAINED ||
-        work.result==QMU_NATIVE_EEEE_SOURCE_PROFILE_UNRETURNED) {
-        *retained_unknown=true;
-        error_setg(errp,"Native host factory did not return a qualified profile; exact owned receipt retained");
-        return NULL; // NEVER run fail_sync/destroy State callback fields
-    }
-    if (work.result==QMU_NATIVE_EEEE_HOST_FACTORY_RETURNED_NULL) {
-        if (!factory->dispose_returned_receipt(s->eeee_native_factory_receipt)) abort();
-        s->eeee_native_factory_receipt=NULL;goto fail_caps;
-    }
-    if (work.result!=QMU_NATIVE_EEEE_HOST_SESSION_RETURNED) abort();
-    result=factory->take_returned_host_session(s->eeee_native_factory_receipt);
-    if (!factory->dispose_returned_receipt(s->eeee_native_factory_receipt)) abort();
-    s->eeee_native_factory_receipt=NULL;
-    return result; // same Device/source owner; NOT full Local init acceptance
-fail_caps:
-    error_setg(errp,"Native EEEE host factory returned unavailable/null");
-fail_root:
-    agfx_eeee_native_context_stop_acquiring(context);
-    if (!agfx_eeee_native_context_retire(context)) {
-        *retained_unknown=true; // actual busy root preserved, no State teardown
-    }
-    return NULL;
-}
-
 static void agfx_realize(PCIDevice *pci_dev, Error **errp)
 {
     AppleGfxMLState *s = APPLE_GFX_ML(pci_dev);
@@ -25311,13 +25239,9 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     qmu_config.mode_data[2] = (1024u << 16) | 1280u;
     qmu_config.mode_count = 3;
 
-    bool retained_native_factory = false;
-    s->qmu_dev = agfx_create_native_eeee_host_session(
-        s, &qmu_config, &qmu_callbacks, &retained_native_factory, errp);
+    s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
     if (!s->qmu_dev) {
-        if (retained_native_factory) {
-            return; /* Same QOM/Context/receipt preserved on unknown escape. */
-        }
+        error_setg(errp, "Failed to create qmetal device");
         goto fail_sync;
     }
 
@@ -25453,7 +25377,6 @@ static void agfx_exit(PCIDevice *pci_dev)
     object_ref(OBJECT(s));
 
     qatomic_set(&s->exiting, true);
-    agfx_eeee_native_context_stop_acquiring(s->eeee_native_context);
     agfx_log(s, "[apple-gfx-ml] Device exit\n");
     if (qatomic_read(&s->guest_sched_exec3_cmdbuf_wp_armed) != 0) {
         uint64_t addr =
@@ -25557,9 +25480,6 @@ static void agfx_exit(PCIDevice *pci_dev)
     agfx_run_lifecycle_work(agfx_destroy_qmu, s);
     s->qmu_dev = NULL;
 
-    /* Source/native descendants return before their actual Context/root retires.
-     * AIO wait releases BQL for final native MR/context releases. */
-    AIO_WAIT_WHILE(NULL, !agfx_eeee_native_context_retire(s->eeee_native_context));
     agfx_completion_queue_destroy(s);
     qemu_mutex_destroy(&s->mmio_job_mutex);
     qemu_mutex_destroy(&s->session_mutex);

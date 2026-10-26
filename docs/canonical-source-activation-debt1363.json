@@ -1,0 +1,26 @@
+{
+  "status": "DEFERRED_CANONICAL_PRODUCTION_ACTIVATION_AFTER_REAL_E2E_REGRESSION",
+  "QMetal_accepted_main": "7addd0a0a45dddf29d784c5c5b7ed18b0054cd35",
+  "preserved_QEMU_donor": "5189e946841cb257c7a17b409911186c7864d6af",
+  "preserved_branch": "fix/source-activation1363-20261026",
+  "restored_production_source": "ea16eb6536cc4cba7546b2849673832c8355992c",
+  "failed_E2E": {
+    "path": "/srv/project/apple-virgl/evidence/runs/eeee-active-backing1363-r1/END.json",
+    "bytes": 22396,
+    "sha256": "c24ef54472810f152946c24b1e875ab8f5f729521cc7c1263c112b5aee346eb5"
+  },
+  "negative": {
+    "path": "/srv/project/apple-virgl/evidence/runs/20261014-qmetal-parallel/whole1363-cold-list-custody-main/NEGATIVE892.json",
+    "bytes": 1349,
+    "sha256": "d1847e9fc838e75c2cef38229eb7a8802d904b9c7e64ed7379ceee5b8054493d"
+  },
+  "before": "Canonicalselection regressed boot to firstEXEC CPU-unreturned beforeLoginUI.",
+  "after": "Exact prior legacyproduction source restored; acceptednewQMnativeowners retained. Legacygraphicspath applicability inherited; exact restoredtuple runtime remains separatepending.",
+  "accepted_coverage_preserved": "QMetalactualcanonical4/5/Nub/sharedvalidity/nativefirstaccess/lifetime/shutdown/sourceworker gates stayacceptedonmain. QEMUprovider/caps/RCU/capturecode unchanged; activation donor staysinbranch/history.",
+  "unclosed": [
+    "Actual firstEXEC SourceLocalCpuUnreturned causalCPUcontract, token/endpointidentity metadata mismatch",
+    "Canonicalproductionaliasactivation E2E acceptance",
+    "Desktop correctness/Finder/Screensaver/AB/reference/nativeeee1"
+  ],
+  "next": "From restoredcurrentmain, recover/close exact SourceCPU contract using source and priorSource846 solution/history, then re-admit canonicalactivation. No acceptedunit discarded/no callback/token/default-success workaround."
+}
