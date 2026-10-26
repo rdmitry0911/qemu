@@ -23599,6 +23599,10 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
             static int agfx_capture_dir_init;
             static int agfx_capture_dir_ok;
             static unsigned long agfx_capture_start;
+            static unsigned long agfx_capture_max;
+            static unsigned long agfx_capture_attempts;
+            static const char *agfx_capture_arm_file;
+            static bool agfx_capture_armed;
             if (!agfx_capture_dir_init) {
                 const char *env = getenv("AGFX_FRAME_CAPTURE_DIR_ALL");
                 const char *start_env = getenv("AGFX_FRAME_CAPTURE_START");
@@ -23619,10 +23623,53 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                                  "mkdir failed errno=%d\n", env, errno);
                     }
                 }
+                const char *max_env = getenv("AGFX_FRAME_CAPTURE_MAX");
+                if (max_env && max_env[0]) {
+                    char *end = NULL;
+                    errno = 0;
+                    agfx_capture_max = strtoul(max_env, &end, 10);
+                    if (errno || end == max_env || *end ||
+                        !agfx_capture_max || agfx_capture_max > 4096) {
+                        agfx_capture_dir_ok = 0;
+                        agfx_log(s, "FRAME_CAPTURE_FAILED reason=max_invalid\n");
+                    }
+                }
+                const char *arm_env = getenv("AGFX_FRAME_CAPTURE_ARM_FILE");
+                if (arm_env && arm_env[0]) {
+                    agfx_capture_arm_file = arm_env;
+                    if (arm_env[0] != '/' || !agfx_capture_max) {
+                        agfx_capture_dir_ok = 0;
+                        agfx_log(s, "FRAME_CAPTURE_FAILED reason=arm_requires_absolute_path_and_max\n");
+                    }
+                } else {
+                    agfx_capture_armed = true;
+                }
                 agfx_capture_dir_init = 1;
             }
+            /* Reuse the saved ARM_FILE donor: ENOENT is an inert postauth
+             * barrier, not a failed output open. Never retry a bad arm path. */
+            if (agfx_capture_dir_ok && !agfx_capture_armed &&
+                agfx_capture_arm_file) {
+                struct stat arm;
+                if (lstat(agfx_capture_arm_file, &arm) == 0) {
+                    if (S_ISREG(arm.st_mode) && !S_ISLNK(arm.st_mode)) {
+                        agfx_capture_armed = true;
+                        agfx_log(s, "FRAME_CAPTURE_ARMED next_present=%lu\n",
+                                 (unsigned long)pc);
+                    } else {
+                        agfx_capture_dir_ok = 0;
+                        agfx_log(s, "FRAME_CAPTURE_FAILED reason=arm_invalid\n");
+                    }
+                } else if (errno != ENOENT) {
+                    agfx_capture_dir_ok = 0;
+                    agfx_log(s, "FRAME_CAPTURE_FAILED reason=arm_unreadable\n");
+                }
+            }
             if (agfx_capture_dir_ok && agfx_capture_dir &&
+                agfx_capture_armed &&
+                (!agfx_capture_max || agfx_capture_attempts < agfx_capture_max) &&
                 (unsigned long)pc >= agfx_capture_start) {
+                ++agfx_capture_attempts;
                 char ppm_path[PATH_MAX];
                 int n = snprintf(ppm_path, sizeof(ppm_path),
                                  "%s/frame_%06lu.ppm",
@@ -23630,10 +23677,12 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                 if (n > 0 && n < (int)sizeof(ppm_path)) {
                     FILE *f = fopen(ppm_path, "wb");
                     if (f) {
-                        fprintf(f, "P6\n%u %u\n255\n", width, height);
+                        bool complete = fprintf(f, "P6\n%u %u\n255\n",
+                                                width, height) > 0;
                         const uint8_t *src = (const uint8_t *)s->display_fb;
-                        uint8_t *rgb = g_malloc((size_t)width * 3);
-                        for (uint32_t y = 0; y < height; y++) {
+                        uint8_t *rgb = g_try_malloc((size_t)width * 3);
+                        complete = complete && rgb;
+                        for (uint32_t y = 0; complete && y < height; y++) {
                             const uint8_t *row =
                                 src + (size_t)y * stride;
                             for (uint32_t x = 0; x < width; x++) {
@@ -23643,16 +23692,39 @@ static bool apple_gfx_ml_apply_staged_frame(AppleGfxMLState *s,
                                 rgb[x * 3 + 1] = row[x * 4 + 1];
                                 rgb[x * 3 + 2] = row[x * 4 + 0];
                             }
-                            fwrite(rgb, 1, (size_t)width * 3, f);
+                            complete = fwrite(rgb, 1, (size_t)width * 3, f) ==
+                                       (size_t)width * 3;
                         }
                         g_free(rgb);
-                        fclose(f);
-                    } else if (pc <= AGFX_LOG_INITIAL_COUNT) {
-                        agfx_log(s,
-                                 "[apple-gfx-ml] AGFX_FRAME_CAPTURE_DIR_ALL: "
-                                 "fopen %s failed errno=%d\n",
-                                 ppm_path, errno);
+                        if (fclose(f) != 0) complete = false;
+                        if (complete) {
+                            agfx_log(s, "FRAME_CAPTURED n=%lu frame=%p bh_seq=%u "
+                                     "console=%p fb=%p width=%u height=%u "
+                                     "stride=%u path=%s\n",
+                                     (unsigned long)pc,
+                                     (void *)job->terminal_frame,
+                                     job->owned_output_diag_seq,
+                                     (void *)s->con, (void *)s->display_fb,
+                                     width, height, stride, ppm_path);
+                        } else {
+                            agfx_capture_dir_ok = 0;
+                            agfx_log(s, "FRAME_CAPTURE_FAILED n=%lu reason=write_or_close\n",
+                                     (unsigned long)pc);
+                        }
+                    } else {
+                        agfx_capture_dir_ok = 0;
+                        agfx_log(s, "FRAME_CAPTURE_FAILED n=%lu reason=open errno=%d\n",
+                                 (unsigned long)pc, errno);
                     }
+                } else {
+                    agfx_capture_dir_ok = 0;
+                    agfx_log(s, "FRAME_CAPTURE_FAILED n=%lu reason=path_length\n",
+                             (unsigned long)pc);
+                }
+                if (agfx_capture_max &&
+                    agfx_capture_attempts == agfx_capture_max) {
+                    agfx_log(s, "FRAME_CAPTURE_LIMIT_REACHED attempts=%lu max=%lu\n",
+                             agfx_capture_attempts, agfx_capture_max);
                 }
             }
         }
