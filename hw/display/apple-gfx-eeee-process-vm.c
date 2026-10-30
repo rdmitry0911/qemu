@@ -20,6 +20,8 @@
 
 #include "apple-gfx-ml.h"
 #include "apple-gfx-eeee-process-vm.h"
+#include "apple-gfx-eeee-source-dmabuf.h"
+#include "apple-gfx-ordinary-physical-capture.h"
 #include "qmu/qmetal_unified.h"
 
 #include <sys/mman.h>
@@ -145,7 +147,9 @@ static void agfx_eeee_physical_backing_unref(AgfxEeeePhysicalBacking *backing)
      * Keep our independently pinned MR before releasing this reference. */
     region = backing->region;
     if (qatomic_fetch_dec(&backing->references) == 1) {
-        close(backing->fd);
+        if (backing->fd >= 0) {
+            close(backing->fd);
+        }
         g_free(backing);
     }
     apple_gfx_ml_memory_region_unref_bql(region);
@@ -295,6 +299,50 @@ void agfx_eeee_source_backing_unref(AgfxEeeeSourceBacking *source)
     g_free(source);
 }
 
+/* The already-owned immutable pieces are the only inputs. Shared by the
+ * legacy provider capture and the independent ordinary physical endpoint;
+ * neither caller may invent uncovered bytes or replace a foreign VA. */
+static bool agfx_source_backing_map_pieces(AgfxEeeeSourceBacking *source,
+                                          uint64_t alignment)
+{
+    uint64_t mapped_length = source->mapped_length;
+    void *reservation;
+    uint64_t reservation_length, aligned_address, prefix, suffix;
+
+    reservation_length = mapped_length + alignment;
+    reservation = mmap(NULL, reservation_length, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reservation == MAP_FAILED) {
+        return false;
+    }
+    aligned_address = ((uint64_t)(uintptr_t)reservation + alignment - 1) &
+                      ~(alignment - 1);
+    prefix = aligned_address - (uint64_t)(uintptr_t)reservation;
+    suffix = reservation_length - prefix - mapped_length;
+    if ((prefix && munmap(reservation, prefix)) ||
+        (suffix && munmap((void *)(uintptr_t)(aligned_address + mapped_length),
+                         suffix))) {
+        abort();
+    }
+    source->mapping = (void *)(uintptr_t)aligned_address;
+    for (guint i = 0; i < source->pieces->len; ++i) {
+        const AgfxEeeeSourcePiece *piece = &g_array_index(source->pieces,
+                                                         AgfxEeeeSourcePiece, i);
+        void *target = (uint8_t *)source->mapping + piece->mapping_offset;
+        void *mapped = mmap(target, piece->length, PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_FIXED, piece->backing->fd,
+                            piece->backing->file_offset + piece->region_offset);
+
+        if (mapped == MAP_FAILED) {
+            return false;
+        }
+        if (mapped != target) {
+            abort();
+        }
+    }
+    return true;
+}
+
 AgfxEeeeSourceBacking *agfx_eeee_source_backing_capture(
     AgfxEeeeProviderState *state, uint64_t address, uint64_t length,
     uint64_t alignment)
@@ -303,8 +351,6 @@ AgfxEeeeSourceBacking *agfx_eeee_source_backing_capture(
     uint64_t start, view_offset, mapped_length, position;
     AgfxEeeeAllocation *allocation;
     AgfxEeeeSourceBacking *source;
-    void *reservation;
-    uint64_t reservation_length, aligned_address, prefix, suffix;
     bool covered = true;
 
     if (!state || !page || alignment < page ||
@@ -367,41 +413,9 @@ AgfxEeeeSourceBacking *agfx_eeee_source_backing_capture(
         return NULL;
     }
 
-    /* From here only immutable physical refs are used. Logical replacement
-     * can proceed now; capture no longer needs State, task or its mutable VA.
-     * Reserve our own aligned VA, then replace only that owned reservation. */
-    reservation_length = mapped_length + alignment;
-    reservation = mmap(NULL, reservation_length, PROT_NONE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (reservation == MAP_FAILED) {
+    if (!agfx_source_backing_map_pieces(source, alignment)) {
         agfx_eeee_source_backing_unref(source);
         return NULL;
-    }
-    aligned_address = ((uint64_t)(uintptr_t)reservation + alignment - 1) &
-                      ~(alignment - 1);
-    prefix = aligned_address - (uint64_t)(uintptr_t)reservation;
-    suffix = reservation_length - prefix - mapped_length;
-    if ((prefix && munmap(reservation, prefix)) ||
-        (suffix && munmap((void *)(uintptr_t)(aligned_address + mapped_length),
-                         suffix))) {
-        abort();
-    }
-    source->mapping = (void *)(uintptr_t)aligned_address;
-    for (guint i = 0; i < source->pieces->len; ++i) {
-        const AgfxEeeeSourcePiece *piece = &g_array_index(source->pieces,
-                                                         AgfxEeeeSourcePiece, i);
-        void *target = (uint8_t *)source->mapping + piece->mapping_offset;
-        void *mapped = mmap(target, piece->length, PROT_READ | PROT_WRITE,
-                            MAP_SHARED | MAP_FIXED, piece->backing->fd,
-                            piece->backing->file_offset + piece->region_offset);
-
-        if (mapped == MAP_FAILED) {
-            agfx_eeee_source_backing_unref(source);
-            return NULL;
-        }
-        if (mapped != target) {
-            abort();
-        }
     }
     return source;
 }
@@ -783,29 +797,39 @@ static uint64_t agfx_eeee_task_host_page_size(void *ctx)
 /* QMetal's accepted workers are not QEMU-created RCU readers. Register the
  * actual reader for exactly the outer callback interval, preserving existing
  * QEMU/main readers and nested facility scopes on the same thread. */
-static __thread unsigned agfx_eeee_rcu_depth;
-static __thread bool agfx_eeee_rcu_registered_here;
+static __thread unsigned agfx_memory_rcu_depth;
+static __thread bool agfx_memory_rcu_registered_here;
 
-static void agfx_eeee_task_rcu_enter(void *ctx)
+static void agfx_memory_rcu_enter(void)
 {
-    (void)agfx_eeee_state(ctx);
-    if (agfx_eeee_rcu_depth++ == 0) {
-        agfx_eeee_rcu_registered_here = !rcu_thread_is_registered();
-        if (agfx_eeee_rcu_registered_here) {
+    if (agfx_memory_rcu_depth++ == 0) {
+        agfx_memory_rcu_registered_here = !rcu_thread_is_registered();
+        if (agfx_memory_rcu_registered_here) {
             rcu_register_thread();
         }
     }
     rcu_read_lock();
 }
 
+static void agfx_memory_rcu_leave(void)
+{
+    rcu_read_unlock();
+    if (--agfx_memory_rcu_depth == 0 && agfx_memory_rcu_registered_here) {
+        rcu_unregister_thread();
+        agfx_memory_rcu_registered_here = false;
+    }
+}
+
+static void agfx_eeee_task_rcu_enter(void *ctx)
+{
+    (void)agfx_eeee_state(ctx);
+    agfx_memory_rcu_enter();
+}
+
 static void agfx_eeee_task_rcu_leave(void *ctx)
 {
     (void)agfx_eeee_state(ctx);
-    rcu_read_unlock();
-    if (--agfx_eeee_rcu_depth == 0 && agfx_eeee_rcu_registered_here) {
-        rcu_unregister_thread();
-        agfx_eeee_rcu_registered_here = false;
-    }
+    agfx_memory_rcu_leave();
 }
 
 static void agfx_eeee_task_lock(void *ctx)
@@ -1004,4 +1028,236 @@ void agfx_eeee_provider_fill_callbacks(qmu_extended_callbacks *callbacks)
     callbacks->eeee_task_remove = agfx_eeee_task_remove;
     callbacks->eeee_task_host_write = agfx_eeee_task_host_write;
     callbacks->eeee_task_fatal = agfx_eeee_task_fatal;
+}
+
+/* Independent original-GPA capture: no provider allocation table, SourceTask,
+ * task-VA lookup, or extended-callback publication is involved. */
+typedef struct AgfxOrdinaryPhysicalSpan {
+    AgfxEeeeSourceBacking *source;
+    AgfxEeeeSourceDmaBuf *dma_export;
+    AgfxEeeeDmaBufFailure export_failure;
+    uint32_t task_id, resource_id;
+    uint64_t task_epoch, object_epoch, source_va;
+    bool complete;
+} AgfxOrdinaryPhysicalSpan;
+
+typedef struct AgfxOrdinaryPhysicalDomain {
+    const struct qmu_ordinary_physical_request_v2 *request;
+    bool intersects_iommu;
+} AgfxOrdinaryPhysicalDomain;
+
+/* Inspect immutable FlatView slices BEFORE flatview_translate can invoke any
+ * IOMMU attrs/translation callback. The admitted ordinary inputs are system
+ * physical RAM GPAs, not device-DMA IOVAs. This does not reject an unrelated
+ * IOMMU range, replace a guest page or silently try another representation. */
+static bool agfx_ordinary_physical_check_domain(Int128 start, Int128 length,
+    const MemoryRegion *region, hwaddr offset_in_region, void *opaque)
+{
+    AgfxOrdinaryPhysicalDomain *domain = opaque;
+
+    (void)offset_in_region;
+    if (!memory_region_is_iommu((MemoryRegion *)region)) {
+        return false;
+    }
+    for (uint64_t i = 0; i < domain->request->piece_count; ++i) {
+        const struct qmu_ordinary_physical_piece_v2 *piece =
+            &domain->request->pieces[i];
+        Int128 first = int128_make64(piece->gpa);
+        Int128 last = int128_add(first, int128_make64(piece->length));
+
+        if (int128_lt(start, last) &&
+            int128_lt(first, int128_add(start, length))) {
+            domain->intersects_iommu = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+void agfx_ordinary_physical_capture(void *context,
+    const struct qmu_ordinary_physical_request_v2 *request, void **output)
+{
+    const uint64_t page = qemu_real_host_page_size();
+    uint64_t position = 0;
+    AgfxOrdinaryPhysicalSpan *span;
+    AgfxEeeeSourceBacking *source;
+    FlatView *view;
+    AgfxOrdinaryPhysicalDomain domain = { .request = request };
+
+    if (!output || *output || !request ||
+        request->version != QMU_PRIVATE_ORDINARY_PHYSICAL_CAPTURE_V2_VERSION ||
+        request->struct_size != sizeof(*request) || !page ||
+        !request->pieces || !request->piece_count ||
+        request->piece_count > G_MAXUINT ||
+        request->piece_count > SIZE_MAX / sizeof(AgfxEeeeSourcePiece) ||
+        !request->allocation_length || !request->literal_length ||
+        request->allocation_length > SIZE_MAX ||
+        request->allocation_alignment < page ||
+        (request->allocation_alignment & (request->allocation_alignment - 1)) ||
+        request->allocation_length > SIZE_MAX - request->allocation_alignment ||
+        request->allocation_length % page ||
+        request->visible_offset > request->allocation_length ||
+        request->literal_length > request->allocation_length - request->visible_offset) {
+        return; /* no physical effect or owner was acquired */
+    }
+    for (uint64_t i = 0; i < request->piece_count; ++i) {
+        const struct qmu_ordinary_physical_piece_v2 *piece = &request->pieces[i];
+        if (piece->logical_offset != position || !piece->mapped_pointer ||
+            !agfx_eeee_page_range(piece->gpa, piece->length) ||
+            (uintptr_t)piece->mapped_pointer % page ||
+            piece->length > request->allocation_length - position) {
+            return;
+        }
+        position += piece->length;
+    }
+    if (position != request->allocation_length ||
+        !agfx_ordinary_physical_capture_enter(context)) {
+        return;
+    }
+    span = g_new0(AgfxOrdinaryPhysicalSpan, 1);
+    span->export_failure = (AgfxEeeeDmaBufFailure) {
+        AGFX_DMABUF_NONE, 0, UINT_MAX };
+    source = g_new0(AgfxEeeeSourceBacking, 1);
+    source->references = 1;
+    source->mapping = MAP_FAILED;
+    source->mapped_length = request->allocation_length;
+    source->view_offset = request->visible_offset;
+    source->length = request->literal_length;
+    source->pieces = g_array_sized_new(false, false, sizeof(AgfxEeeeSourcePiece),
+                                       request->piece_count);
+    span->source = source;
+    span->task_id = request->task_id;
+    span->resource_id = request->resource_id;
+    span->task_epoch = request->task_epoch;
+    span->object_epoch = request->object_epoch;
+    span->source_va = request->source_va; /* provenance, never an address lookup */
+    *output = span; /* SAME partial owner before first MR/FD/mapping effect */
+
+    agfx_memory_rcu_enter();
+    view = address_space_to_flatview(&address_space_memory);
+    if (!view) {
+        goto partial_rcu;
+    }
+    flatview_for_each_range(view, agfx_ordinary_physical_check_domain, &domain);
+    if (domain.intersects_iommu) {
+        goto partial_rcu; /* SAME partial owner, no IOMMU callback/effect */
+    }
+    for (uint64_t i = 0; i < request->piece_count; ++i) {
+        const struct qmu_ordinary_physical_piece_v2 *piece = &request->pieces[i];
+        hwaddr translated_offset = 0, translated_length = piece->length;
+        MemoryRegion *region;
+        RAMBlock *ram_block;
+        uint8_t *base;
+        uint64_t file_offset;
+        int fd;
+        AgfxEeeePhysicalBacking *backing;
+        AgfxEeeeSourcePiece saved;
+
+        region = flatview_translate(view, piece->gpa, &translated_offset,
+                                    &translated_length, true,
+                                    MEMTXATTRS_UNSPECIFIED);
+        if (!region || translated_length != piece->length ||
+            !memory_access_is_direct(region, true, MEMTXATTRS_UNSPECIFIED) ||
+            !memory_region_is_ram(region) || memory_region_is_ram_device(region) ||
+            memory_region_has_ram_discard_manager(region) || !region->ram_block) {
+            goto partial_rcu;
+        }
+        ram_block = region->ram_block;
+        base = memory_region_get_ram_ptr(region);
+        if (!base || translated_offset > UINTPTR_MAX - (uintptr_t)base ||
+            (const void *)(base + translated_offset) != piece->mapped_pointer ||
+            translated_offset > qemu_ram_get_used_length(ram_block) ||
+            piece->length > qemu_ram_get_used_length(ram_block) - translated_offset ||
+            !qemu_ram_is_shared(ram_block)) {
+            goto partial_rcu;
+        }
+        fd = qemu_ram_get_fd(ram_block);
+        file_offset = qemu_ram_get_fd_offset(ram_block);
+        if (fd < 0 || file_offset > UINT64_MAX - translated_offset ||
+            file_offset + translated_offset > INT64_MAX ||
+            piece->length > INT64_MAX - (file_offset + translated_offset) ||
+            !agfx_eeee_page_range(file_offset + translated_offset, piece->length)) {
+            goto partial_rcu;
+        }
+        /* Preowned slot; no late HVA inverse lookup, and no cleanup under RCU
+         * or the caller's renderer/RT locks on a normal partial failure. */
+        backing = g_new0(AgfxEeeePhysicalBacking, 1);
+        backing->references = 1;
+        backing->fd = -1;
+        backing->file_offset = file_offset;
+        saved = (AgfxEeeeSourcePiece) {
+            .backing = backing,
+            .region_offset = translated_offset,
+            .mapping_offset = piece->logical_offset,
+            .length = piece->length,
+        };
+        g_array_append_val(source->pieces, saved);
+        memory_region_ref(region);
+        backing->region = region;
+        backing->fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (backing->fd < 0) {
+            goto partial_rcu;
+        }
+    }
+    agfx_memory_rcu_leave();
+    /* All physical owners are now independent of logical mappings/State.
+     * The existing core changes only its own reservation, without BQL. */
+    if (agfx_source_backing_map_pieces(source, request->allocation_alignment)) {
+        /* This is genuine physical storage over the captured saved FDs, not
+         * a fabricated SourceTask/ProviderState. The SAME already-published
+         * span owns the export and its original returned failure metadata.
+         * The exporter takes an additional source reference, without BQL:
+         * our original reference remains held even on its failure return. */
+        span->dma_export = agfx_eeee_source_dmabuf_create(
+            source, &span->export_failure);
+        span->complete = span->dma_export &&
+            agfx_eeee_source_dmabuf_fd(span->dma_export) >= 0;
+    }
+    agfx_ordinary_physical_capture_leave(context);
+    return;
+partial_rcu:
+    agfx_memory_rcu_leave();
+    agfx_ordinary_physical_capture_leave(context);
+    /* describe=false; original caller still owns this exact partial span. */
+}
+
+bool agfx_ordinary_physical_describe(const void *opaque,
+    struct qmu_ordinary_physical_view_v2 *view)
+{
+    const AgfxOrdinaryPhysicalSpan *span = opaque;
+    if (!span || !view || !span->complete || !span->dma_export ||
+        agfx_eeee_source_dmabuf_fd(span->dma_export) < 0) {
+        return false;
+    }
+    *view = (struct qmu_ordinary_physical_view_v2) {
+        .allocation = agfx_eeee_source_backing_allocation(span->source),
+        .allocation_length = agfx_eeee_source_backing_allocation_length(span->source),
+        .visible_pointer = agfx_eeee_source_backing_pointer(span->source),
+        .visible_offset = agfx_eeee_source_backing_visible_offset(span->source),
+        .visible_length = agfx_eeee_source_backing_length(span->source),
+        .dma_buf_fd = agfx_eeee_source_dmabuf_fd(span->dma_export),
+        .reserved = 0,
+    };
+    return true;
+}
+
+bool agfx_ordinary_physical_dirty(void *opaque, uint64_t offset, uint64_t length)
+{
+    AgfxOrdinaryPhysicalSpan *span = opaque;
+    return span && span->complete &&
+        agfx_eeee_source_backing_mark_dirty(span->source, offset, length);
+}
+
+void agfx_ordinary_physical_release_span(void *opaque)
+{
+    AgfxOrdinaryPhysicalSpan *span = opaque;
+    if (span) {
+        /* Caller has actually retired ALL imported native Memory (including
+         * separate child Image Memory) and holds no renderer/RT/provider lock.
+         * Export closes first; its source reference is returned before our
+         * original mapping/FD/MR ownership. Final QOM return uses BQL. */
+        agfx_eeee_source_dmabuf_unref(span->dma_export);
+        agfx_eeee_source_backing_unref(span->source);
+        g_free(span);
+    }
 }

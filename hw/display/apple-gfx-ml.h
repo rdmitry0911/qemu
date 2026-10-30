@@ -22,6 +22,8 @@
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
 typedef struct qmu_session_work qmu_session_work;
+typedef struct AgfxOrdinaryPhysicalContext AgfxOrdinaryPhysicalContext;
+struct qmu_private_ordinary_physical_capture_v2;
 
 typedef struct AgfxHostWork {
     struct AppleGfxMLState *state;
@@ -103,6 +105,11 @@ struct AppleGfxMLState {
     AgfxEeeeProviderState *eeee_provider_state;
     AgfxEeeeNativeContext *eeee_native_context;
     void *eeee_native_factory_receipt;
+
+    /* Independent ordinary peer; never the dormant canonical full18 carrier. */
+    AgfxOrdinaryPhysicalContext *ordinary_physical_context;
+    const struct qmu_private_ordinary_physical_capture_v2 *ordinary_physical_peer;
+    void *ordinary_physical_receipt;
 
     /* QEMU display */
     QemuConsole *con;

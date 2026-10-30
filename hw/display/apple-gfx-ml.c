@@ -27,6 +27,7 @@
 #include "block/thread-pool.h"
 #include "migration/vmstate.h"
 #include "hw/display/apple-gfx-ml-memory.h"
+#include "apple-gfx-ordinary-physical-capture.h"
 #include "qapi/error.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
@@ -64,6 +65,13 @@ void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
  * hides the per-target ioctl declaration. The diagnostic is x86/KVM-only and
  * calls the same exported helper used by target code. */
 int kvm_vcpu_ioctl(CPUState *cpu, unsigned long type, ...);
+static void agfx_run_lifecycle_work(void (*fn)(void *), void *opaque);
+static void agfx_destroy_ordinary_physical(AppleGfxMLState *s);
+/* Missing/mismatched peer is a returned realization failure, never a fallback
+ * to an unsupported ordinary representation. Exact paired exports are sealed
+ * by the joint package; this weak reference keeps old ABI inspection possible. */
+#pragma weak qmu_get_private_ordinary_physical_capture_v2
+
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
 typedef struct AgfxLogEntry AgfxLogEntry;
 typedef struct AppleGfxMLFrameCompletionJob AppleGfxMLFrameCompletionJob;
@@ -22831,6 +22839,210 @@ bool agfx_eeee_native_context_retire(AgfxEeeeNativeContext *context)
     return true;
 }
 
+/* Independent ordinary context. Root owns the QOM reference; transferred
+ * client references only decrement counters, so no worker's noexcept last
+ * drop can run a QOM finalizer. Root retires after actual Session destruction. */
+struct AgfxOrdinaryPhysicalContext {
+    AppleGfxMLState *state;
+    QemuMutex lock;
+    unsigned references;
+    unsigned captures;
+    bool stopped;
+};
+
+AgfxOrdinaryPhysicalContext *agfx_ordinary_physical_context_create(AppleGfxMLState *s)
+{
+    AgfxOrdinaryPhysicalContext *context;
+    assert(bql_locked());
+    if (!s || s->ordinary_physical_context || qatomic_read(&s->exiting)) {
+        return NULL;
+    }
+    context = g_new0(AgfxOrdinaryPhysicalContext, 1);
+    object_ref(OBJECT(s));
+    context->state = s;
+    qemu_mutex_init(&context->lock);
+    qatomic_set(&context->references, 1);
+    s->ordinary_physical_context = context;
+    return context;
+}
+
+bool agfx_ordinary_physical_context_acquire(AgfxOrdinaryPhysicalContext *context,
+    struct qmu_ordinary_physical_handoff_v2 *handoff)
+{
+    bool acquired = false;
+    if (!context || !handoff || handoff->acquired_context) {
+        return false;
+    }
+    qemu_mutex_lock(&context->lock);
+    if (!context->stopped) {
+        g_assert_cmpuint(qatomic_read(&context->references), >, 0);
+        qatomic_inc(&context->references);
+        *handoff = (struct qmu_ordinary_physical_handoff_v2) {
+            .version = QMU_PRIVATE_ORDINARY_PHYSICAL_CAPTURE_V2_VERSION,
+            .struct_size = sizeof(*handoff),
+            .acquired_context = context,
+            .memory_ctx_identity = context->state,
+            .stop = agfx_ordinary_physical_context_stop,
+            .release_context = agfx_ordinary_physical_context_release,
+            .capture = agfx_ordinary_physical_capture,
+            .describe = agfx_ordinary_physical_describe,
+            .mark_dirty = agfx_ordinary_physical_dirty,
+            .release_span = agfx_ordinary_physical_release_span,
+        };
+        acquired = true;
+    }
+    qemu_mutex_unlock(&context->lock);
+    return acquired;
+}
+
+bool agfx_ordinary_physical_context_stop(void *opaque)
+{
+    AgfxOrdinaryPhysicalContext *context = opaque;
+    if (!context) {
+        return false;
+    }
+    qemu_mutex_lock(&context->lock);
+    context->stopped = true;
+    qemu_mutex_unlock(&context->lock);
+    return true;
+}
+
+void agfx_ordinary_physical_context_release(void *opaque)
+{
+    AgfxOrdinaryPhysicalContext *context = opaque;
+    qemu_mutex_lock(&context->lock);
+    g_assert_cmpuint(qatomic_read(&context->references), >, 1);
+    qatomic_dec(&context->references);
+    qemu_mutex_unlock(&context->lock);
+    aio_wait_kick(); /* no context bytes touched after the unlock */
+}
+
+bool agfx_ordinary_physical_capture_enter(void *opaque)
+{
+    AgfxOrdinaryPhysicalContext *context = opaque;
+    bool entered = false;
+    if (!context) {
+        return false;
+    }
+    qemu_mutex_lock(&context->lock);
+    if (!context->stopped && qatomic_read(&context->references) > 1) {
+        qatomic_inc(&context->captures);
+        entered = true;
+    }
+    qemu_mutex_unlock(&context->lock);
+    return entered;
+}
+
+void agfx_ordinary_physical_capture_leave(void *opaque)
+{
+    AgfxOrdinaryPhysicalContext *context = opaque;
+    qemu_mutex_lock(&context->lock);
+    g_assert_cmpuint(qatomic_read(&context->captures), >, 0);
+    qatomic_dec(&context->captures);
+    qemu_mutex_unlock(&context->lock);
+    aio_wait_kick();
+}
+
+void agfx_ordinary_physical_context_retire(AgfxOrdinaryPhysicalContext *context)
+{
+    AppleGfxMLState *s;
+    assert(bql_locked());
+    if (!context) {
+        return;
+    }
+    agfx_ordinary_physical_context_stop(context);
+    AIO_WAIT_WHILE(NULL, qatomic_read(&context->references) != 1 ||
+                         qatomic_read(&context->captures) != 0);
+    /* Join the final releaser's exact critical section before freeing it. */
+    qemu_mutex_lock(&context->lock);
+    g_assert_cmpuint(qatomic_read(&context->references), ==, 1);
+    g_assert_cmpuint(qatomic_read(&context->captures), ==, 0);
+    qemu_mutex_unlock(&context->lock);
+    s = context->state;
+    s->ordinary_physical_context = NULL;
+    qemu_mutex_destroy(&context->lock);
+    g_free(context);
+    object_unref(OBJECT(s));
+}
+
+enum AgfxOrdinaryInstallOutcome {
+    AGFX_ORDINARY_INSTALLED,
+    AGFX_ORDINARY_RETURNED_FAILURE,
+    AGFX_ORDINARY_RETAINED,
+};
+
+static bool agfx_negotiate_ordinary_physical(AppleGfxMLState *s, Error **errp)
+{
+    const struct qmu_private_ordinary_physical_capture_v2 *peer =
+        qmu_get_private_ordinary_physical_capture_v2 ?
+        qmu_get_private_ordinary_physical_capture_v2() : NULL;
+
+    /* This must precede qmu_create: even prepare-null/rejection needs the
+     * exact private final-delete witness, rather than an unchecked void call. */
+    if (!peer || peer->version != QMU_PRIVATE_ORDINARY_PHYSICAL_CAPTURE_V2_VERSION ||
+        peer->struct_size != sizeof(*peer) || !peer->prepare ||
+        !peer->install || !peer->dispose_returned || !peer->destroy_returned) {
+        error_setg(errp, "Missing exact private ordinary physical capture peer");
+        return false;
+    }
+    s->ordinary_physical_peer = peer;
+    return true;
+}
+
+static void __attribute__((noreturn))
+agfx_ordinary_physical_retained(const char *stage)
+{
+    /* A known failed disposition is terminal evidence, not a pending normal
+     * shutdown. The owned controller stops the VM on this exact marker.
+     * No retry, native cleanup, context release or fictitious normal RETURN. */
+    error_report("AGFX_ORDINARY_PHYSICAL_RETAINED stage=%s "
+                 "outcome=UNRETURNED owners_preserved=1", stage);
+    fflush(stderr);
+    for (;;) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+}
+
+static enum AgfxOrdinaryInstallOutcome agfx_install_ordinary_physical(
+    AppleGfxMLState *s, Error **errp)
+{
+    const struct qmu_private_ordinary_physical_capture_v2 *peer =
+        s->ordinary_physical_peer;
+    struct qmu_ordinary_physical_handoff_v2 handoff = { 0 };
+    uint32_t result;
+
+    assert(peer && peer->destroy_returned);
+    if (!agfx_ordinary_physical_context_create(s) ||
+        !agfx_ordinary_physical_context_acquire(s->ordinary_physical_context, &handoff)) {
+        error_setg(errp, "Cannot acquire ordinary physical context");
+        return AGFX_ORDINARY_RETURNED_FAILURE;
+    }
+    s->ordinary_physical_receipt = peer->prepare(s->qmu_dev, &handoff);
+    if (!s->ordinary_physical_receipt) {
+        agfx_ordinary_physical_context_release(handoff.acquired_context);
+        error_setg(errp, "Ordinary physical prepare returned no receipt");
+        return AGFX_ORDINARY_RETURNED_FAILURE;
+    }
+    /* SAME receipt is stored in the actual State before install may escape.
+     * A returned unknown/foreign result never authorizes its disposal. */
+    result = peer->install(s->ordinary_physical_receipt);
+    if (result == QMU_ORDINARY_PHYSICAL_V2_INSTALLED) {
+        return AGFX_ORDINARY_INSTALLED;
+    }
+    agfx_ordinary_physical_context_stop(s->ordinary_physical_context);
+    if (result != QMU_ORDINARY_PHYSICAL_V2_REJECTED ||
+        !peer->dispose_returned(s->ordinary_physical_receipt)) {
+        error_setg(errp, "Ordinary physical install retained original unknown receipt");
+        error_report("AGFX_ORDINARY_PHYSICAL_RETAINED stage=install "
+                     "result=%u outcome=UNRETURNED owners_preserved=1", result);
+        fflush(stderr);
+        return AGFX_ORDINARY_RETAINED;
+    }
+    s->ordinary_physical_receipt = NULL;
+    error_setg(errp, "Ordinary physical install returned rejection");
+    return AGFX_ORDINARY_RETURNED_FAILURE;
+}
+
 /* ============================================================
  * Thread-safe Interrupt Delivery (Apple style)
  * IRQ is raised from qmetal pthread, must be delivered via BH
@@ -25239,9 +25451,27 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     qmu_config.mode_data[2] = (1024u << 16) | 1280u;
     qmu_config.mode_count = 3;
 
+    if (!agfx_negotiate_ordinary_physical(s, errp)) {
+        goto fail_sync;
+    }
     s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
     if (!s->qmu_dev) {
         error_setg(errp, "Failed to create qmetal device");
+        goto fail_sync;
+    }
+
+    /* Complete independent handoff before MMIO/present workers or Console
+     * ingress. No canonical full18 field or provider State is published. */
+    switch (agfx_install_ordinary_physical(s, errp)) {
+    case AGFX_ORDINARY_INSTALLED:
+        break;
+    case AGFX_ORDINARY_RETAINED:
+        /* Quarantine preserves SAME packet, Session, context/QOM root and
+         * callback storage. No retry, fake RETURN or partial finalization. */
+        return;
+    case AGFX_ORDINARY_RETURNED_FAILURE:
+        agfx_destroy_ordinary_physical(s);
+        agfx_ordinary_physical_context_retire(s->ordinary_physical_context);
         goto fail_sync;
     }
 
@@ -25349,11 +25579,32 @@ static void agfx_free_render_pool(void *opaque)
     thread_pool_free(s->render_pool);
 }
 
-static void agfx_destroy_qmu(void *opaque)
-{
-    AppleGfxMLState *s = opaque;
+typedef struct AgfxOrdinaryDestroyWork {
+    AppleGfxMLState *state;
+    bool returned;
+} AgfxOrdinaryDestroyWork;
 
-    qmu_destroy(s->qmu_dev);
+static void agfx_destroy_ordinary_worker(void *opaque)
+{
+    AgfxOrdinaryDestroyWork *work = opaque;
+    AppleGfxMLState *s = work->state;
+
+    work->returned = s->ordinary_physical_peer->destroy_returned(
+        s->ordinary_physical_receipt, s->qmu_dev);
+}
+
+static void agfx_destroy_ordinary_physical(AppleGfxMLState *s)
+{
+    AgfxOrdinaryDestroyWork work = { .state = s };
+
+    assert(s->qmu_dev && s->ordinary_physical_peer);
+    agfx_run_lifecycle_work(agfx_destroy_ordinary_worker, &work);
+    if (!work.returned) {
+        agfx_ordinary_physical_retained("destroy");
+    }
+    /* Actual final-delete leaf AND normal destruction RETURN, not merely the
+     * void ABI call returning or provider/context ownership becoming empty. */
+    s->qmu_dev = NULL;
 }
 
 typedef struct AgfxQuiesceWork {
@@ -25477,8 +25728,19 @@ static void agfx_exit(PCIDevice *pci_dev)
     /* Worker/native/done/BH/read descendants have returned at the owner barrier. */
     qmu_display_target_release(s->display_target);
     s->display_target = NULL;
-    agfx_run_lifecycle_work(agfx_destroy_qmu, s);
-    s->qmu_dev = NULL;
+    /* No new capture after the actual producer barrier; already entered
+     * captures and native owners are joined by the same Session destructor. */
+    agfx_ordinary_physical_context_stop(s->ordinary_physical_context);
+    agfx_destroy_ordinary_physical(s);
+    if (s->ordinary_physical_receipt) {
+        bool disposed = s->ordinary_physical_peer->dispose_returned(
+            s->ordinary_physical_receipt);
+        if (!disposed) {
+            agfx_ordinary_physical_retained("dispose_after_destroy");
+        }
+        s->ordinary_physical_receipt = NULL;
+    }
+    agfx_ordinary_physical_context_retire(s->ordinary_physical_context);
 
     agfx_completion_queue_destroy(s);
     qemu_mutex_destroy(&s->mmio_job_mutex);
