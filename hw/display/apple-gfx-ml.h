@@ -24,6 +24,7 @@ typedef struct qmu_session qmu_session;
 typedef struct qmu_session_work qmu_session_work;
 typedef struct AgfxOrdinaryPhysicalContext AgfxOrdinaryPhysicalContext;
 struct qmu_private_ordinary_physical_capture_v2;
+struct qmu_private_ordinary_task_memory_v1;
 
 typedef struct AgfxHostWork {
     struct AppleGfxMLState *state;
@@ -100,8 +101,9 @@ struct AppleGfxMLState {
     /* QMetal unified library handle - contains ALL protocol logic */
     qmu_session *qmu_dev;
 
-    /* Reserved for the indivisible EEEE provider/session cutover.  It is not
-     * initialized or passed to QMetal by the legacy path. */
+    /* Owned CPU facilities, independent of canonical Session activation.
+     * The ordinary private peer may acquire this real context without
+     * publishing any of its callbacks through the public full18 tail. */
     AgfxEeeeProviderState *eeee_provider_state;
     AgfxEeeeNativeContext *eeee_native_context;
     void *eeee_native_factory_receipt;
@@ -110,6 +112,13 @@ struct AppleGfxMLState {
     AgfxOrdinaryPhysicalContext *ordinary_physical_context;
     const struct qmu_private_ordinary_physical_capture_v2 *ordinary_physical_peer;
     void *ordinary_physical_receipt;
+
+    /* This alias identifies only the CPU root created for the private
+     * ordinary peer. Acquired descendants own references to that same root. */
+    AgfxEeeeNativeContext *ordinary_task_memory_context;
+    const struct qmu_private_ordinary_task_memory_v1 *ordinary_task_memory_peer;
+    void *ordinary_task_memory_receipt;
+    uint32_t ordinary_task_memory_install_result;
 
     /* QEMU display */
     QemuConsole *con;

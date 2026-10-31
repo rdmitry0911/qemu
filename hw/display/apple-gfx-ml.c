@@ -54,6 +54,7 @@
 #include "qmu/pvg_regs.h"
 #include "qmu/qmetal_unified.h"
 #include "qmu/qmu_owned_display_frame.h"
+#include "qmu_ordinary_task_memory_v1.h"
 
 /* Forward declarations from qmu_vulkan.h (C++ header, can't include directly) */
 struct qmu_vulkan_ctx;
@@ -71,6 +72,9 @@ static void agfx_destroy_ordinary_physical(AppleGfxMLState *s);
  * to an unsupported ordinary representation. Exact paired exports are sealed
  * by the joint package; this weak reference keeps old ABI inspection possible. */
 #pragma weak qmu_get_private_ordinary_physical_capture_v2
+/* Optional on an older matched ordinary stack. Once present, this complete
+ * CPU peer is required; a mismatch cannot activate a partial full18 table. */
+#pragma weak qmu_get_private_ordinary_task_memory_v1
 
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
 typedef struct AgfxLogEntry AgfxLogEntry;
@@ -23043,6 +23047,141 @@ static enum AgfxOrdinaryInstallOutcome agfx_install_ordinary_physical(
     return AGFX_ORDINARY_RETURNED_FAILURE;
 }
 
+static bool agfx_negotiate_ordinary_task_memory(AppleGfxMLState *s,
+                                                 Error **errp)
+{
+    const struct qmu_private_ordinary_task_memory_v1 *peer;
+
+    if (!qmu_get_private_ordinary_task_memory_v1) {
+        return true; /* Unchanged old-DSO ordinary path; no CPU context. */
+    }
+    peer = qmu_get_private_ordinary_task_memory_v1();
+    if (!peer || peer->version != QMU_PRIVATE_ORDINARY_TASK_MEMORY_V1_VERSION ||
+        peer->struct_size != sizeof(*peer) || !peer->prepare ||
+        !peer->install || !peer->dispose_returned) {
+        error_setg(errp, "Mismatched private ordinary task-memory peer");
+        return false;
+    }
+    s->ordinary_task_memory_peer = peer;
+    return true;
+}
+
+static void __attribute__((noreturn))
+agfx_ordinary_task_memory_retained(const char *stage, uint32_t result)
+{
+    error_report("AGFX_ORDINARY_TASK_MEMORY_RETAINED stage=%s result=%u "
+                 "outcome=UNRETURNED owners_preserved=1", stage, result);
+    fflush(stderr);
+    for (;;) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+}
+
+static bool agfx_ordinary_task_memory_callbacks_complete(
+    AppleGfxMLState *s, const qmu_extended_callbacks *cb)
+{
+    return cb->abi_magic == QMU_EXTENDED_CALLBACKS_ABI_MAGIC &&
+           cb->abi_version == QMU_EXTENDED_ABI_VERSION &&
+           cb->struct_size == sizeof(*cb) && cb->user_ctx == s &&
+           cb->map_gpa && cb->unmap_gpa && cb->read_memory &&
+           cb->mark_mapped_memory_dirty && cb->eeee_task_allocate &&
+           cb->eeee_task_remap_shared_fixed_overwrite &&
+           cb->eeee_task_protect && cb->eeee_task_deallocate &&
+           cb->eeee_task_host_page_size && cb->eeee_task_rcu_enter &&
+           cb->eeee_task_rcu_leave && cb->eeee_task_lock &&
+           cb->eeee_task_unlock && cb->eeee_task_translate &&
+           cb->eeee_task_direct && cb->eeee_task_ram_pointer &&
+           cb->eeee_task_region_ref && cb->eeee_task_region_unref &&
+           cb->eeee_task_publish && cb->eeee_task_remove &&
+           cb->eeee_task_host_write && cb->eeee_task_fatal;
+}
+
+static void agfx_ordinary_task_memory_stop_acquiring(void *opaque)
+{
+    agfx_eeee_native_context_stop_acquiring(opaque);
+}
+
+static enum AgfxOrdinaryInstallOutcome agfx_install_ordinary_task_memory(
+    AppleGfxMLState *s, Error **errp)
+{
+    const struct qmu_private_ordinary_task_memory_v1 *peer =
+        s->ordinary_task_memory_peer;
+    struct qmu_ordinary_task_memory_handoff_v1 handoff = {
+        .version = QMU_PRIVATE_ORDINARY_TASK_MEMORY_V1_VERSION,
+        .struct_size = sizeof(handoff),
+        .profile = QMU_ORDINARY_TASK_MEMORY_LEGACY_CALLBACKS,
+    };
+
+    if (!peer) {
+        return AGFX_ORDINARY_INSTALLED;
+    }
+    s->ordinary_task_memory_context = agfx_eeee_native_context_create(s);
+    if (!s->ordinary_task_memory_context) {
+        error_setg(errp, "Cannot create ordinary CPU facilities context");
+        return AGFX_ORDINARY_RETURNED_FAILURE;
+    }
+    if (!agfx_eeee_native_context_acquire(s->ordinary_task_memory_context,
+                                         &handoff.facilities)) {
+        error_setg(errp, "Cannot acquire ordinary CPU facilities context");
+        return AGFX_ORDINARY_RETURNED_FAILURE;
+    }
+    handoff.acquired_context = s->ordinary_task_memory_context;
+    handoff.release_context = agfx_eeee_native_context_release;
+    handoff.stop_acquiring = agfx_ordinary_task_memory_stop_acquiring;
+    handoff.memory_ctx_identity = s;
+    if (!agfx_ordinary_task_memory_callbacks_complete(s, &handoff.facilities)) {
+        agfx_eeee_native_context_release(handoff.acquired_context);
+        error_setg(errp, "Incomplete ordinary CPU facilities acquisition");
+        return AGFX_ORDINARY_RETURNED_FAILURE;
+    }
+
+    /* Context root and its complete callback snapshot are already owned by
+     * State. Only a nonnull prepare RETURN transfers the acquired reference. */
+    s->ordinary_task_memory_receipt = peer->prepare(s->qmu_dev, &handoff);
+    if (!s->ordinary_task_memory_receipt) {
+        agfx_eeee_native_context_release(handoff.acquired_context);
+        error_setg(errp, "Ordinary task-memory prepare returned no receipt");
+        return AGFX_ORDINARY_RETURNED_FAILURE;
+    }
+    s->ordinary_task_memory_install_result =
+        peer->install(s->ordinary_task_memory_receipt);
+    if (s->ordinary_task_memory_install_result ==
+        QMU_ORDINARY_TASK_MEMORY_INSTALLED) {
+        return AGFX_ORDINARY_INSTALLED;
+    }
+    agfx_eeee_native_context_stop_acquiring(s->ordinary_task_memory_context);
+    if (s->ordinary_task_memory_install_result !=
+        QMU_ORDINARY_TASK_MEMORY_REJECTED) {
+        /* Keep the actual returned value and SAME receipt/context/Session.
+         * Unknown, escape and unreturned outcomes never authorize destroy. */
+        return AGFX_ORDINARY_RETAINED;
+    }
+    error_setg(errp, "Ordinary task-memory install returned rejection");
+    return AGFX_ORDINARY_RETURNED_FAILURE;
+}
+
+static void agfx_return_ordinary_task_memory_after_destroy(AppleGfxMLState *s)
+{
+    assert(!s->qmu_dev); /* Existing V2 proved actual final delete + RETURN. */
+    if (s->ordinary_task_memory_receipt) {
+        if (!s->ordinary_task_memory_peer->dispose_returned(
+                s->ordinary_task_memory_receipt)) {
+            agfx_ordinary_task_memory_retained(
+                "dispose_after_destroy", s->ordinary_task_memory_install_result);
+        }
+        s->ordinary_task_memory_receipt = NULL;
+    }
+    if (s->ordinary_task_memory_context) {
+        /* Same BQL/main-AIO-pumped root retirement, after the actual CPU
+         * providers, mapping/MR descendants and acquired lease returned. */
+        if (!agfx_eeee_native_context_retire(s->ordinary_task_memory_context)) {
+            agfx_ordinary_task_memory_retained(
+                "context_retire", s->ordinary_task_memory_install_result);
+        }
+        s->ordinary_task_memory_context = NULL;
+    }
+}
+
 /* ============================================================
  * Thread-safe Interrupt Delivery (Apple style)
  * IRQ is raised from qmetal pthread, must be delivered via BH
@@ -25451,7 +25590,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     qmu_config.mode_data[2] = (1024u << 16) | 1280u;
     qmu_config.mode_count = 3;
 
-    if (!agfx_negotiate_ordinary_physical(s, errp)) {
+    if (!agfx_negotiate_ordinary_physical(s, errp) ||
+        !agfx_negotiate_ordinary_task_memory(s, errp)) {
         goto fail_sync;
     }
     s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
@@ -25471,6 +25611,30 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         return;
     case AGFX_ORDINARY_RETURNED_FAILURE:
         agfx_destroy_ordinary_physical(s);
+        agfx_ordinary_physical_context_retire(s->ordinary_physical_context);
+        goto fail_sync;
+    }
+
+    /* Optional complete CPU-facility handoff follows V2, before any MMIO,
+     * Task, worker or Console ingress. Public callback tail stays empty. */
+    switch (agfx_install_ordinary_task_memory(s, errp)) {
+    case AGFX_ORDINARY_INSTALLED:
+        break;
+    case AGFX_ORDINARY_RETAINED:
+        agfx_ordinary_task_memory_retained(
+            "install", s->ordinary_task_memory_install_result);
+    case AGFX_ORDINARY_RETURNED_FAILURE:
+        agfx_eeee_native_context_stop_acquiring(s->ordinary_task_memory_context);
+        agfx_ordinary_physical_context_stop(s->ordinary_physical_context);
+        agfx_destroy_ordinary_physical(s);
+        agfx_return_ordinary_task_memory_after_destroy(s);
+        if (s->ordinary_physical_receipt) {
+            if (!s->ordinary_physical_peer->dispose_returned(
+                    s->ordinary_physical_receipt)) {
+                agfx_ordinary_physical_retained("startup_dispose_after_destroy");
+            }
+            s->ordinary_physical_receipt = NULL;
+        }
         agfx_ordinary_physical_context_retire(s->ordinary_physical_context);
         goto fail_sync;
     }
@@ -25731,7 +25895,9 @@ static void agfx_exit(PCIDevice *pci_dev)
     /* No new capture after the actual producer barrier; already entered
      * captures and native owners are joined by the same Session destructor. */
     agfx_ordinary_physical_context_stop(s->ordinary_physical_context);
+    agfx_eeee_native_context_stop_acquiring(s->ordinary_task_memory_context);
     agfx_destroy_ordinary_physical(s);
+    agfx_return_ordinary_task_memory_after_destroy(s);
     if (s->ordinary_physical_receipt) {
         bool disposed = s->ordinary_physical_peer->dispose_returned(
             s->ordinary_physical_receipt);
