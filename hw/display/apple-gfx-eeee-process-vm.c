@@ -25,6 +25,7 @@
 #include "qmu/qmetal_unified.h"
 
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 /* Identity is captured at admitted remap, never recovered from current GPA or
  * a potentially changed task mapping. The duplicated fd also survives RAM
@@ -1032,7 +1033,43 @@ void agfx_eeee_provider_fill_callbacks(qmu_extended_callbacks *callbacks)
 
 /* Independent original-GPA capture: no provider allocation table, SourceTask,
  * task-VA lookup, or extended-callback publication is involved. */
+/* One generation token survives Context retirement while any actual span is
+ * retained. Context addresses may be reused; this live token cannot alias a
+ * different live provider generation. No comparison dereferences Context. */
+struct AgfxOrdinaryPhysicalOrigin {
+    int references;
+    const void *context_identity;
+    bool stopped;
+};
+
+AgfxOrdinaryPhysicalOrigin *agfx_ordinary_physical_origin_new(const void *context)
+{
+    AgfxOrdinaryPhysicalOrigin *origin = g_new0(AgfxOrdinaryPhysicalOrigin, 1);
+    origin->references = 1;
+    origin->context_identity = context;
+    return origin;
+}
+
+AgfxOrdinaryPhysicalOrigin *agfx_ordinary_physical_origin_ref(AgfxOrdinaryPhysicalOrigin *origin)
+{
+    qatomic_inc(&origin->references);
+    return origin;
+}
+
+void agfx_ordinary_physical_origin_unref(AgfxOrdinaryPhysicalOrigin *origin)
+{
+    if (origin && qatomic_fetch_dec(&origin->references) == 1) {
+        g_free(origin);
+    }
+}
+
+void agfx_ordinary_physical_origin_stop(AgfxOrdinaryPhysicalOrigin *origin)
+{
+    qatomic_set(&origin->stopped, true);
+}
+
 typedef struct AgfxOrdinaryPhysicalSpan {
+    AgfxOrdinaryPhysicalOrigin *origin;
     AgfxEeeeSourceBacking *source;
     AgfxEeeeSourceDmaBuf *dma_export;
     AgfxEeeeDmaBufFailure export_failure;
@@ -1115,6 +1152,8 @@ void agfx_ordinary_physical_capture(void *context,
         return;
     }
     span = g_new0(AgfxOrdinaryPhysicalSpan, 1);
+    span->origin = agfx_ordinary_physical_origin_ref(
+        agfx_ordinary_physical_context_origin(context));
     span->export_failure = (AgfxEeeeDmaBufFailure) {
         AGFX_DMABUF_NONE, 0, UINT_MAX };
     source = g_new0(AgfxEeeeSourceBacking, 1);
@@ -1258,6 +1297,166 @@ void agfx_ordinary_physical_release_span(void *opaque)
          * original mapping/FD/MR ownership. Final QOM return uses BQL. */
         agfx_eeee_source_dmabuf_unref(span->dma_export);
         agfx_eeee_source_backing_unref(span->source);
+        agfx_ordinary_physical_origin_unref(span->origin);
         g_free(span);
     }
+}
+
+typedef struct AgfxOrdinaryPhysicalInterval {
+    dev_t device;
+    ino_t inode;
+    uint64_t first, length;
+} AgfxOrdinaryPhysicalInterval;
+
+/* Cache only immutable source-FD identity while the original span owns it.
+ * This comparison makes at most one fstat per actual saved backing, never one
+ * per pair of pieces. The cache and clipped intervals own no physical pages. */
+static const struct stat *agfx_ordinary_physical_stat(
+    const AgfxEeeePhysicalBacking *backing, GHashTable *stats)
+{
+    struct stat *st = g_hash_table_lookup(stats, backing);
+    if (st) {
+        return st;
+    }
+    st = g_new(struct stat, 1);
+    if (fstat(backing->fd, st) != 0 || !S_ISREG(st->st_mode) || st->st_size < 0) {
+        g_free(st);
+        return NULL;
+    }
+    g_hash_table_insert(stats, (void *)backing, st);
+    return st;
+}
+
+static gint agfx_ordinary_physical_interval_order(gconstpointer left, gconstpointer right)
+{
+    const AgfxOrdinaryPhysicalInterval *a = left, *b = right;
+    if (a->device != b->device) {
+        return a->device < b->device ? -1 : 1;
+    }
+    if (a->inode != b->inode) {
+        return a->inode < b->inode ? -1 : 1;
+    }
+    return a->first < b->first ? -1 : a->first != b->first;
+}
+
+static void agfx_ordinary_physical_normalize(GArray *ranges)
+{
+    unsigned written = 0;
+    g_array_sort(ranges, agfx_ordinary_physical_interval_order);
+    for (unsigned i = 0; i < ranges->len; ++i) {
+        AgfxOrdinaryPhysicalInterval current = g_array_index(ranges,
+            AgfxOrdinaryPhysicalInterval, i);
+        if (written) {
+            AgfxOrdinaryPhysicalInterval *last = &g_array_index(ranges,
+                AgfxOrdinaryPhysicalInterval, written - 1);
+            if (last->device == current.device && last->inode == current.inode &&
+                current.first <= last->first + last->length) {
+                last->length = MAX(last->first + last->length,
+                    current.first + current.length) - last->first;
+                continue;
+            }
+        }
+        g_array_index(ranges, AgfxOrdinaryPhysicalInterval, written++) = current;
+    }
+    g_array_set_size(ranges, written);
+}
+
+/* Full coverage is checked before normalization: no missing byte can become
+ * disjoint merely because a saved piece or its original FD is unavailable. */
+static bool agfx_ordinary_physical_ranges(const AgfxOrdinaryPhysicalSpan *span,
+    uint64_t offset, uint64_t length, GHashTable *stats, GArray *ranges)
+{
+    uint64_t covered = 0, first, end;
+    if (!span || !span->complete || !span->source ||
+        offset > span->source->length || length > span->source->length - offset ||
+        offset > UINT64_MAX - span->source->view_offset) {
+        return false;
+    }
+    first = span->source->view_offset + offset;
+    if (length > UINT64_MAX - first) {
+        return false;
+    }
+    end = first + length;
+    for (unsigned i = 0; i < span->source->pieces->len; ++i) {
+        const AgfxEeeeSourcePiece *piece = &g_array_index(span->source->pieces,
+            AgfxEeeeSourcePiece, i);
+        uint64_t begin, limit, file_first;
+        const struct stat *st;
+        if (!piece->backing || piece->length > UINT64_MAX - piece->mapping_offset) {
+            return false;
+        }
+        begin = MAX(first, piece->mapping_offset);
+        limit = MIN(end, piece->mapping_offset + piece->length);
+        if (begin >= limit) {
+            continue;
+        }
+        if (piece->region_offset > UINT64_MAX - piece->backing->file_offset) {
+            return false;
+        }
+        file_first = piece->backing->file_offset + piece->region_offset;
+        if (begin - piece->mapping_offset > UINT64_MAX - file_first) {
+            return false;
+        }
+        file_first += begin - piece->mapping_offset;
+        if (limit - begin > UINT64_MAX - file_first ||
+            limit - begin > length - covered ||
+            !(st = agfx_ordinary_physical_stat(piece->backing, stats)) ||
+            file_first + (limit - begin) > (uint64_t)st->st_size) {
+            return false;
+        }
+        AgfxOrdinaryPhysicalInterval range = {
+            .device = st->st_dev, .inode = st->st_ino,
+            .first = file_first, .length = limit - begin,
+        };
+        g_array_append_val(ranges, range);
+        covered += range.length;
+    }
+    if (covered != length) {
+        return false;
+    }
+    agfx_ordinary_physical_normalize(ranges);
+    return true;
+}
+
+uint32_t agfx_ordinary_physical_compare(const void *context,
+    const void *left_opaque, uint64_t left_offset, uint64_t left_length,
+    const void *right_opaque, uint64_t right_offset, uint64_t right_length)
+{
+    const AgfxOrdinaryPhysicalSpan *left = left_opaque, *right = right_opaque;
+    uint32_t result = QMU_ORDINARY_PHYSICAL_COMPARISON_UNAVAILABLE;
+    if (!context || !left || !right || !left->origin ||
+        left->origin != right->origin ||
+        left->origin->context_identity != context ||
+        qatomic_read(&left->origin->stopped)) {
+        return result;
+    }
+    GHashTable *stats = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    GArray *a = g_array_new(false, false, sizeof(AgfxOrdinaryPhysicalInterval));
+    GArray *b = g_array_new(false, false, sizeof(AgfxOrdinaryPhysicalInterval));
+    if (!agfx_ordinary_physical_ranges(left, left_offset, left_length, stats, a) ||
+        !agfx_ordinary_physical_ranges(right, right_offset, right_length, stats, b)) {
+        goto done;
+    }
+    result = QMU_ORDINARY_PHYSICAL_COMPARISON_DISJOINT;
+    for (unsigned i = 0, j = 0; i < a->len && j < b->len;) {
+        const AgfxOrdinaryPhysicalInterval *x = &g_array_index(a, AgfxOrdinaryPhysicalInterval, i);
+        const AgfxOrdinaryPhysicalInterval *y = &g_array_index(b, AgfxOrdinaryPhysicalInterval, j);
+        if (x->device != y->device) {
+            if (x->device < y->device) { ++i; } else { ++j; }
+        } else if (x->inode != y->inode) {
+            if (x->inode < y->inode) { ++i; } else { ++j; }
+        } else if (x->first + x->length <= y->first) {
+            ++i;
+        } else if (y->first + y->length <= x->first) {
+            ++j;
+        } else {
+            result = QMU_ORDINARY_PHYSICAL_COMPARISON_OVERLAP;
+            break;
+        }
+    }
+ done:
+    g_array_unref(a);
+    g_array_unref(b);
+    g_hash_table_unref(stats);
+    return result;
 }

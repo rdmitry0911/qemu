@@ -72,6 +72,7 @@ static void agfx_destroy_ordinary_physical(AppleGfxMLState *s);
  * to an unsupported ordinary representation. Exact paired exports are sealed
  * by the joint package; this weak reference keeps old ABI inspection possible. */
 #pragma weak qmu_get_private_ordinary_physical_capture_v2
+#pragma weak qmu_get_private_ordinary_physical_comparison_v1
 /* Optional on an older matched ordinary stack. Once present, this complete
  * CPU peer is required; a mismatch cannot activate a partial full18 table. */
 #pragma weak qmu_get_private_ordinary_task_memory_v1
@@ -22848,6 +22849,7 @@ bool agfx_eeee_native_context_retire(AgfxEeeeNativeContext *context)
  * drop can run a QOM finalizer. Root retires after actual Session destruction. */
 struct AgfxOrdinaryPhysicalContext {
     AppleGfxMLState *state;
+    AgfxOrdinaryPhysicalOrigin *origin;
     QemuMutex lock;
     unsigned references;
     unsigned captures;
@@ -22864,6 +22866,7 @@ AgfxOrdinaryPhysicalContext *agfx_ordinary_physical_context_create(AppleGfxMLSta
     context = g_new0(AgfxOrdinaryPhysicalContext, 1);
     object_ref(OBJECT(s));
     context->state = s;
+    context->origin = agfx_ordinary_physical_origin_new(context);
     qemu_mutex_init(&context->lock);
     qatomic_set(&context->references, 1);
     s->ordinary_physical_context = context;
@@ -22907,6 +22910,7 @@ bool agfx_ordinary_physical_context_stop(void *opaque)
     }
     qemu_mutex_lock(&context->lock);
     context->stopped = true;
+    agfx_ordinary_physical_origin_stop(context->origin);
     qemu_mutex_unlock(&context->lock);
     return true;
 }
@@ -22947,6 +22951,13 @@ void agfx_ordinary_physical_capture_leave(void *opaque)
     aio_wait_kick();
 }
 
+AgfxOrdinaryPhysicalOrigin *agfx_ordinary_physical_context_origin(void *opaque)
+{
+    AgfxOrdinaryPhysicalContext *context = opaque;
+    /* Called only inside the existing acquired capture interval. */
+    return context->origin;
+}
+
 void agfx_ordinary_physical_context_retire(AgfxOrdinaryPhysicalContext *context)
 {
     AppleGfxMLState *s;
@@ -22965,6 +22976,7 @@ void agfx_ordinary_physical_context_retire(AgfxOrdinaryPhysicalContext *context)
     s = context->state;
     s->ordinary_physical_context = NULL;
     qemu_mutex_destroy(&context->lock);
+    agfx_ordinary_physical_origin_unref(context->origin);
     g_free(context);
     object_unref(OBJECT(s));
 }
@@ -23045,6 +23057,30 @@ static enum AgfxOrdinaryInstallOutcome agfx_install_ordinary_physical(
     s->ordinary_physical_receipt = NULL;
     error_setg(errp, "Ordinary physical install returned rejection");
     return AGFX_ORDINARY_RETURNED_FAILURE;
+}
+
+static bool agfx_install_ordinary_physical_comparison(AppleGfxMLState *s,
+                                                    Error **errp)
+{
+    const struct qmu_private_ordinary_physical_comparison_v1 *peer;
+    struct qmu_ordinary_physical_comparison_handoff_v1 handoff = {
+        .version = QMU_PRIVATE_ORDINARY_PHYSICAL_COMPARISON_V1_VERSION,
+        .struct_size = sizeof(handoff),
+        .memory_ctx_identity = s,
+        .physical_context_identity = s->ordinary_physical_context,
+        .compare = agfx_ordinary_physical_compare,
+    };
+    if (!qmu_get_private_ordinary_physical_comparison_v1) {
+        return true; /* Older paired peer: comparison remains unavailable. */
+    }
+    peer = qmu_get_private_ordinary_physical_comparison_v1();
+    if (!peer || peer->version != QMU_PRIVATE_ORDINARY_PHYSICAL_COMPARISON_V1_VERSION ||
+        peer->struct_size != sizeof(*peer) || !peer->install ||
+        !peer->install(s->qmu_dev, &handoff)) {
+        error_setg(errp, "Cannot install exact optional physical comparison peer");
+        return false;
+    }
+    return true;
 }
 
 static bool agfx_negotiate_ordinary_task_memory(AppleGfxMLState *s,
@@ -25611,6 +25647,17 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         return;
     case AGFX_ORDINARY_RETURNED_FAILURE:
         agfx_destroy_ordinary_physical(s);
+        agfx_ordinary_physical_context_retire(s->ordinary_physical_context);
+        goto fail_sync;
+    }
+
+    if (!agfx_install_ordinary_physical_comparison(s, errp)) {
+        agfx_ordinary_physical_context_stop(s->ordinary_physical_context);
+        agfx_destroy_ordinary_physical(s);
+        if (!s->ordinary_physical_peer->dispose_returned(s->ordinary_physical_receipt)) {
+            agfx_ordinary_physical_retained("comparison_install_dispose_after_destroy");
+        }
+        s->ordinary_physical_receipt = NULL;
         agfx_ordinary_physical_context_retire(s->ordinary_physical_context);
         goto fail_sync;
     }
