@@ -310,6 +310,74 @@ static void test_foreign_thread_map_and_dirty_without_bql(void)
     fixture_free(f);
 }
 
+/* RAM-copy read leaf from a thread that is neither BQL holder nor RCU
+ * registered: direct RAM/ROM spans copy in place (including a span that
+ * crosses into the next page of the same RAM and an alias), a span that
+ * reaches an unmapped hole rejects the whole read, and no MR reference or
+ * registration is left behind. */
+typedef struct ForeignRead {
+    Fixture *f;
+    bool held_bql, registered_after;
+    bool cross_ok, alias_ok, rom_ok, hole_ok, tail_hole_ok;
+    uint8_t cross[3 * 4096], alias[64], rom[32], hole[16], tail[32];
+} ForeignRead;
+
+static void *foreign_read_thread(void *opaque)
+{
+    ForeignRead *job = opaque;
+    Fixture *f = job->f;
+
+    job->held_bql = bql_locked();
+    job->cross_ok = agfx_memory_read_ram_any_thread(RAM_GPA + f->page - 8,
+                                                    job->cross, f->page + 16);
+    job->alias_ok = agfx_memory_read_ram_any_thread(ALIAS_A_GPA + 100,
+                                                    job->alias, sizeof(job->alias));
+    job->rom_ok = agfx_memory_read_ram_any_thread(ROM_GPA, job->rom,
+                                                  sizeof(job->rom));
+    job->hole_ok = agfx_memory_read_ram_any_thread(UINT64_C(0x50000000),
+                                                   job->hole, sizeof(job->hole));
+    /* Last 16 bytes of the 4-page RAM followed by an unmapped hole. */
+    job->tail_hole_ok = agfx_memory_read_ram_any_thread(
+        RAM_GPA + 4 * f->page - 16, job->tail, sizeof(job->tail));
+    job->registered_after = rcu_thread_is_registered();
+    return NULL;
+}
+
+static void test_foreign_thread_ram_read_leaf(void)
+{
+    Fixture *f = fixture_new();
+    Object *owner = OBJECT(f->owner);
+    uint8_t *ram = memory_region_get_ram_ptr(&f->owner->ram);
+    ForeignRead *job = g_new0(ForeignRead, 1);
+    QemuThread thread;
+
+    g_assert_cmpuint(f->page, ==, 4096);
+    for (unsigned i = 0; i < 4 * f->page; ++i) {
+        ram[i] = (uint8_t)(i * 7 + 3);
+    }
+    job->f = f;
+    g_assert_true(bql_locked());
+    qemu_thread_create(&thread, "agfx-foreign-read", foreign_read_thread, job,
+                       QEMU_THREAD_JOINABLE);
+    qemu_thread_join(&thread);
+    g_assert_false(job->held_bql);
+    g_assert_false(job->registered_after);
+    g_assert_true(job->cross_ok);
+    g_assert_cmpmem(job->cross, f->page + 16, ram + f->page - 8, f->page + 16);
+    g_assert_true(job->alias_ok);
+    g_assert_cmpmem(job->alias, sizeof(job->alias), ram + f->page + 100,
+                    sizeof(job->alias));
+    g_assert_true(job->rom_ok);
+    for (unsigned i = 0; i < sizeof(job->rom); ++i) {
+        g_assert_cmpuint(job->rom[i], ==, 0x63);
+    }
+    g_assert_false(job->hole_ok);
+    g_assert_false(job->tail_hole_ok);
+    g_assert_cmpuint(owner->ref, ==, f->baseline_refs);
+    g_free(job);
+    fixture_free(f);
+}
+
 /* Seqlock over publication: a listener's region_add runs between every
  * listener's begin and commit, so it must observe an odd sequence. */
 static uint64_t probe_seen_seq;
@@ -486,6 +554,8 @@ int main(int argc, char **argv)
 #ifndef AGFX_MEMORY_BASELINE_CONTROL
     g_test_add_func("/agfx/memory/foreign-thread-map-dirty-without-bql",
                     test_foreign_thread_map_and_dirty_without_bql);
+    g_test_add_func("/agfx/memory/foreign-thread-ram-read-leaf",
+                    test_foreign_thread_ram_read_leaf);
     g_test_add_func("/agfx/memory/topology-seq-brackets-publication",
                     test_topology_seq_brackets_publication);
     g_test_add_func("/agfx/memory/capture-retained-keeps-backing",

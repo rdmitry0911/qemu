@@ -22530,6 +22530,11 @@ static int qemu_read_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
     if (s && s->debug_level >= 5) {
         trace_apple_gfx_ml_dma_read(gpa, size);
     }
+    /* Same address space/attributes as agfx_do_dma; non-direct targets keep
+     * the BQL device path for the whole read. */
+    if (size == 0 || agfx_memory_read_ram_any_thread(gpa, buf, size)) {
+        return 0;
+    }
     qemu_event_init(&job.event, false);
     agfx_schedule_host_bh(s, agfx_do_dma, &job);
     qemu_event_wait(&job.event);

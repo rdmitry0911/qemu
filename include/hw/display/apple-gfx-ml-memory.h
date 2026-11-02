@@ -100,6 +100,49 @@ static inline int agfx_memory_mark_mapped_dirty_any_thread(void *hva,
     return result;
 }
 
+/* RAM-copy leaf of the device physical read: every span of [gpa, gpa+size)
+ * that translates to directly accessible RAM (memory_access_is_direct: RAM or
+ * ROMD, never RAM-device or I/O) is copied by the calling thread inside a
+ * registered RCU read section, so the read needs neither the BQL nor a
+ * main-loop BH. Returns false at the first span that is not direct; the caller
+ * then performs the WHOLE read on its unchanged BQL device path, which rewrites
+ * the entire destination (a read has no guest-visible side effect, so the
+ * abandoned prefix is never observable). Writes and mappings are unaffected. */
+static inline bool agfx_memory_read_ram_any_thread(uint64_t gpa, void *buf,
+                                                   size_t size)
+{
+    uint8_t *dst = buf;
+    bool copied = true;
+
+    agfx_memory_rcu_enter();
+    FlatView *view = address_space_to_flatview(&address_space_memory);
+    while (size > 0) {
+        hwaddr offset = 0;
+        hwaddr length = size;
+        MemoryRegion *mr = view ?
+            flatview_translate(view, gpa, &offset, &length, false,
+                               MEMTXATTRS_UNSPECIFIED) : NULL;
+        const void *source;
+
+        if (!mr || length == 0 || length > size || !mr->ram_block ||
+            !memory_access_is_direct(mr, false, MEMTXATTRS_UNSPECIFIED)) {
+            copied = false;
+            break;
+        }
+        source = qemu_map_ram_ptr(mr->ram_block, offset);
+        if (!source) {
+            copied = false;
+            break;
+        }
+        memcpy(dst, source, length);
+        dst += length;
+        gpa += length;
+        size -= length;
+    }
+    agfx_memory_rcu_leave();
+    return copied;
+}
+
 /* Seqlock over address-space publication. memory_region_transaction_commit
  * (under BQL) calls every listener's begin before any address_space_set_flatview
  * and commit after all current_map stores: odd = publication in progress. */
