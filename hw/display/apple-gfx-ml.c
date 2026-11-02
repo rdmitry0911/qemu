@@ -55,6 +55,7 @@
 #include "qmu/qmetal_unified.h"
 #include "qmu/qmu_owned_display_frame.h"
 #include "qmu_ordinary_task_memory_v1.h"
+#include "qmu_mapped_transport_v1.h"
 
 /* Forward declarations from qmu_vulkan.h (C++ header, can't include directly) */
 struct qmu_vulkan_ctx;
@@ -76,6 +77,9 @@ static void agfx_destroy_ordinary_physical(AppleGfxMLState *s);
 /* Optional on an older matched ordinary stack. Once present, this complete
  * CPU peer is required; a mismatch cannot activate a partial full18 table. */
 #pragma weak qmu_get_private_ordinary_task_memory_v1
+/* Optional retained-RAM transport provider; absent on older DSOs (callback
+ * path unchanged). A present export must match exactly. */
+#pragma weak qmu_get_private_mapped_transport_v1
 
 typedef struct AppleGfxMLSessionJob AppleGfxMLSessionJob;
 typedef struct AgfxLogEntry AgfxLogEntry;
@@ -23052,6 +23056,76 @@ static bool agfx_install_ordinary_physical_comparison(AppleGfxMLState *s,
     return true;
 }
 
+static uint64_t agfx_topology_sequence(void *ctx)
+{
+    AppleGfxMLState *s = ctx;
+
+    return agfx_topology_seq_read(&s->topology);
+}
+
+/* RETAINED_RAM_V1 capture, callable from any thread; a rejected capture is
+ * unpinned on the existing BQL unmap path. */
+static void *agfx_map_retained(void *ctx, uint64_t gpa, size_t size,
+                               int writable, uint64_t *sequence)
+{
+    AppleGfxMLState *s = ctx;
+    void *rejected = NULL;
+    void *ptr;
+
+    if (!sequence) {
+        return NULL;
+    }
+    ptr = agfx_memory_capture_retained(&s->topology, gpa, size, writable,
+                                       sequence, &rejected);
+    if (rejected) {
+        qemu_unmap_gpa(s, rejected, size, 0);
+    }
+    return ptr;
+}
+
+static bool agfx_negotiate_mapped_transport(AppleGfxMLState *s, Error **errp)
+{
+    const struct qmu_private_mapped_transport_v1 *api;
+
+    if (!qmu_get_private_mapped_transport_v1) {
+        return true; /* Older DSO: unchanged callback transport. */
+    }
+    api = qmu_get_private_mapped_transport_v1();
+    if (!api || api->version != QMU_PRIVATE_MAPPED_TRANSPORT_V1_VERSION ||
+        api->struct_size != sizeof(*api) || !api->install) {
+        error_setg(errp, "Mismatched private mapped-transport peer");
+        return false;
+    }
+    s->mapped_transport_peer = api;
+    return true;
+}
+
+/* After the ordinary peers and before MMIO/present workers or Console: no
+ * FIFO ingress exists yet. A rejection leaves the Session unchanged on the
+ * callback path. The listener stays registered until after Session destroy. */
+static void agfx_install_mapped_transport(AppleGfxMLState *s)
+{
+    struct qmu_mapped_transport_provider_v1 provider = {
+        .version = QMU_PRIVATE_MAPPED_TRANSPORT_V1_VERSION,
+        .struct_size = sizeof(provider),
+        .contract = QMU_MAPPED_TRANSPORT_RETAINED_RAM_V1,
+        .ctx = s,
+        .map_retained = agfx_map_retained,
+        .topology_sequence = agfx_topology_sequence,
+    };
+
+    if (!s->mapped_transport_peer) {
+        return;
+    }
+    agfx_topology_seq_register(&s->topology, "apple-gfx-ml-topology");
+    s->mapped_transport_installed =
+        s->mapped_transport_peer->install(s->qmu_dev, &provider) ==
+        QMU_MAPPED_TRANSPORT_INSTALLED;
+    if (!s->mapped_transport_installed) {
+        warn_report("apple-gfx-ml: mapped transport rejected; callback path");
+    }
+}
+
 static bool agfx_negotiate_ordinary_task_memory(AppleGfxMLState *s,
                                                  Error **errp)
 {
@@ -25596,7 +25670,8 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     qmu_config.mode_count = 3;
 
     if (!agfx_negotiate_ordinary_physical(s, errp) ||
-        !agfx_negotiate_ordinary_task_memory(s, errp)) {
+        !agfx_negotiate_ordinary_task_memory(s, errp) ||
+        !agfx_negotiate_mapped_transport(s, errp)) {
         goto fail_sync;
     }
     s->qmu_dev = qmu_create_extended(&qmu_config, &qmu_callbacks);
@@ -25657,6 +25732,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
 
     qmu_log_set_callback(agfx_qmu_log_callback, s);
     qmu_set_debug_level(s->qmu_dev, s->debug_level);
+    agfx_install_mapped_transport(s);
 
     /* Start wrapper-owned serial worker threads. */
     qemu_sem_init(&s->mmio_sem, 0);
@@ -25914,6 +25990,8 @@ static void agfx_exit(PCIDevice *pci_dev)
     agfx_eeee_native_context_stop_acquiring(s->ordinary_task_memory_context);
     agfx_destroy_ordinary_physical(s);
     agfx_return_ordinary_task_memory_after_destroy(s);
+    /* Session destroy has returned: no provider owner remains. */
+    agfx_topology_seq_unregister(&s->topology);
     if (s->ordinary_physical_receipt) {
         bool disposed = s->ordinary_physical_peer->dispose_returned(
             s->ordinary_physical_receipt);

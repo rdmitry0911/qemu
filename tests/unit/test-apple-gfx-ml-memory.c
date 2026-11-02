@@ -309,6 +309,160 @@ static void test_foreign_thread_map_and_dirty_without_bql(void)
     drain_flatviews();
     fixture_free(f);
 }
+
+/* Seqlock over publication: a listener's region_add runs between every
+ * listener's begin and commit, so it must observe an odd sequence. */
+static uint64_t probe_seen_seq;
+static AgfxTopologySeq *probe_topology;
+static void probe_region_add(MemoryListener *listener,
+                             MemoryRegionSection *section)
+{
+    if (probe_topology) {
+        probe_seen_seq = agfx_topology_seq_read(probe_topology);
+    }
+}
+
+static void test_topology_seq_brackets_publication(void)
+{
+    Fixture *f = fixture_new();
+    AgfxTopologySeq topology = { 0 };
+    MemoryListener probe = { .name = "agfx-probe",
+                             .region_add = probe_region_add,
+                             .priority = MEMORY_LISTENER_PRIORITY_MIN };
+    MemoryRegion extra;
+    uint64_t before;
+
+    agfx_topology_seq_register(&topology, "agfx-test-topology");
+    before = agfx_topology_seq_read(&topology);
+    g_assert_cmpuint(before & 1, ==, 0);
+    memory_listener_register(&probe, &address_space_memory);
+    g_assert_cmpuint(agfx_topology_seq_read(&topology), ==, before);
+    probe_topology = &topology;
+    probe_seen_seq = 0;
+    g_assert_true(memory_region_init_ram_nomigrate(
+        &extra, OBJECT(f->owner), "agfx-memory-extra", f->page, &error_abort));
+    memory_region_add_subregion(get_system_memory(), UINT64_C(0x60000000),
+                                &extra);
+    g_assert_cmpuint(probe_seen_seq & 1, ==, 1);
+    g_assert_cmpuint(agfx_topology_seq_read(&topology), ==, before + 2);
+    memory_region_del_subregion(get_system_memory(), &extra);
+    g_assert_cmpuint(agfx_topology_seq_read(&topology), ==, before + 4);
+    probe_topology = NULL;
+    memory_listener_unregister(&probe);
+    agfx_topology_seq_unregister(&topology);
+    drain_flatviews();
+    object_unparent(OBJECT(&extra));
+    fixture_free(f);
+}
+
+/* Retained capture: refused during a publication; an accepted alias keeps
+ * its backing after the GPA is republished to a different RAM region. */
+static void test_capture_retained_keeps_backing(void)
+{
+    Fixture *f = fixture_new();
+    Object *owner = OBJECT(f->owner);
+    AgfxTopologySeq topology = { 0 };
+    uint8_t *ram = memory_region_get_ram_ptr(&f->owner->ram);
+    MemoryRegion replacement;
+    uint64_t seq_a = 0, seq_b = 0;
+    void *rejected = (void *)1;
+    uint8_t *a, *b;
+
+    agfx_topology_seq_register(&topology, "agfx-test-topology");
+    qatomic_inc(&topology.seq);  /* publication in progress */
+    g_assert_null(agfx_memory_capture_retained(&topology, ALIAS_A_GPA,
+                                               f->page, 1, &seq_a, &rejected));
+    g_assert_null(rejected);
+    g_assert_cmpuint(owner->ref, ==, f->baseline_refs);
+    qatomic_inc(&topology.seq);
+
+    a = agfx_memory_capture_retained(&topology, ALIAS_A_GPA, f->page, 1,
+                                     &seq_a, &rejected);
+    g_assert_true(a == ram + f->page);
+    g_assert_null(rejected);
+    g_assert_cmpuint(seq_a, ==, agfx_topology_seq_read(&topology));
+    g_assert_cmpuint(owner->ref, ==, f->baseline_refs + 1);
+
+    /* Republish GPA ALIAS_A_GPA onto a different RAM region. */
+    g_assert_true(memory_region_init_ram_nomigrate(
+        &replacement, OBJECT(f->owner), "agfx-memory-b", f->page,
+        &error_abort));
+    memory_region_transaction_begin();
+    memory_region_del_subregion(get_system_memory(), &f->owner->alias_a);
+    memory_region_add_subregion(get_system_memory(), ALIAS_A_GPA,
+                                &replacement);
+    memory_region_transaction_commit();
+    g_assert_cmpuint(agfx_topology_seq_read(&topology), ==, seq_a + 2);
+
+    b = agfx_memory_capture_retained(&topology, ALIAS_A_GPA, f->page, 1,
+                                     &seq_b, &rejected);
+    g_assert_true(b == memory_region_get_ram_ptr(&replacement));
+    g_assert_cmpuint(seq_b, ==, seq_a + 2);
+    a[5] = 0xa5;  /* retained alias still writes backing A */
+    g_assert_cmpuint(ram[f->page + 5], ==, 0xa5);
+    g_assert_cmpuint(b[5], !=, 0xa5);
+
+    agfx_memory_unmap_gpa(b, f->page, 0);
+    agfx_memory_unmap_gpa(a, f->page, 0);
+    memory_region_transaction_begin();
+    memory_region_del_subregion(get_system_memory(), &replacement);
+    memory_region_add_subregion(get_system_memory(), ALIAS_A_GPA,
+                                &f->owner->alias_a);
+    memory_region_transaction_commit();
+    agfx_topology_seq_unregister(&topology);
+    drain_flatviews();
+    object_unparent(OBJECT(&replacement));
+    g_assert_cmpuint(owner->ref, ==, f->baseline_refs);
+    fixture_free(f);
+}
+/* A publication completing after the map acquired its pin and before the
+ * final sequence comparison: the capture is rejected and the exact acquired
+ * alias is handed back for exactly one matching release. */
+static MemoryRegion *overlap_region;
+static void *overlap_map(uint64_t gpa, size_t size, int writable)
+{
+    void *ptr = agfx_memory_map_gpa_any_thread(gpa, size, writable);
+
+    memory_region_add_subregion(get_system_memory(), UINT64_C(0x70000000),
+                                overlap_region);  /* begin..commit inside */
+    return ptr;
+}
+
+static void test_capture_retained_overlap_rejected(void)
+{
+    Fixture *f = fixture_new();
+    Object *owner = OBJECT(f->owner);
+    AgfxTopologySeq topology = { 0 };
+    uint8_t *ram = memory_region_get_ram_ptr(&f->owner->ram);
+    MemoryRegion extra;
+    uint64_t sequence = 0, before;
+    uint32_t with_pin;
+    void *rejected = NULL;
+
+    g_assert_true(memory_region_init_ram_nomigrate(
+        &extra, OBJECT(f->owner), "agfx-memory-overlap", f->page,
+        &error_abort));
+    overlap_region = &extra;
+    agfx_topology_seq_register(&topology, "agfx-test-topology");
+    before = agfx_topology_seq_read(&topology);
+    g_assert_null(agfx_memory_capture_retained_with(
+        &topology, ALIAS_A_GPA, f->page, 1, &sequence, &rejected,
+        overlap_map));
+    g_assert_true(rejected == ram + f->page);
+    g_assert_cmpuint(sequence, ==, 0);
+    g_assert_cmpuint(agfx_topology_seq_read(&topology), ==, before + 2);
+    /* The new FlatView also references this owner; measure the pin alone. */
+    with_pin = owner->ref;
+    agfx_memory_unmap_gpa(rejected, f->page, 0);  /* the caller's release */
+    g_assert_cmpuint(owner->ref, ==, with_pin - 1);
+    memory_region_del_subregion(get_system_memory(), &extra);
+    agfx_topology_seq_unregister(&topology);
+    drain_flatviews();
+    object_unparent(OBJECT(&extra));
+    drain_flatviews();
+    g_assert_cmpuint(owner->ref, ==, f->baseline_refs);
+    fixture_free(f);
+}
 #endif
 
 int main(int argc, char **argv)
@@ -332,6 +486,12 @@ int main(int argc, char **argv)
 #ifndef AGFX_MEMORY_BASELINE_CONTROL
     g_test_add_func("/agfx/memory/foreign-thread-map-dirty-without-bql",
                     test_foreign_thread_map_and_dirty_without_bql);
+    g_test_add_func("/agfx/memory/topology-seq-brackets-publication",
+                    test_topology_seq_brackets_publication);
+    g_test_add_func("/agfx/memory/capture-retained-keeps-backing",
+                    test_capture_retained_keeps_backing);
+    g_test_add_func("/agfx/memory/capture-retained-overlap-rejected",
+                    test_capture_retained_overlap_rejected);
 #endif
     status = g_test_run();
     qemu_cleanup(status);

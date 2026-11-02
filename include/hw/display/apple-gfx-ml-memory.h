@@ -100,4 +100,85 @@ static inline int agfx_memory_mark_mapped_dirty_any_thread(void *hva,
     return result;
 }
 
+/* Seqlock over address-space publication. memory_region_transaction_commit
+ * (under BQL) calls every listener's begin before any address_space_set_flatview
+ * and commit after all current_map stores: odd = publication in progress. */
+typedef struct AgfxTopologySeq {
+    MemoryListener listener;
+    uint64_t seq;
+    bool registered;
+} AgfxTopologySeq;
+
+static inline void agfx_topology_seq_advance(MemoryListener *listener)
+{
+    qatomic_inc(&container_of(listener, AgfxTopologySeq, listener)->seq);
+}
+
+/* Under BQL. Registration itself runs begin/commit once (even result). */
+static inline void agfx_topology_seq_register(AgfxTopologySeq *topology,
+                                              const char *name)
+{
+    topology->listener = (MemoryListener) {
+        .name = name,
+        .begin = agfx_topology_seq_advance,
+        .commit = agfx_topology_seq_advance,
+        .priority = MEMORY_LISTENER_PRIORITY_MIN,
+    };
+    memory_listener_register(&topology->listener, &address_space_memory);
+    topology->registered = true;
+}
+
+static inline void agfx_topology_seq_unregister(AgfxTopologySeq *topology)
+{
+    if (topology->registered) {
+        memory_listener_unregister(&topology->listener);
+        topology->registered = false;
+    }
+}
+
+static inline uint64_t agfx_topology_seq_read(AgfxTopologySeq *topology)
+{
+    return qatomic_load_acquire(&topology->seq);
+}
+
+/* Retained capture: one direct RAM alias + its MR reference, accepted only
+ * when no publication was in progress at its start and none began before its
+ * end. A mapping acquired but rejected is handed back in *rejected for the
+ * caller's own unpin path (never unpinned here). */
+static inline void *agfx_memory_capture_retained_with(
+    AgfxTopologySeq *topology, uint64_t gpa, size_t size, int writable,
+    uint64_t *sequence, void **rejected,
+    void *(*map)(uint64_t gpa, size_t size, int writable))
+{
+    uint64_t begin = agfx_topology_seq_read(topology);
+    void *ptr;
+
+    *rejected = NULL;
+    if (begin & 1) {
+        return NULL;
+    }
+    ptr = map(gpa, size, writable);
+    if (!ptr) {
+        return NULL;
+    }
+    smp_rmb();
+    if (qatomic_read(&topology->seq) != begin) {
+        *rejected = ptr;
+        return NULL;
+    }
+    *sequence = begin;
+    return ptr;
+}
+
+static inline void *agfx_memory_capture_retained(AgfxTopologySeq *topology,
+                                                 uint64_t gpa, size_t size,
+                                                 int writable,
+                                                 uint64_t *sequence,
+                                                 void **rejected)
+{
+    return agfx_memory_capture_retained_with(topology, gpa, size, writable,
+                                             sequence, rejected,
+                                             agfx_memory_map_gpa_any_thread);
+}
+
 #endif /* HW_DISPLAY_APPLE_GFX_ML_MEMORY_H */

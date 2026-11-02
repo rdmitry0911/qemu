@@ -18,6 +18,7 @@
 #include "qemu/typedefs.h"
 #include "qemu/thread.h"      /* QemuThread, QemuSemaphore, QemuMutex */
 #include "qemu/notify.h"
+#include "hw/display/apple-gfx-ml-memory.h"  /* AgfxTopologySeq */
 
 /* Forward declaration - defined in qmetal unified API */
 typedef struct qmu_session qmu_session;
@@ -119,6 +120,13 @@ struct AppleGfxMLState {
     const struct qmu_private_ordinary_task_memory_v1 *ordinary_task_memory_peer;
     void *ordinary_task_memory_receipt;
     uint32_t ordinary_task_memory_install_result;
+
+    /* Optional retained-RAM FIFO/stamp transport provider; topology is the
+     * address-space publication seqlock. State outlives every QMetal owner
+     * of the provider (listener unregistered after Session destroy). */
+    const struct qmu_private_mapped_transport_v1 *mapped_transport_peer;
+    AgfxTopologySeq topology;
+    bool mapped_transport_installed;
 
     /* QEMU display */
     QemuConsole *con;
