@@ -19,6 +19,7 @@
 #include "system/ramblock.h"
 
 #include "apple-gfx-ml.h"
+#include "hw/display/apple-gfx-ml-memory.h"
 #include "apple-gfx-eeee-process-vm.h"
 #include "apple-gfx-eeee-source-dmabuf.h"
 #include "apple-gfx-ordinary-physical-capture.h"
@@ -797,11 +798,12 @@ static uint64_t agfx_eeee_task_host_page_size(void *ctx)
 
 /* QMetal's accepted workers are not QEMU-created RCU readers. Register the
  * actual reader for exactly the outer callback interval, preserving existing
- * QEMU/main readers and nested facility scopes on the same thread. */
+ * QEMU/main readers and nested facility scopes on the same thread. Shared
+ * with the direct map/dirty callbacks through apple-gfx-ml-memory.h. */
 static __thread unsigned agfx_memory_rcu_depth;
 static __thread bool agfx_memory_rcu_registered_here;
 
-static void agfx_memory_rcu_enter(void)
+void agfx_memory_rcu_enter(void)
 {
     if (agfx_memory_rcu_depth++ == 0) {
         agfx_memory_rcu_registered_here = !rcu_thread_is_registered();
@@ -812,7 +814,7 @@ static void agfx_memory_rcu_enter(void)
     rcu_read_lock();
 }
 
-static void agfx_memory_rcu_leave(void)
+void agfx_memory_rcu_leave(void)
 {
     rcu_read_unlock();
     if (--agfx_memory_rcu_depth == 0 && agfx_memory_rcu_registered_here) {

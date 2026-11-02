@@ -11,6 +11,13 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 
+/* QMetal workers and the agfx-io MMIO worker are not QEMU-created RCU
+ * readers. This registers the calling thread for exactly the outer interval
+ * when it is not already registered and nests on the same thread; the
+ * definitions live with the existing task-provider users. */
+void agfx_memory_rcu_enter(void);
+void agfx_memory_rcu_leave(void);
+
 /* A successful map owns one canonical MemoryRegion reference. */
 static inline void *agfx_memory_map_gpa(uint64_t gpa, size_t size, int writable)
 {
@@ -48,9 +55,10 @@ static inline void agfx_memory_unmap_gpa(void *hva, size_t size, int dirty)
     }
 }
 
-/* Called under BQL by the synchronous dirty-notification BH. The incoming
- * mapping owns the region pin; memory_region_from_host() only borrows it.
- * Notifying a host write must never consume that pin. */
+/* The incoming mapping owns the region pin; memory_region_from_host() only
+ * borrows it. Notifying a host write must never consume that pin. Needs an
+ * RCU read-side section (dirty bitmap blocks) but not BQL: it is the same
+ * atomic dirty-range operation a vCPU write performs. */
 static inline int agfx_memory_mark_mapped_dirty(void *hva, size_t size)
 {
     ram_addr_t offset;
@@ -65,6 +73,31 @@ static inline int agfx_memory_mark_mapped_dirty(void *hva, size_t size)
     }
     memory_region_set_dirty(mr, offset, size);
     return 0;
+}
+
+/* Any-thread forms used by the QMetal callbacks. The map form preserves the
+ * leaf's admission and its one MR reference; the dirty form keeps borrowing
+ * the caller's live pin and never unmaps. Final unpin stays the BQL path. */
+static inline void *agfx_memory_map_gpa_any_thread(uint64_t gpa, size_t size,
+                                                   int writable)
+{
+    void *ptr;
+
+    agfx_memory_rcu_enter();
+    ptr = agfx_memory_map_gpa(gpa, size, writable);
+    agfx_memory_rcu_leave();
+    return ptr;
+}
+
+static inline int agfx_memory_mark_mapped_dirty_any_thread(void *hva,
+                                                           size_t size)
+{
+    int result;
+
+    agfx_memory_rcu_enter();
+    result = agfx_memory_mark_mapped_dirty(hva, size);
+    agfx_memory_rcu_leave();
+    return result;
 }
 
 #endif /* HW_DISPLAY_APPLE_GFX_ML_MEMORY_H */

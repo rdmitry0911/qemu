@@ -22379,7 +22379,7 @@ void agfx_qmu_log_callback(void *ctx,
 static void *qemu_map_gpa(void *ctx, uint64_t gpa, size_t size, int writable)
 {
     AppleGfxMLState *s = ctx;
-    void *ptr = agfx_memory_map_gpa(gpa, size, writable);
+    void *ptr = agfx_memory_map_gpa_any_thread(gpa, size, writable);
 
     if (ptr && s && s->debug_level >= 5) {
         trace_apple_gfx_ml_map_gpa(gpa, size, ptr, writable);
@@ -22462,49 +22462,18 @@ static void qemu_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
     agfx_unmap_bql(agfx_unmap_gpa_call, &unmap);
 }
 
-/* A direct shared MTLBuffer is imported over a pinned guest-RAM HVA.  The GPU
- * can write that allocation without a later CPU copy, but QEMU still needs a
- * main-loop/BQL dirty-accounting edge before the guest observes completion.
- * This deliberately does not release the mapping: Buffer::importGuestPages
- * owns that lifetime and qemu_unmap_gpa remains its sole unpin path. */
-typedef struct AgfxMappedDirtyJob {
-    void *hva;
-    size_t size;
-    int result;
-    QemuEvent event;
-} AgfxMappedDirtyJob;
-
-static void agfx_mark_mapped_dirty_bh(void *opaque)
-{
-    AgfxMappedDirtyJob *job = opaque;
-    if (!job || !job->hva || job->size == 0) {
-        if (job) {
-            job->result = -1;
-            qemu_event_set(&job->event);
-        }
-        return;
-    }
-
-    job->result = agfx_memory_mark_mapped_dirty(job->hva, job->size);
-    qemu_event_set(&job->event);
-}
-
+/* A direct shared MTLBuffer (and any other caller-held map_gpa mapping) is
+ * dirtied in place: the caller's pin keeps the canonical MR alive and the
+ * operation is the atomic dirty-range update under an RCU reader, the same
+ * one a vCPU write performs, so no BQL/main-loop edge is needed. This never
+ * releases the mapping; qemu_unmap_gpa remains its sole unpin path. */
 static int qemu_mark_mapped_memory_dirty(void *ctx, void *hva, size_t size)
 {
     AppleGfxMLState *s = ctx;
     if (!s || !hva || size == 0) {
         return -1;
     }
-    AgfxMappedDirtyJob job = {
-        .hva = hva,
-        .size = size,
-        .result = -1,
-    };
-    qemu_event_init(&job.event, false);
-    agfx_schedule_host_bh(s, agfx_mark_mapped_dirty_bh, &job);
-    qemu_event_wait(&job.event);
-    qemu_event_destroy(&job.event);
-    return job.result;
+    return agfx_memory_mark_mapped_dirty_any_thread(hva, size);
 }
 
 /* ============================================================

@@ -230,6 +230,87 @@ static void test_detached_owner_survives_until_unmap(void)
     g_free(f);
 }
 
+#ifndef AGFX_MEMORY_BASELINE_CONTROL
+/* A QMetal worker is a plain thread: neither BQL holder nor a QEMU-created
+ * RCU reader. The main thread keeps BQL for the whole interval and only joins,
+ * so any hidden BH/BQL edge in either operation would deadlock this case. */
+typedef struct ForeignDirty {
+    Fixture *f;
+    uint8_t *mapped;
+    bool registered_before;
+    bool registered_inside;
+    bool registered_after;
+    bool held_bql;
+    int failures;
+} ForeignDirty;
+
+static void *foreign_dirty_thread(void *opaque)
+{
+    ForeignDirty *job = opaque;
+
+    job->registered_before = rcu_thread_is_registered();
+    job->held_bql = bql_locked();
+    agfx_memory_rcu_enter();
+    agfx_memory_rcu_enter();
+    job->registered_inside = rcu_thread_is_registered();
+    agfx_memory_rcu_leave();
+    job->registered_inside &= rcu_thread_is_registered();
+    agfx_memory_rcu_leave();
+    job->mapped = agfx_memory_map_gpa_any_thread(RAM_GPA + 2 * job->f->page,
+                                                 job->f->page, 1);
+    if (job->mapped) {
+        job->mapped[11] = 0x5a;
+        for (unsigned i = 0; i < 256; ++i) {
+            if (agfx_memory_mark_mapped_dirty_any_thread(job->mapped + 8,
+                                                         32) != 0) {
+                job->failures++;
+            }
+        }
+    }
+    job->registered_after = rcu_thread_is_registered();
+    return NULL;
+}
+
+static void test_foreign_thread_map_and_dirty_without_bql(void)
+{
+    Fixture *f = fixture_new();
+    Object *owner = OBJECT(f->owner);
+    uint8_t *ram = memory_region_get_ram_ptr(&f->owner->ram);
+    ForeignDirty job = { .f = f };
+    DirtyBitmapSnapshot *snap;
+    QemuThread thread;
+
+    memory_region_set_log(&f->owner->ram, true, DIRTY_MEMORY_VGA);
+    drain_flatviews();
+    memory_region_reset_dirty(&f->owner->ram, 0, 4 * f->page, DIRTY_MEMORY_VGA);
+    g_assert_true(bql_locked());
+    qemu_thread_create(&thread, "agfx-foreign", foreign_dirty_thread, &job,
+                       QEMU_THREAD_JOINABLE);
+    qemu_thread_join(&thread);
+    g_assert_false(job.registered_before);
+    g_assert_false(job.held_bql);
+    g_assert_true(job.registered_inside);
+    g_assert_false(job.registered_after);
+    g_assert_true(job.mapped == ram + 2 * f->page);
+    g_assert_cmpint(job.failures, ==, 0);
+    g_assert_cmpuint(owner->ref, ==, f->baseline_refs + 1);
+    g_assert_cmpuint(ram[2 * f->page + 11], ==, 0x5a);
+    snap = memory_region_snapshot_and_clear_dirty(&f->owner->ram, 0,
+                                                   4 * f->page,
+                                                   DIRTY_MEMORY_VGA);
+    for (unsigned i = 0; i < 4; ++i) {
+        g_assert_cmpint(memory_region_snapshot_get_dirty(&f->owner->ram, snap,
+                         i * f->page, f->page), ==, i == 2);
+    }
+    g_free(snap);
+    agfx_memory_unmap_gpa(job.mapped, f->page, 0);
+    g_assert_cmpuint(owner->ref, ==, f->baseline_refs);
+    memory_region_set_log(&f->owner->ram, false, DIRTY_MEMORY_VGA);
+    drain_flatviews();
+    fixture_free(f);
+}
+#endif
+
 int main(int argc, char **argv)
 {
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
@@ -248,6 +329,10 @@ int main(int argc, char **argv)
     g_test_add_func("/agfx/memory/admission-rom", test_admission_and_rom);
     g_test_add_func("/agfx/memory/detached-owner-last-pin",
                     test_detached_owner_survives_until_unmap);
+#ifndef AGFX_MEMORY_BASELINE_CONTROL
+    g_test_add_func("/agfx/memory/foreign-thread-map-dirty-without-bql",
+                    test_foreign_thread_map_and_dirty_without_bql);
+#endif
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();
