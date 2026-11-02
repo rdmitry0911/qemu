@@ -726,6 +726,23 @@ bool aio_poll(AioContext *ctx, bool blocking)
 
     progress |= timerlistgroup_run_timers(&ctx->tlg);
 
+    /*
+     * The glib event loop may be asleep on this AioContext right now: a vCPU
+     * thread holding the BQL runs aio_poll(qemu_get_aio_context()) from
+     * AIO_WAIT_WHILE() while the main loop thread sleeps in ppoll().
+     * ->wait() re-armed the one-shot fd monitoring requests it completed
+     * (fdmon-io_uring queues IORING_OP_POLL_ADD SQEs, the ctx notifier
+     * included), which are normally submitted only by the next ->wait() or
+     * ->gsource_prepare().  Until then the kernel does not monitor the
+     * notifier, so aio_notify() cannot wake the sleeping loop and new bottom
+     * halves wait for its next timer.  The ready handlers have consumed their
+     * events by now, so hand the re-armed requests over as the glib loop's
+     * own prepare step would.
+     */
+    if (g_source_get_context(&ctx->source)) {
+        ctx->fdmon_ops->gsource_prepare(ctx);
+    }
+
     return progress;
 }
 
