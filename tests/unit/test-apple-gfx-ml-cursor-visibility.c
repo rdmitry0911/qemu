@@ -17,6 +17,12 @@ typedef struct Fixture {
     DisplayChangeListener listener;
     unsigned updates;
     bool observed[256];
+    unsigned defines;
+    int defined_width;
+    int defined_height;
+    int defined_hot_x;
+    int defined_hot_y;
+    uint32_t defined[16];
 } Fixture;
 
 int (*qemu_main)(void);
@@ -32,9 +38,25 @@ static void observe_cursor(DisplayChangeListener *listener,
     g_assert_cmpint(y, ==, -7);
 }
 
+static void observe_cursor_define(DisplayChangeListener *listener,
+                                  QEMUCursor *cursor)
+{
+    Fixture *f = container_of(listener, Fixture, listener);
+    size_t pixels = (size_t)cursor->width * cursor->height;
+
+    g_assert_cmpuint(pixels, <=, ARRAY_SIZE(f->defined));
+    f->defines++;
+    f->defined_width = cursor->width;
+    f->defined_height = cursor->height;
+    f->defined_hot_x = cursor->hot_x;
+    f->defined_hot_y = cursor->hot_y;
+    memcpy(f->defined, cursor->data, pixels * sizeof(uint32_t));
+}
+
 static const DisplayChangeListenerOps listener_ops = {
     .dpy_name = "test-agfx-cursor-visibility",
     .dpy_mouse_set = observe_cursor,
+    .dpy_cursor_define = observe_cursor_define,
 };
 
 static const GraphicHwOps console_ops = { };
@@ -56,7 +78,9 @@ static Fixture *fixture_new(void)
     f->listener.ops = &listener_ops;
     f->listener.con = s->con;
     register_displaychangelistener(&f->listener);
+    /* A reused console replays its previous cursor on registration. */
     f->updates = 0;
+    f->defines = 0;
     return f;
 }
 
@@ -143,6 +167,70 @@ static void test_repeated_updates_and_null_callbacks(void)
     fixture_free(f);
 }
 
+/*
+ * Production glyph path: host callback -> owned copy -> BH conversion ->
+ * dpy_cursor_define.  Reference copy_GuestBGRA_ToHostBGRA_Task reads row y at
+ * y * stride into a packed width * 4 row; QMetal has already validated
+ * (height - 1) * stride + width * 4 <= mapped_length, with no stride lower
+ * bound.  Each source byte is distinct, so every row origin is observable.
+ */
+static uint32_t expected_pixel(const uint8_t *src)
+{
+    return ((uint32_t)src[0] << 16) | ((uint32_t)src[1] << 8) |
+           (uint32_t)src[2] | ((uint32_t)src[3] << 24);
+}
+
+static void check_glyph(uint64_t stride, uint32_t width, uint32_t height,
+                        uint64_t mapped_length)
+{
+    Fixture *f = fixture_new();
+    uint8_t src[64];
+
+    g_assert_cmpuint(mapped_length, <=, sizeof(src));
+    for (unsigned i = 0; i < sizeof(src); ++i) {
+        src[i] = (uint8_t)(0x11 + i * 7);
+    }
+    apple_gfx_ml_cursor_glyph(f->state, src, mapped_length, stride, width,
+                              height, 1, 2, 0);
+    g_assert_cmpuint(f->defines, ==, 0);
+    pump_bhs();
+    g_assert_cmpuint(f->defines, ==, 1);
+    g_assert_cmpint(f->defined_width, ==, width);
+    g_assert_cmpint(f->defined_height, ==, height);
+    g_assert_cmpint(f->defined_hot_x, ==, 1);
+    g_assert_cmpint(f->defined_hot_y, ==, 2);
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint8_t *px = src + y * stride + x * 4u;
+
+            g_assert_cmphex(f->defined[y * width + x], ==, expected_pixel(px));
+        }
+    }
+    fixture_free(f);
+}
+
+static void test_glyph_packed_rows(void)
+{
+    check_glyph(8, 2, 2, 16);
+}
+
+static void test_glyph_padded_rows(void)
+{
+    check_glyph(12, 2, 2, 20);
+}
+
+static void test_glyph_overlapping_rows(void)
+{
+    /* stride < width * 4: (2 - 1) * 4 + 2 * 4 = 12 bytes. */
+    check_glyph(4, 2, 2, 12);
+}
+
+static void test_glyph_zero_stride_rows(void)
+{
+    /* Every row is the same 8 source bytes. */
+    check_glyph(0, 2, 3, 8);
+}
+
 int main(int argc, char **argv)
 {
     char options[][16] = {"-machine", "none", "-accel", "tcg", "-nodefaults",
@@ -161,6 +249,12 @@ int main(int argc, char **argv)
                     test_earlier_move_observes_later_hide);
     g_test_add_func("/agfx/cursor-visibility/repeated-and-null",
                     test_repeated_updates_and_null_callbacks);
+    g_test_add_func("/agfx/cursor-glyph/packed-rows", test_glyph_packed_rows);
+    g_test_add_func("/agfx/cursor-glyph/padded-rows", test_glyph_padded_rows);
+    g_test_add_func("/agfx/cursor-glyph/overlapping-rows",
+                    test_glyph_overlapping_rows);
+    g_test_add_func("/agfx/cursor-glyph/zero-stride-rows",
+                    test_glyph_zero_stride_rows);
     status = g_test_run();
     qemu_cleanup(status);
     bql_unlock();

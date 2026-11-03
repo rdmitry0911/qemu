@@ -88,6 +88,10 @@ void agfx_publish_display_mode(AppleGfxMLState *s, uint32_t width, uint32_t heig
  * No QMetal session or physical GPU is needed to exercise the UI handoff. */
 void apple_gfx_ml_cursor_show(void *ctx, uint32_t display_id, int visible);
 void apple_gfx_ml_cursor_move(void *ctx, uint32_t display_id);
+void apple_gfx_ml_cursor_glyph(void *ctx, const void *pixels,
+                               uint64_t mapped_length, uint64_t stride,
+                               uint32_t width, uint32_t height,
+                               uint32_t hot_x, uint32_t hot_y, uint32_t sum);
 
 /* Device state - minimal, all logic in qmetal */
 struct AppleGfxMLState {

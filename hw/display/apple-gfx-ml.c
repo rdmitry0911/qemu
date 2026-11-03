@@ -24503,15 +24503,15 @@ static void apple_gfx_ml_cursor_move_bh(void *opaque)
     g_free(job);
 }
 
-static void qemu_cursor_glyph(void *ctx,
-                              const void *pixels,
-                              uint64_t mapped_length,
-                              uint64_t stride,
-                              uint32_t width,
-                              uint32_t height,
-                              uint32_t hot_x,
-                              uint32_t hot_y,
-                              uint32_t sum)
+void apple_gfx_ml_cursor_glyph(void *ctx,
+                               const void *pixels,
+                               uint64_t mapped_length,
+                               uint64_t stride,
+                               uint32_t width,
+                               uint32_t height,
+                               uint32_t hot_x,
+                               uint32_t hot_y,
+                               uint32_t sum)
 {
     AppleGfxMLState *s = ctx;
     AppleGfxMLCursorGlyphJob *job;
@@ -25628,7 +25628,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .read_memory = qemu_read_memory,
         .write_memory = qemu_write_memory,
         .raise_irq = qemu_raise_irq,
-        .cursor_glyph = qemu_cursor_glyph,
+        .cursor_glyph = apple_gfx_ml_cursor_glyph,
         .cursor_move = apple_gfx_ml_cursor_move,
         .cursor_show = apple_gfx_ml_cursor_show,
         .mode_change = qemu_mode_change,
