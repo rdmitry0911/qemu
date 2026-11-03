@@ -10,6 +10,7 @@
 #include "qemu/rcu.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "system/ram_addr.h"
 
 /* QMetal workers and the agfx-io MMIO worker are not QEMU-created RCU
  * readers. This registers the calling thread for exactly the outer interval
@@ -141,6 +142,54 @@ static inline bool agfx_memory_read_ram_any_thread(uint64_t gpa, void *buf,
     }
     agfx_memory_rcu_leave();
     return copied;
+}
+
+/* RAM-copy leaf of the device physical write: the single-span write form of
+ * the core inline fast path (address_space_read/flatview_write_continue_step).
+ * Inside one registered RCU read section the request is translated ONCE; only
+ * when that one translation covers the whole request, the target is directly
+ * writable RAM (memory_access_is_direct for a write: never ROM, ROMD,
+ * RAM-device or I/O) inside its MemoryRegion, and its dirty logging lacks
+ * DIRTY_MEMORY_CODE (that client needs the TB invalidation done by
+ * address_space_write), are the bytes moved into the captured RAM pointer
+ * (memmove, as the core RAM write does: the source may alias guest RAM) and
+ * the SAME captured MR range marked dirty with the atomic dirty-range update a
+ * vCPU write performs. Nothing is re-translated and no pointer or pin escapes.
+ * Otherwise NOTHING is written and false is returned; the caller then performs
+ * the WHOLE write on its unchanged BQL device path (requests spanning several
+ * translations always take that path). Zero length succeeds. */
+static inline bool agfx_memory_write_ram_any_thread(uint64_t gpa,
+                                                    const void *buf,
+                                                    size_t size)
+{
+    bool written = false;
+
+    if (size == 0) {
+        return true;
+    }
+    agfx_memory_rcu_enter();
+    FlatView *view = address_space_to_flatview(&address_space_memory);
+    hwaddr offset = 0;
+    hwaddr length = size;
+    MemoryRegion *mr = view ?
+        flatview_translate(view, gpa, &offset, &length, true,
+                           MEMTXATTRS_UNSPECIFIED) : NULL;
+
+    if (mr && length == size && mr->ram_block &&
+        memory_access_is_direct(mr, true, MEMTXATTRS_UNSPECIFIED) &&
+        !(memory_region_get_dirty_log_mask(mr) & (1 << DIRTY_MEMORY_CODE)) &&
+        offset <= memory_region_size(mr) &&
+        size <= memory_region_size(mr) - offset) {
+        void *target = qemu_map_ram_ptr(mr->ram_block, offset);
+
+        if (target) {
+            memmove(target, buf, size);
+            memory_region_set_dirty(mr, offset, size);
+            written = true;
+        }
+    }
+    agfx_memory_rcu_leave();
+    return written;
 }
 
 /* Seqlock over address-space publication. memory_region_transaction_commit

@@ -22551,6 +22551,11 @@ static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf,
     if (s && s->debug_level >= 5) {
         trace_apple_gfx_ml_dma_write(gpa, size);
     }
+    /* Directly writable RAM is copied and dirtied by the calling thread under
+     * RCU; anything else keeps the whole write on the BQL device path. */
+    if (size == 0 || agfx_memory_write_ram_any_thread(gpa, buf, size)) {
+        return 0;
+    }
     qemu_event_init(&job.event, false);
     agfx_schedule_host_bh(s, agfx_do_dma, &job);
     qemu_event_wait(&job.event);

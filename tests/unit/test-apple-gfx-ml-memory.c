@@ -14,6 +14,7 @@
 #include "system/ram_addr.h"
 #include "system/replay.h"
 #include "system/system.h"
+#include "system/tcg.h"
 #include "hw/display/apple-gfx-ml-memory.h"
 
 #ifdef AGFX_MEMORY_BASELINE_CONTROL
@@ -378,6 +379,156 @@ static void test_foreign_thread_ram_read_leaf(void)
     fixture_free(f);
 }
 
+/* RAM-copy write leaf from a thread that is neither BQL holder nor RCU
+ * registered: directly writable RAM spans (crossing a page, through an alias)
+ * are written and marked dirty (KVM-like dirty mask; with TCG's CODE client the
+ * leaf declines and writes nothing); ROM, an unmapped hole and a request whose
+ * single translation does not cover it (RAM running into a hole) are declined
+ * WITHOUT writing any byte, an aliasing source keeps memmove semantics, and no
+ * MR reference or registration is left behind. */
+typedef struct ForeignWrite {
+    Fixture *f;
+    bool held_bql, registered_after;
+    bool cross_ok, alias_ok, rom_ok, hole_ok, tail_hole_ok, empty_ok;
+    uint8_t cross[4096 + 16], alias[64], rom[32], hole[16], tail[32];
+} ForeignWrite;
+
+static void *foreign_write_thread(void *opaque)
+{
+    ForeignWrite *job = opaque;
+    Fixture *f = job->f;
+
+    job->held_bql = bql_locked();
+    job->cross_ok = agfx_memory_write_ram_any_thread(RAM_GPA + 2 * f->page - 8,
+                                                     job->cross, f->page + 16);
+    job->alias_ok = agfx_memory_write_ram_any_thread(ALIAS_A_GPA + 100,
+                                                     job->alias, sizeof(job->alias));
+    job->rom_ok = agfx_memory_write_ram_any_thread(ROM_GPA, job->rom,
+                                                   sizeof(job->rom));
+    job->hole_ok = agfx_memory_write_ram_any_thread(UINT64_C(0x50000000),
+                                                    job->hole, sizeof(job->hole));
+    /* Last 16 bytes of the 4-page RAM followed by an unmapped hole. */
+    job->tail_hole_ok = agfx_memory_write_ram_any_thread(
+        RAM_GPA + 4 * f->page - 16, job->tail, sizeof(job->tail));
+    job->empty_ok = agfx_memory_write_ram_any_thread(RAM_GPA, job->tail, 0);
+    job->registered_after = rcu_thread_is_registered();
+    return NULL;
+}
+
+static void test_foreign_thread_ram_write_leaf(void)
+{
+    Fixture *f = fixture_new();
+    Object *owner = OBJECT(f->owner);
+    uint8_t *ram = memory_region_get_ram_ptr(&f->owner->ram);
+    uint8_t *rom = memory_region_get_ram_ptr(&f->owner->rom);
+    ForeignWrite *job = g_new0(ForeignWrite, 1);
+    DirtyBitmapSnapshot *snap;
+    QemuThread thread;
+
+    g_assert_cmpuint(f->page, ==, 4096);
+    memset(ram, 0x47, 4 * f->page);
+    for (unsigned i = 0; i < sizeof(job->cross); ++i) {
+        job->cross[i] = (uint8_t)(i * 5 + 1);
+    }
+    memset(job->alias, 0xa5, sizeof(job->alias));
+    memset(job->rom, 0x11, sizeof(job->rom));
+    memset(job->hole, 0x22, sizeof(job->hole));
+    memset(job->tail, 0x33, sizeof(job->tail));
+    memory_region_set_log(&f->owner->ram, true, DIRTY_MEMORY_VGA);
+    drain_flatviews();
+    snap = memory_region_snapshot_and_clear_dirty(&f->owner->ram, 0,
+                                                  4 * f->page,
+                                                  DIRTY_MEMORY_VGA);
+    g_free(snap);
+    job->f = f;
+    g_assert_true(bql_locked());
+#ifdef CONFIG_TCG
+    /* With TCG the dirty mask carries DIRTY_MEMORY_CODE: the leaf must decline
+     * the whole write (address_space_write owns TB invalidation) and write
+     * nothing. */
+    g_assert_true(tcg_enabled());
+    g_assert_true(memory_region_get_dirty_log_mask(&f->owner->ram) &
+                  (1 << DIRTY_MEMORY_CODE));
+    qemu_thread_create(&thread, "agfx-foreign-write-tcg", foreign_write_thread,
+                       job, QEMU_THREAD_JOINABLE);
+    qemu_thread_join(&thread);
+    g_assert_false(job->cross_ok);
+    g_assert_false(job->alias_ok);
+    g_assert_true(job->empty_ok);
+    for (unsigned i = 0; i < 4 * f->page; ++i) {
+        g_assert_cmpuint(ram[i], ==, 0x47);
+    }
+    snap = memory_region_snapshot_and_clear_dirty(&f->owner->ram, 0,
+                                                  4 * f->page,
+                                                  DIRTY_MEMORY_VGA);
+    for (unsigned i = 0; i < 4; ++i) {
+        g_assert_false(memory_region_snapshot_get_dirty(&f->owner->ram, snap,
+                       i * f->page, f->page));
+    }
+    g_free(snap);
+    /* The production accelerator is KVM, where no CODE client exists. */
+    tcg_allowed = false;
+#endif
+    g_assert_false(memory_region_get_dirty_log_mask(&f->owner->ram) &
+                   (1 << DIRTY_MEMORY_CODE));
+    qemu_thread_create(&thread, "agfx-foreign-write", foreign_write_thread, job,
+                       QEMU_THREAD_JOINABLE);
+    qemu_thread_join(&thread);
+    g_assert_false(job->held_bql);
+    g_assert_false(job->registered_after);
+    g_assert_true(job->cross_ok);
+    g_assert_cmpmem(ram + 2 * f->page - 8, f->page + 16, job->cross, f->page + 16);
+    g_assert_true(job->alias_ok);
+    /* alias_a maps RAM page 1. */
+    g_assert_cmpmem(ram + f->page + 100, sizeof(job->alias), job->alias,
+                    sizeof(job->alias));
+    g_assert_false(job->rom_ok);
+    for (unsigned i = 0; i < f->page; ++i) {
+        g_assert_cmpuint(rom[i], ==, 0x63);
+    }
+    g_assert_false(job->hole_ok);
+    g_assert_false(job->tail_hole_ok);
+    for (unsigned i = 0; i < 16; ++i) {
+        g_assert_cmpuint(ram[4 * f->page - 16 + i], ==, 0x47);
+    }
+    g_assert_true(job->empty_ok);
+    snap = memory_region_snapshot_and_clear_dirty(&f->owner->ram, 0,
+                                                  4 * f->page,
+                                                  DIRTY_MEMORY_VGA);
+    /* cross wrote pages 1..3, the alias wrote page 1; page 0 untouched. */
+    for (unsigned i = 0; i < 4; ++i) {
+        g_assert_cmpint(memory_region_snapshot_get_dirty(&f->owner->ram, snap,
+                         i * f->page, f->page), ==, i >= 1);
+    }
+    for (unsigned i = 0; i < f->page; ++i) {
+        g_assert_cmpuint(ram[i], ==, 0x47);
+    }
+    g_free(snap);
+    /* The source may alias the destination guest RAM (a caller-held map_gpa
+     * alias): the leaf has the core RAM write's memmove semantics. */
+    {
+        uint8_t expect[64];
+        uint8_t *base = ram + 3 * f->page;
+
+        for (unsigned i = 0; i < 64; ++i) {
+            base[i] = (uint8_t)(200 + i);
+        }
+        memcpy(expect, base, sizeof(expect));
+        memmove(expect + 8, expect, 32);
+        g_assert_true(agfx_memory_write_ram_any_thread(RAM_GPA + 3 * f->page + 8,
+                                                       base, 32));
+        g_assert_cmpmem(base, 64, expect, 64);
+    }
+#ifdef CONFIG_TCG
+    tcg_allowed = true;
+#endif
+    memory_region_set_log(&f->owner->ram, false, DIRTY_MEMORY_VGA);
+    drain_flatviews();
+    g_assert_cmpuint(owner->ref, ==, f->baseline_refs);
+    g_free(job);
+    fixture_free(f);
+}
+
 /* Seqlock over publication: a listener's region_add runs between every
  * listener's begin and commit, so it must observe an odd sequence. */
 static uint64_t probe_seen_seq;
@@ -556,6 +707,8 @@ int main(int argc, char **argv)
                     test_foreign_thread_map_and_dirty_without_bql);
     g_test_add_func("/agfx/memory/foreign-thread-ram-read-leaf",
                     test_foreign_thread_ram_read_leaf);
+    g_test_add_func("/agfx/memory/foreign-thread-ram-write-leaf",
+                    test_foreign_thread_ram_write_leaf);
     g_test_add_func("/agfx/memory/topology-seq-brackets-publication",
                     test_topology_seq_brackets_publication);
     g_test_add_func("/agfx/memory/capture-retained-keeps-backing",
