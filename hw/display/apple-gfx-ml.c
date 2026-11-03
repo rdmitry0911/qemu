@@ -782,10 +782,8 @@ static const char *agfx_mmio_offset_name(uint64_t offset)
         return "IOSFC_MAP_FLAGS";
     case PVG_REG_IOSFC_MAP_ADDR:
         return "IOSFC_MAP_ADDR";
-    case PVG_REG_IOSFC_UNMAP:
-        return "IOSFC_UNMAP";
-    case PVG_REG_IOSFC_UNMAP_LEN:
-        return "IOSFC_UNMAP_LEN";
+    case PVG_REG_DISPLAY_DOORBELL:
+        return "DISPLAY_DOORBELL";
     case PVG_REG_IOSFC_RESULT:
         return "IOSFC_RESULT";
     case PVG_REG_DISPLAY_PORT_COUNT:
@@ -24412,8 +24410,6 @@ static void apple_gfx_ml_cursor_glyph_bh(void *opaque)
 {
     AppleGfxMLCursorGlyphJob *job = opaque;
     AppleGfxMLState *s = job ? job->state : NULL;
-    const uint8_t *src;
-    size_t row_padding = 0;
 
     if (!job || !s || !job->pixels) {
         if (job) {
@@ -24421,12 +24417,6 @@ static void apple_gfx_ml_cursor_glyph_bh(void *opaque)
         }
         g_free(job);
         return;
-    }
-
-    src = job->pixels;
-    if (job->stride >= (uint64_t)job->width * 4u) {
-        row_padding = (size_t)(job->stride -
-                               (uint64_t)job->width * 4u);
     }
 
     if (s->cursor) {
@@ -24438,7 +24428,14 @@ static void apple_gfx_ml_cursor_glyph_bh(void *opaque)
     s->cursor->hot_x = job->hot_x;
     s->cursor->hot_y = job->hot_y;
 
+    /*
+     * Reference -[_PGDisplayNub copy_GuestBGRA_ToHostBGRA_Task:...] copies
+     * row y from guest offset y * stride into a packed width * 4 row; QMetal
+     * validated (height - 1) * stride + width * 4 <= mapped_length, and the
+     * stride has no lower bound (rows may overlap).
+     */
     for (uint32_t y = 0; y < job->height; ++y) {
+        const uint8_t *src = job->pixels + (size_t)y * job->stride;
         for (uint32_t x = 0; x < job->width; ++x) {
             uint32_t *dst = &s->cursor->data[(size_t)y * job->width + x];
 
@@ -24453,7 +24450,6 @@ static void apple_gfx_ml_cursor_glyph_bh(void *opaque)
                    ((uint32_t)src[3] << 24u);
             src += 4;
         }
-        src += row_padding;
     }
 
     agfx_log(s, "[apple-gfx-ml] cursor_glyph: %ux%u stride=%" PRIu64 " hot=%u,%u sum=0x%08x\n",
@@ -25439,8 +25435,9 @@ static void agfx_mmio_write_original(void *opaque, hwaddr offset,
      * the already-armed source. */
     if (offset == PVG_REG_IOSFC_MAP_ADDR && val != 0) {
         agfx_schedule_frame_presents(s);
-    } else if ((offset == PVG_REG_IOSFC_ENABLE && val == 0) ||
-               offset == PVG_REG_IOSFC_UNMAP) {
+    } else if (offset == PVG_REG_IOSFC_ENABLE && val == 0) {
+        /* 0x1220 is -[_PGDevice ringDisplayDoorbellAtPort:] (reference
+         * mmioWriteAtOffset index 0x88), a cursor doorbell, not an unmap. */
         agfx_cancel_frame_presents(s);
     }
 
