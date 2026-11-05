@@ -419,6 +419,8 @@ static NotifierList wakeup_notifiers =
     NOTIFIER_LIST_INITIALIZER(wakeup_notifiers);
 static NotifierList shutdown_notifiers =
     NOTIFIER_LIST_INITIALIZER(shutdown_notifiers);
+static NotifierList cleanup_notifiers =
+    NOTIFIER_LIST_INITIALIZER(cleanup_notifiers);
 static uint32_t wakeup_reason_mask = ~(1 << QEMU_WAKEUP_REASON_NONE);
 
 ShutdownCause qemu_shutdown_requested_get(void)
@@ -829,6 +831,11 @@ void qemu_register_powerdown_notifier(Notifier *notifier)
     notifier_list_add(&powerdown_notifiers, notifier);
 }
 
+void qemu_register_cleanup_notifier(Notifier *notifier)
+{
+    notifier_list_add(&cleanup_notifiers, notifier);
+}
+
 void qemu_register_shutdown_notifier(Notifier *notifier)
 {
     notifier_list_add(&shutdown_notifiers, notifier);
@@ -982,6 +989,13 @@ void qemu_cleanup(int status)
     /* No more vcpu or device emulation activity beyond this point */
     vm_shutdown();
     replay_finish();
+
+    /*
+     * Devices with their own worker threads stop them here: vCPUs are stopped,
+     * while the main AIO context, guest memory and BQL they may need still work.
+     * Nothing later in this process exit waits for those threads.
+     */
+    notifier_list_notify(&cleanup_notifiers, NULL);
 
     /*
      * We must cancel all block jobs while the block layer is drained,

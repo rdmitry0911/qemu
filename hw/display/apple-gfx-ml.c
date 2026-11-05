@@ -636,6 +636,8 @@ static bool agfx_log_should_emit(uint64_t *counter)
 }
 
 
+static void agfx_cleanup_notifier(Notifier *notifier, void *opaque);
+
 static void agfx_shutdown_notifier(Notifier *notifier, void *opaque)
 {
     AppleGfxMLState *s = container_of(notifier, AppleGfxMLState,
@@ -25556,6 +25558,9 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
     s->shutdown_notifier.notify = agfx_shutdown_notifier;
     qemu_register_shutdown_notifier(&s->shutdown_notifier);
     s->shutdown_notifier_registered = true;
+    s->cleanup_notifier.notify = agfx_cleanup_notifier;
+    qemu_register_cleanup_notifier(&s->cleanup_notifier);
+    s->cleanup_notifier_registered = true;
     agfx_guest_sched_debug_state = s;
     agfx_log_init(s);
     agfx_log(s, "[apple-gfx-ml] Realizing device: %ux%u, VRAM=%uMB\n",
@@ -25800,6 +25805,10 @@ fail_log:
         notifier_remove(&s->shutdown_notifier);
         s->shutdown_notifier_registered = false;
     }
+    if (s->cleanup_notifier_registered) {
+        notifier_remove(&s->cleanup_notifier);
+        s->cleanup_notifier_registered = false;
+    }
 }
 
 typedef struct AgfxLifecycleWork {
@@ -25894,10 +25903,111 @@ static void agfx_quiesce_session(void *opaque)
         qmu_session_quiesce_host_callback_producers_deferred(work->session);
 }
 
+/*
+ * Stop every worker that can call into or run inside the library: guest MMIO,
+ * autonomous present roots, accepted Session work, bootstrap and render workers.
+ * Both device exit and normal process quit need this order. Runs once.
+ */
+static void agfx_stop_phase(AppleGfxMLState *s)
+{
+    AgfxQuiesceWork work = { .session = s->qmu_dev, .status = QMU_ERROR };
+
+    if (s->stop_phase_done) {
+        return;
+    }
+    /* Stop async MMIO worker thread */
+    qatomic_set(&s->mmio_worker_stop, true);
+    qemu_sem_post(&s->mmio_sem);  /* Wake to exit */
+    agfx_run_lifecycle_work(agfx_join_mmio_worker, s);
+    qemu_sem_destroy(&s->mmio_sem);
+
+    /* Close autonomous wrapper roots, not its accepted control/source
+     * executor: a queued original may still publish its intentional cancel. */
+    qemu_mutex_lock(&s->bootstrap_present_mutex);
+    s->bootstrap_present_roots_stopped = true;
+    qemu_cond_signal(&s->bootstrap_present_cond);
+    qemu_mutex_unlock(&s->bootstrap_present_mutex);
+
+    agfx_run_lifecycle_work(agfx_quiesce_session, &work);
+    /* Transport the SAME exception back to its actual main caller before any
+     * destruction or void PCI-parent return. Do not turn it into success. */
+    qmu_session_rethrow_quiesce(s->qmu_dev);
+    /* Invalid prerequisites likewise never authorize deletion. Actual pending
+     * native work keeps the real provider barrier itself pending; this only
+     * preserves owners if that provider rejects an invalid lifecycle caller. */
+    AIO_WAIT_WHILE(NULL, work.status != QMU_OK);
+    assert(!s->deferred_frame_owner.state);
+
+    qemu_mutex_lock(&s->bootstrap_present_mutex);
+    s->bootstrap_present_worker_stop = true;
+    qemu_cond_signal(&s->bootstrap_present_cond);
+    qemu_mutex_unlock(&s->bootstrap_present_mutex);
+    agfx_run_lifecycle_work(agfx_join_bootstrap_worker, s);
+    qemu_mutex_lock(&s->bootstrap_present_mutex);
+    agfx_cancel_frame_presents_locked(s);
+    qemu_mutex_unlock(&s->bootstrap_present_mutex);
+
+    /* All intentional CPU/frame/UI/IRQ/DMA descendants have returned at the
+     * canonical owner barrier, not merely at an empty QEMU queue snapshot. */
+    if (s->render_pool) {
+        agfx_run_lifecycle_work(agfx_free_render_pool, s);
+        s->render_pool = NULL;
+    }
+    s->stop_phase_done = true;
+}
+
+/* A stop that cannot finish must not reach library finalizers with live users. */
+#define AGFX_QUIT_STOP_LIMIT_MS 20000
+
+typedef struct AgfxQuitWatchdog {
+    bool done;
+} AgfxQuitWatchdog;
+
+static void *agfx_quit_watchdog_thread(void *opaque)
+{
+    AgfxQuitWatchdog *watchdog = opaque;
+
+    for (int waited = 0; waited < AGFX_QUIT_STOP_LIMIT_MS; waited += 50) {
+        if (qatomic_read(&watchdog->done)) {
+            return NULL;
+        }
+        g_usleep(50 * 1000);
+    }
+    fprintf(stderr, "[apple-gfx-ml] [ERROR] quit stop phase did not finish in %d ms, "
+            "exit without finalizers\n", AGFX_QUIT_STOP_LIMIT_MS);
+    _exit(EXIT_FAILURE);
+}
+
+/*
+ * Normal quit never unrealizes this device, so exit() used to run library
+ * finalizers with the P0 worker still inside the library (d441: SIGSEGV in
+ * spv_cached_compile on a destroyed static map, main thread in _dl_fini).
+ */
+static void agfx_cleanup_notifier(Notifier *notifier, void *opaque)
+{
+    AppleGfxMLState *s = container_of(notifier, AppleGfxMLState,
+                                      cleanup_notifier);
+    AgfxQuitWatchdog watchdog = { .done = false };
+    QemuThread thread;
+    const int64_t begin = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+    if (!s->qmu_dev) {
+        return;
+    }
+    qatomic_set(&s->exiting, true);
+    fprintf(stderr, "[apple-gfx-ml] quit stop phase begin\n");
+    qemu_thread_create(&thread, "agfx-quit-wd", agfx_quit_watchdog_thread,
+                       &watchdog, QEMU_THREAD_JOINABLE);
+    agfx_stop_phase(s);
+    qatomic_set(&watchdog.done, true);
+    qemu_thread_join(&thread);
+    fprintf(stderr, "[apple-gfx-ml] quit stop phase done ms=%lld\n",
+            (long long)(qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - begin));
+}
+
 static void agfx_exit(PCIDevice *pci_dev)
 {
     AppleGfxMLState *s = APPLE_GFX_ML(pci_dev);
-    AgfxQuiesceWork work = { .session = s->qmu_dev, .status = QMU_ERROR };
 
     object_ref(OBJECT(s));
 
@@ -25960,45 +26070,13 @@ static void agfx_exit(PCIDevice *pci_dev)
         notifier_remove(&s->shutdown_notifier);
         s->shutdown_notifier_registered = false;
     }
-
-    /* Stop async MMIO worker thread */
-    qatomic_set(&s->mmio_worker_stop, true);
-    qemu_sem_post(&s->mmio_sem);  /* Wake to exit */
-    agfx_run_lifecycle_work(agfx_join_mmio_worker, s);
-    qemu_sem_destroy(&s->mmio_sem);
-
-    /* Close autonomous wrapper roots, not its accepted control/source
-     * executor: a queued original may still publish its intentional cancel. */
-    qemu_mutex_lock(&s->bootstrap_present_mutex);
-    s->bootstrap_present_roots_stopped = true;
-    qemu_cond_signal(&s->bootstrap_present_cond);
-    qemu_mutex_unlock(&s->bootstrap_present_mutex);
-
-    agfx_run_lifecycle_work(agfx_quiesce_session, &work);
-    /* Transport the SAME exception back to its actual main caller before any
-     * destruction or void PCI-parent return. Do not turn it into success. */
-    qmu_session_rethrow_quiesce(s->qmu_dev);
-    /* Invalid prerequisites likewise never authorize deletion. Actual pending
-     * native work keeps the real provider barrier itself pending; this only
-     * preserves owners if that provider rejects an invalid lifecycle caller. */
-    AIO_WAIT_WHILE(NULL, work.status != QMU_OK);
-    assert(!s->deferred_frame_owner.state);
-
-    qemu_mutex_lock(&s->bootstrap_present_mutex);
-    s->bootstrap_present_worker_stop = true;
-    qemu_cond_signal(&s->bootstrap_present_cond);
-    qemu_mutex_unlock(&s->bootstrap_present_mutex);
-    agfx_run_lifecycle_work(agfx_join_bootstrap_worker, s);
-    qemu_mutex_lock(&s->bootstrap_present_mutex);
-    agfx_cancel_frame_presents_locked(s);
-    qemu_mutex_unlock(&s->bootstrap_present_mutex);
-
-    /* All intentional CPU/frame/UI/IRQ/DMA descendants have returned at the
-     * canonical owner barrier, not merely at an empty QEMU queue snapshot. */
-    if (s->render_pool) {
-        agfx_run_lifecycle_work(agfx_free_render_pool, s);
-        s->render_pool = NULL;
+    if (s->cleanup_notifier_registered) {
+        notifier_remove(&s->cleanup_notifier);
+        s->cleanup_notifier_registered = false;
     }
+
+    agfx_stop_phase(s);
+
     /* Worker/native/done/BH/read descendants have returned at the owner barrier. */
     qmu_display_target_release(s->display_target);
     s->display_target = NULL;
@@ -26393,6 +26471,7 @@ static void agfx_instance_init(Object *obj)
     s->vsync_enabled = true;
     s->exiting = false;
     s->shutdown_notifier_registered = false;
+    s->cleanup_notifier_registered = false;
     
     /* Initialize frame state */
     s->new_frame_ready = false;

@@ -180,6 +180,9 @@ struct AppleGfxMLState {
     bool exiting;
     bool shutdown_notifier_registered;
     Notifier shutdown_notifier;
+    bool cleanup_notifier_registered;
+    Notifier cleanup_notifier;
+    bool stop_phase_done;
     bool msi_used;
     bool display_enabled;
     uint64_t frame_count;
