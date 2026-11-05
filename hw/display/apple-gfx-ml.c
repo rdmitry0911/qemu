@@ -22540,6 +22540,15 @@ static int qemu_read_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
     return (job.result == MEMTX_OK) ? 0 : -1;
 }
 
+/* Guest RAM only: any thread, no BQL, and never a device read. Nonzero when any byte of
+ * the range is not directly accessible RAM. qemu_read_memory falls back to the device
+ * path instead, which is why QMetal's private buffer read cannot use it. */
+static int qemu_read_ram_memory(void *ctx, uint64_t gpa, void *buf, size_t size)
+{
+    (void)ctx;
+    return size == 0 || agfx_memory_read_ram_any_thread(gpa, buf, size) ? 0 : -1;
+}
+
 static int qemu_write_memory(void *ctx, uint64_t gpa, const void *buf,
                               size_t size)
 {
@@ -22613,6 +22622,7 @@ AgfxEeeeNativeContext *agfx_eeee_native_context_create(AppleGfxMLState *s)
         .unmap_gpa = qemu_unmap_gpa,
         .mark_mapped_memory_dirty = qemu_mark_mapped_memory_dirty,
         .read_memory = qemu_read_memory,
+        .read_ram_memory = qemu_read_ram_memory,
     };
     s->eeee_provider_state = agfx_eeee_provider_state_create();
     agfx_eeee_provider_fill_callbacks(&context->callbacks);
@@ -25626,6 +25636,7 @@ static void agfx_realize(PCIDevice *pci_dev, Error **errp)
         .unmap_gpa = qemu_unmap_gpa,
         .mark_mapped_memory_dirty = qemu_mark_mapped_memory_dirty,
         .read_memory = qemu_read_memory,
+        .read_ram_memory = qemu_read_ram_memory,
         .write_memory = qemu_write_memory,
         .raise_irq = qemu_raise_irq,
         .cursor_glyph = apple_gfx_ml_cursor_glyph,
