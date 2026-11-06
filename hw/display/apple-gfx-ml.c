@@ -26040,7 +26040,7 @@ static void agfx_cleanup_notifier(Notifier *notifier, void *opaque)
                                       cleanup_notifier);
     AgfxQuitWatchdog *watchdog;
     AgfxFinishRetirementWork retirement = { .status = QMU_ERROR };
-    QemuThread thread;
+    pthread_t thread;
     const int64_t begin = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
 
     if (!s->qmu_dev) {
@@ -26048,8 +26048,11 @@ static void agfx_cleanup_notifier(Notifier *notifier, void *opaque)
     }
     qatomic_set(&s->exiting, true);
     watchdog = g_new0(AgfxQuitWatchdog, 1);
-    qemu_thread_create(&thread, "agfx-quit-wd", agfx_quit_watchdog_thread,
-                       watchdog, QEMU_THREAD_JOINABLE);
+    /* Not qemu_thread_create: it prints to stderr on failure, and with no
+     * watchdog yet nothing would bound a blocked stderr. */
+    if (pthread_create(&thread, NULL, agfx_quit_watchdog_thread, watchdog) != 0) {
+        _exit(EXIT_FAILURE);
+    }
     fprintf(stderr, "[apple-gfx-ml] quit stop phase begin\n");
     agfx_stop_phase(s);
     retirement.session = s->qmu_dev;
@@ -26063,7 +26066,7 @@ static void agfx_cleanup_notifier(Notifier *notifier, void *opaque)
     fprintf(stderr, "[apple-gfx-ml] quit stop phase done ms=%lld\n",
             (long long)(qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - begin));
     qatomic_set(&watchdog->done, true);
-    qemu_thread_join(&thread);
+    pthread_join(thread, NULL);
     g_free(watchdog);
 }
 
