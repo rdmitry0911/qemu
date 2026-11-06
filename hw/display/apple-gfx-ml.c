@@ -25958,36 +25958,88 @@ static void agfx_stop_phase(AppleGfxMLState *s)
 
 /* A stop that cannot finish must not reach library finalizers with live users. */
 #define AGFX_QUIT_STOP_LIMIT_MS 20000
+/* The failure notice is best effort: a full stderr pipe or a held stdio lock
+ * must not keep the process alive past this. */
+#define AGFX_QUIT_NOTICE_LIMIT_MS 1000
 
 typedef struct AgfxQuitWatchdog {
     bool done;
 } AgfxQuitWatchdog;
 
+static void *agfx_quit_notice_thread(void *opaque)
+{
+    bool *delivered = opaque;
+
+    fprintf(stderr, "[apple-gfx-ml] [ERROR] quit stop phase did not finish in %d ms, "
+            "exit without finalizers\n", AGFX_QUIT_STOP_LIMIT_MS);
+    fflush(stderr);
+    qatomic_set(delivered, true);
+    return NULL;
+}
+
+/* Exit with failure, giving the notice a bounded time to get out. */
+static void agfx_quit_fail(void)
+{
+    static bool delivered;
+    pthread_t notice;
+    const int64_t limit = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                          AGFX_QUIT_NOTICE_LIMIT_MS;
+
+    /* Not qemu_thread_create: on failure it prints to the same stderr and aborts. */
+    if (pthread_create(&notice, NULL, agfx_quit_notice_thread, &delivered) == 0) {
+        pthread_detach(notice);
+        while (!qatomic_read(&delivered) &&
+               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) < limit) {
+            g_usleep(10 * 1000);
+        }
+    }
+    _exit(EXIT_FAILURE);
+}
+
 static void *agfx_quit_watchdog_thread(void *opaque)
 {
     AgfxQuitWatchdog *watchdog = opaque;
+    const int64_t limit = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                          AGFX_QUIT_STOP_LIMIT_MS;
 
-    for (int waited = 0; waited < AGFX_QUIT_STOP_LIMIT_MS; waited += 50) {
-        if (qatomic_read(&watchdog->done)) {
-            return NULL;
+    /* Completion is tested after every sleep and before the limit, so a stop
+     * that finished during the last sleep is not reported as failed. */
+    while (!qatomic_read(&watchdog->done)) {
+        if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) >= limit) {
+            agfx_quit_fail();
         }
         g_usleep(50 * 1000);
     }
-    fprintf(stderr, "[apple-gfx-ml] [ERROR] quit stop phase did not finish in %d ms, "
-            "exit without finalizers\n", AGFX_QUIT_STOP_LIMIT_MS);
-    _exit(EXIT_FAILURE);
+    return NULL;
+}
+
+typedef struct AgfxFinishRetirementWork {
+    qmu_session *session;
+    qmu_status status;
+} AgfxFinishRetirementWork;
+
+static void agfx_finish_retirement(void *opaque)
+{
+    AgfxFinishRetirementWork *work = opaque;
+
+    work->status = qmu_session_finish_retirement_for_exit(work->session);
 }
 
 /*
  * Normal quit never unrealizes this device, so exit() used to run library
  * finalizers with the P0 worker still inside the library (d441: SIGSEGV in
  * spv_cached_compile on a destroyed static map, main thread in _dl_fini).
+ *
+ * The watchdog lives on the heap: a foreign exception from the stop phase must
+ * not leave its thread reading an unwound frame. It is armed before the first
+ * diagnostic and disarmed after the last one, since either can block on stderr.
  */
 static void agfx_cleanup_notifier(Notifier *notifier, void *opaque)
 {
     AppleGfxMLState *s = container_of(notifier, AppleGfxMLState,
                                       cleanup_notifier);
-    AgfxQuitWatchdog watchdog = { .done = false };
+    AgfxQuitWatchdog *watchdog;
+    AgfxFinishRetirementWork retirement = { .status = QMU_ERROR };
     QemuThread thread;
     const int64_t begin = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
 
@@ -25995,14 +26047,24 @@ static void agfx_cleanup_notifier(Notifier *notifier, void *opaque)
         return;
     }
     qatomic_set(&s->exiting, true);
-    fprintf(stderr, "[apple-gfx-ml] quit stop phase begin\n");
+    watchdog = g_new0(AgfxQuitWatchdog, 1);
     qemu_thread_create(&thread, "agfx-quit-wd", agfx_quit_watchdog_thread,
-                       &watchdog, QEMU_THREAD_JOINABLE);
+                       watchdog, QEMU_THREAD_JOINABLE);
+    fprintf(stderr, "[apple-gfx-ml] quit stop phase begin\n");
     agfx_stop_phase(s);
-    qatomic_set(&watchdog.done, true);
-    qemu_thread_join(&thread);
+    retirement.session = s->qmu_dev;
+    agfx_run_lifecycle_work(agfx_finish_retirement, &retirement);
+    if (retirement.status != QMU_OK) {
+        fprintf(stderr, "[apple-gfx-ml] [ERROR] retirement worker not finished "
+                "after stop, status=%d, exit without finalizers\n",
+                (int)retirement.status);
+        _exit(EXIT_FAILURE);
+    }
     fprintf(stderr, "[apple-gfx-ml] quit stop phase done ms=%lld\n",
             (long long)(qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - begin));
+    qatomic_set(&watchdog->done, true);
+    qemu_thread_join(&thread);
+    g_free(watchdog);
 }
 
 static void agfx_exit(PCIDevice *pci_dev)
