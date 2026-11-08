@@ -126,6 +126,7 @@ static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
     smc_debug("CMD received: 0x%02x\n", (uint8_t)val);
     switch (val) {
     case APPLESMC_READ_CMD:
+    case APPLESMC_GET_KEY_BY_INDEX_CMD:
         /* did last command run through OK? */
         if (status == APPLESMC_ST_CMD_DONE || status == APPLESMC_ST_NEW_CMD) {
             s->cmd = val;
@@ -153,6 +154,20 @@ static const struct AppleSMCData *applesmc_find_key(AppleSMCState *s)
         if (!memcmp(d->key, s->key, 4)) {
             return d;
         }
+    }
+    return NULL;
+}
+
+static const struct AppleSMCData *
+applesmc_find_key_by_index(AppleSMCState *s, uint32_t index)
+{
+    struct AppleSMCData *d;
+
+    QLIST_FOREACH(d, &s->data_def, node) {
+        if (index == 0) {
+            return d;
+        }
+        index--;
     }
     return NULL;
 }
@@ -189,6 +204,33 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
         }
         s->read_pos++;
         break;
+    case APPLESMC_GET_KEY_BY_INDEX_CMD:
+        if ((s->status & 0x0f) == APPLESMC_ST_CMD_DONE ||
+            s->read_pos >= 4) {
+            break;
+        }
+        s->key[s->read_pos++] = val;
+        if (s->read_pos == 4) {
+            uint32_t index = ((uint32_t)(uint8_t)s->key[0] << 24) |
+                             ((uint32_t)(uint8_t)s->key[1] << 16) |
+                             ((uint32_t)(uint8_t)s->key[2] << 8) |
+                             (uint8_t)s->key[3];
+
+            d = applesmc_find_key_by_index(s, index);
+            if (d != NULL) {
+                memcpy(s->data, d->key, 4);
+                s->data_len = 4;
+                s->data_pos = 0;
+                s->status = APPLESMC_ST_ACK | APPLESMC_ST_DATA_READY;
+                s->status_1e = APPLESMC_ST_CMD_DONE;
+            } else {
+                s->status = APPLESMC_ST_CMD_DONE;
+                s->status_1e = APPLESMC_ST_1E_BAD_INDEX;
+            }
+        } else {
+            s->status = APPLESMC_ST_ACK;
+        }
+        break;
     default:
         s->status = APPLESMC_ST_CMD_DONE;
         s->status_1e = APPLESMC_ST_1E_STILL_BAD_CMD;
@@ -208,6 +250,7 @@ static uint64_t applesmc_io_data_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (s->cmd) {
     case APPLESMC_READ_CMD:
+    case APPLESMC_GET_KEY_BY_INDEX_CMD:
         if (!(s->status & APPLESMC_ST_DATA_READY)) {
             break;
         }
