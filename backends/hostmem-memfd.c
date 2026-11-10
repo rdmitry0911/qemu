@@ -16,6 +16,7 @@
 #include "qemu/memfd.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qom/object.h"
 #include "migration/cpr.h"
 
@@ -28,6 +29,7 @@ struct HostMemoryBackendMemfd {
     bool hugetlb;
     uint64_t hugetlbsize;
     bool seal;
+    uint64_t align;
 };
 
 static bool
@@ -61,8 +63,9 @@ have_fd:
     ram_flags = backend->share ? RAM_SHARED : RAM_PRIVATE;
     ram_flags |= backend->reserve ? 0 : RAM_NORESERVE;
     ram_flags |= backend->guest_memfd ? RAM_GUEST_MEMFD : 0;
-    return memory_region_init_ram_from_fd(&backend->mr, OBJECT(backend), name,
-                                          backend->size, ram_flags, fd, 0, errp);
+    return memory_region_init_ram_from_fd_aligned(&backend->mr, OBJECT(backend),
+                                                  name, backend->size, m->align,
+                                                  ram_flags, fd, 0, errp);
 }
 
 static bool
@@ -108,6 +111,35 @@ memfd_backend_get_hugetlbsize(Object *obj, Visitor *v, const char *name,
     uint64_t value = m->hugetlbsize;
 
     visit_type_size(v, name, &value, errp);
+}
+
+static void
+memfd_backend_get_align(Object *o, Visitor *v, const char *name,
+                        void *opaque, Error **errp)
+{
+    HostMemoryBackendMemfd *m = MEMORY_BACKEND_MEMFD(o);
+    uint64_t val = m->align;
+
+    visit_type_size(v, name, &val, errp);
+}
+
+static void
+memfd_backend_set_align(Object *o, Visitor *v, const char *name,
+                        void *opaque, Error **errp)
+{
+    HostMemoryBackendMemfd *m = MEMORY_BACKEND_MEMFD(o);
+    uint64_t val;
+
+    if (host_memory_backend_mr_inited(MEMORY_BACKEND(o))) {
+        error_setg(errp, "cannot change property '%s' of %s", name,
+                   object_get_typename(o));
+        return;
+    }
+
+    if (!visit_type_size(v, name, &val, errp)) {
+        return;
+    }
+    m->align = val;
 }
 
 static bool
@@ -157,6 +189,13 @@ memfd_backend_class_init(ObjectClass *oc, const void *data)
                                    memfd_backend_set_seal);
     object_class_property_set_description(oc, "seal",
                                           "Seal growing & shrinking");
+    object_class_property_add(oc, "align", "int",
+                              memfd_backend_get_align,
+                              memfd_backend_set_align,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "align",
+                                          "Alignment of the host mapping "
+                                          "(0: page size of the memfd)");
 }
 
 static const TypeInfo memfd_backend_info = {

@@ -5909,7 +5909,7 @@ SRST
         Please refer to ``memory-backend-file`` for a description of the
         options.
 
-    ``-object memory-backend-memfd,id=id,merge=on|off,dump=on|off,share=on|off,prealloc=on|off,size=size,host-nodes=host-nodes,policy=default|preferred|bind|interleave,seal=on|off,hugetlb=on|off,hugetlbsize=size``
+    ``-object memory-backend-memfd,id=id,merge=on|off,dump=on|off,share=on|off,prealloc=on|off,size=size,host-nodes=host-nodes,policy=default|preferred|bind|interleave,seal=on|off,hugetlb=on|off,hugetlbsize=size,align=align``
         Creates an anonymous memory file backend object, which allows
         QEMU to share the memory with an external process (e.g. when
         using vhost-user). The memory is allocated with memfd and
@@ -5924,6 +5924,12 @@ SRST
         the hugetlb page size on systems that support multiple hugetlb
         page sizes (it must be a power of 2 value supported by the
         system).
+
+        The ``align`` option specifies the base address alignment of the
+        mapping, as for ``memory-backend-file``: a power of 2 and a
+        multiple of the memfd page size (default: the memfd page size).
+        ``align=2M`` lets transparent huge pages back the memory when
+        the host's ``shmem_enabled`` setting allows them.
 
         In some versions of Linux, the ``hugetlb`` option is
         incompatible with the ``seal`` option (requires at least Linux

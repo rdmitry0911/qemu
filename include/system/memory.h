@@ -1232,6 +1232,37 @@ bool memory_region_init_ram_from_fd(MemoryRegion *mr,
                                     Error **errp);
 
 /**
+ * memory_region_init_ram_from_fd_aligned:  Initialize RAM memory region
+ *                                          with a mmap-ed backend, as
+ *                                          memory_region_init_ram_from_fd(),
+ *                                          with a chosen mapping alignment.
+ *
+ * @mr: the #MemoryRegion to be initialized.
+ * @owner: the object that tracks the region's reference count
+ * @name: the name of the region.
+ * @size: size of the region.
+ * @align: alignment of the region base address; 0 selects the page size
+ *         of @fd.  Otherwise it must be a power of two and a multiple of
+ *         the page size of @fd (as @align of
+ *         memory_region_init_ram_from_file()).
+ * @ram_flags: as for memory_region_init_ram_from_fd().
+ * @fd: the fd to mmap.
+ * @offset: offset within the file referenced by fd
+ * @errp: pointer to Error*, to store an error if it happens.
+ *
+ * Return: true on success, else false setting @errp with error.
+ */
+bool memory_region_init_ram_from_fd_aligned(MemoryRegion *mr,
+                                            Object *owner,
+                                            const char *name,
+                                            uint64_t size,
+                                            uint64_t align,
+                                            uint32_t ram_flags,
+                                            int fd,
+                                            ram_addr_t offset,
+                                            Error **errp);
+
+/**
  * memory_region_init_ram_ptr:  Initialize RAM memory region from a
  *                              user-provided pointer.  Accesses into the
  *                              region will modify memory directly.

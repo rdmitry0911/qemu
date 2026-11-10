@@ -771,13 +771,20 @@
 # @seal: if true, create a sealed-file, which will block further
 #     resizing of the memory (default: true)
 #
+# @align: the base address alignment when QEMU mmap(2)s the memfd, as
+#     for memory-backend-file.  It must be a power of 2 and a multiple
+#     of the memfd page size.  A 2 MiB alignment lets transparent huge
+#     pages back shmem guest RAM.  0 selects the memfd page size.
+#     (default: 0) (since 11.1.3-applesmc)
+#
 # Since: 2.12
 ##
 { 'struct': 'MemoryBackendMemfdProperties',
   'base': 'MemoryBackendProperties',
   'data': { '*hugetlb': 'bool',
             '*hugetlbsize': 'size',
-            '*seal': 'bool' },
+            '*seal': 'bool',
+            '*align': 'size' },
   'if': 'CONFIG_LINUX' }
 
 ##
