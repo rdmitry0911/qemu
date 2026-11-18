@@ -169,6 +169,14 @@ if have_system
   tests += {'test-qdev': [qom, hwcore]}
 endif
 
+if have_system and config_all_devices.has_key('CONFIG_VFIO_USER')
+  tests += {
+    'test-vfio-user-proxy': [qom, io,
+                             meson.project_source_root() / 'hw/vfio-user/proxy.c',
+                             meson.project_source_root() / 'iothread.c'],
+  }
+endif
+
 if have_ga and host_os == 'linux'
   tests += {'test-qga': ['../qtest/libqmp.c', '../qtest/libqtest.c']}
   test_deps += {'test-qga': qga}
