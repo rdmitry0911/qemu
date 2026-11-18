@@ -222,6 +222,7 @@ static int vfio_user_recv_hdr(VFIOUserProxy *proxy, Error **errp,
                               VFIOUserHdr *hdr, int **fdp, size_t *numfdp,
                               bool *isreply)
 {
+    ERRP_GUARD();
     struct iovec iov = {
         .iov_base = hdr,
         .iov_len = sizeof(*hdr),
@@ -238,7 +239,8 @@ static int vfio_user_recv_hdr(VFIOUserProxy *proxy, Error **errp,
     }
 
     if (ret < 0) {
-        error_setg_errno(errp, errno, "failed to read header");
+        /* qio_channel_readv_full() has already set *errp (e.g. ECONNRESET) */
+        error_prepend(errp, "failed to read header: ");
         return -1;
     } else if (ret == 0) {
         error_setg(errp, "failed to read header: EOF");
