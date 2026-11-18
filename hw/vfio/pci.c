@@ -2738,34 +2738,55 @@ void vfio_pci_post_reset(VFIOPCIDevice *vdev)
 }
 
 /*
- * Re-send the device's current interrupt configuration to a server that has
- * just been (re)connected and therefore has no IRQ state of its own.  The
- * eventfds in vdev->msi_vectors[] and the INTx notifier are unchanged by a
- * reconnect, so this reuses the same enable paths used after a reset without
- * re-registering the guest-visible vector notifiers.
+ * Send the interrupt configuration of the current guest interrupt mode to a
+ * device that has none: a vfio-user server that was restarted and has just
+ * been reset (docs/interop/vfio-user.rst "Client Disconnection": the client
+ * re-establishes its IRQ fds).  MSI/MSI-X reuse the existing vector eventfds
+ * through the same enable path as vfio_msi_enable()/vfio_msix_enable();
+ * INTx is re-enabled as vfio_pci_post_reset() does; the error and request
+ * notifiers are signalled again if they were registered.
  */
 void vfio_pci_replay_irqs(VFIOPCIDevice *vdev)
 {
+    VFIODevice *vbasedev = &vdev->vbasedev;
     Error *err = NULL;
+    int ret = 0;
 
     switch (vdev->interrupt) {
     case VFIO_INT_MSIX:
-        if (vdev->nr_vectors) {
-            vfio_enable_vectors(vdev, true);
-        } else {
-            vfio_enable_msix_no_vec(vdev);
-        }
+        ret = vdev->nr_vectors ? vfio_enable_vectors(vdev, true)
+                               : vfio_enable_msix_no_vec(vdev);
         break;
     case VFIO_INT_MSI:
-        vfio_enable_vectors(vdev, false);
+        ret = vfio_enable_vectors(vdev, false);
         break;
     case VFIO_INT_INTx:
         if (!vfio_intx_enable(vdev, &err)) {
-            error_reportf_err(err, VFIO_MSG_PREFIX, vdev->vbasedev.name);
+            error_reportf_err(err, VFIO_MSG_PREFIX, vbasedev->name);
         }
         break;
     default:
         break;
+    }
+    if (ret) {
+        error_report(VFIO_MSG_PREFIX "re-enabling %s vectors failed: %d",
+                     vbasedev->name,
+                     vdev->interrupt == VFIO_INT_MSIX ? "MSI-X" : "MSI", ret);
+    }
+
+    if (vdev->pci_aer &&
+        !vfio_device_irq_set_signaling(vbasedev, VFIO_PCI_ERR_IRQ_INDEX, 0,
+                                       VFIO_IRQ_SET_ACTION_TRIGGER,
+                                       event_notifier_get_fd(&vdev->err_notifier),
+                                       &err)) {
+        error_reportf_err(err, VFIO_MSG_PREFIX, vbasedev->name);
+    }
+    if (vdev->req_enabled &&
+        !vfio_device_irq_set_signaling(vbasedev, VFIO_PCI_REQ_IRQ_INDEX, 0,
+                                       VFIO_IRQ_SET_ACTION_TRIGGER,
+                                       event_notifier_get_fd(&vdev->req_notifier),
+                                       &err)) {
+        error_reportf_err(err, VFIO_MSG_PREFIX, vbasedev->name);
     }
 }
 

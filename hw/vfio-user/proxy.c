@@ -55,89 +55,95 @@ static void vfio_user_shutdown(VFIOUserProxy *proxy)
 }
 
 /*
- * Drop every message left over from a dead connection.  Callers blocked in
- * vfio_user_send_wait() are woken with an error so they return instead of
- * waiting out their timeout against a socket that is gone.  Must be called
- * with proxy->lock held and with the recv/send fd handlers already removed.
+ * Fail one message that can no longer be answered because the connection to
+ * the server is gone.  A WAIT message belongs to a blocked sender: complete
+ * it with an error and wake the sender, which recycles it.  Every other
+ * message is owned by the proxy and is released here (fds received with a
+ * server request are closed; fds we were sending are not ours to close).
+ * Called with proxy->lock held, with @msg already off every queue.
  */
-static void vfio_user_flush_queues(VFIOUserProxy *proxy)
+static void vfio_user_fail_msg(VFIOUserProxy *proxy, VFIOUserMsg *msg)
+{
+    msg->pending = false;
+    if (msg->type == VFIO_MSG_WAIT) {
+        vfio_user_set_error(msg->hdr, ECONNRESET);
+        msg->complete = true;
+        qemu_cond_signal(&msg->cv);
+        return;
+    }
+    if (msg->type == VFIO_MSG_REQ) {
+        if (msg->fds != NULL) {
+            vfio_user_putfds(msg);
+        }
+        msg->type = VFIO_MSG_NOWAIT;
+    }
+    vfio_user_recycle(proxy, msg);
+}
+
+/*
+ * Fail everything that belonged to the dead connection: unsent requests,
+ * requests waiting for a reply, a partially received message, server
+ * requests not yet handled, and coalesced writes not yet sent.
+ * Called with proxy->lock held.
+ */
+static void vfio_user_fail_all(VFIOUserProxy *proxy)
 {
     VFIOUserMsg *msg, *m1;
 
+    /* a NOWAIT msg is freed below, or completed if vfio_user_wait_reqs waits */
     proxy->last_nowait = NULL;
 
     QTAILQ_FOREACH_SAFE(msg, &proxy->outgoing, next, m1) {
         QTAILQ_REMOVE(&proxy->outgoing, msg, next);
-        if (msg->type == VFIO_MSG_WAIT) {
-            vfio_user_set_error(msg->hdr, ECONNRESET);
-            msg->complete = true;
-            qemu_cond_signal(&msg->cv);
-        } else {
-            if (msg->type == VFIO_MSG_REQ) {
-                msg->type = VFIO_MSG_NOWAIT;
-            }
-            vfio_user_recycle(proxy, msg);
-        }
+        vfio_user_fail_msg(proxy, msg);
     }
     proxy->num_outgoing = 0;
 
     QTAILQ_FOREACH_SAFE(msg, &proxy->pending, next, m1) {
         QTAILQ_REMOVE(&proxy->pending, msg, next);
-        msg->pending = false;
-        if (msg->type == VFIO_MSG_WAIT) {
-            vfio_user_set_error(msg->hdr, ECONNRESET);
-            msg->complete = true;
-            qemu_cond_signal(&msg->cv);
-        } else {
-            if (msg->type == VFIO_MSG_REQ) {
-                msg->type = VFIO_MSG_NOWAIT;
-            }
-            vfio_user_recycle(proxy, msg);
-        }
+        vfio_user_fail_msg(proxy, msg);
     }
 
     QTAILQ_FOREACH_SAFE(msg, &proxy->incoming, next, m1) {
         QTAILQ_REMOVE(&proxy->incoming, msg, next);
-        if (msg->type == VFIO_MSG_REQ) {
-            msg->type = VFIO_MSG_NOWAIT;
-        }
-        vfio_user_recycle(proxy, msg);
+        vfio_user_fail_msg(proxy, msg);
     }
 
-    if (proxy->wr_multi != NULL) {
-        g_free(proxy->wr_multi);
-        proxy->wr_multi = NULL;
+    /* a reply being received was already taken off the pending queue */
+    if (proxy->part_recv != NULL) {
+        vfio_user_fail_msg(proxy, proxy->part_recv);
+        proxy->part_recv = NULL;
     }
-    proxy->part_recv = NULL;
     proxy->recv_left = 0;
+
+    g_clear_pointer(&proxy->wr_multi, g_free);
 }
 
 /*
- * The socket to the server has died.  If this is a reconnect-enabled client,
- * schedule the device-level reconnect handler on the main loop rather than
- * latching the proxy into a permanent error state.  Must be called with
- * proxy->lock held.
+ * The connection to the server is gone: EOF, a socket error, or a stream we
+ * can no longer trust.  docs/interop/vfio-user.rst "Server Disconnection":
+ * the client cannot know whether the server restarts or is gone for good,
+ * so it treats the device as failed and resets it.  Here that means: stop
+ * using the socket, fail every request in flight at once (no sender waits
+ * out x-msg-timeout), and refuse new requests (VFIO_PROXY_ERROR) until a
+ * reconnect, if enabled, sets the device up again on a new connection.
+ * Called with proxy->lock held; only the first loss of a connection acts.
  */
 static void vfio_user_connection_lost(VFIOUserProxy *proxy)
 {
-    /*
-     * Only act on the first loss of a live connection.  A second notification
-     * (e.g. a failed send followed by a read EOF) must not clobber an
-     * in-progress reconnect or a latched error.
-     */
     if (proxy->state != VFIO_PROXY_CONNECTED) {
         return;
     }
 
     vfio_user_shutdown(proxy);
+    /* nothing more goes out either: the server sees the client leave */
+    qio_channel_shutdown(proxy->ioc, QIO_CHANNEL_SHUTDOWN_BOTH, NULL);
+    proxy->state = VFIO_PROXY_ERROR;
+    vfio_user_fail_all(proxy);
+    trace_vfio_user_connection_lost(proxy->sockname);
 
-    if ((proxy->flags & VFIO_PROXY_CLIENT) && proxy->reconnect &&
-        proxy->reconnect_fn != NULL) {
-        proxy->state = VFIO_PROXY_RECONNECTING;
-        aio_bh_schedule_oneshot(qemu_get_aio_context(), proxy->reconnect_fn,
-                                proxy->reconnect_opaque);
-    } else {
-        proxy->state = VFIO_PROXY_ERROR;
+    if (proxy->lost_bh != NULL) {
+        qemu_bh_schedule(proxy->lost_bh);
     }
 }
 
@@ -379,6 +385,7 @@ static int vfio_user_recv_one(VFIOUserProxy *proxy, Error **errp)
     size_t numfds = 0;
     char *data = NULL;
     VFIOUserHdr hdr;
+    bool lost = false;
     int i, ret;
 
     /*
@@ -491,6 +498,7 @@ static int vfio_user_recv_one(VFIOUserProxy *proxy, Error **errp)
      * err means this message is corrupt
      */
 fatal:
+    lost = true;
     vfio_user_connection_lost(proxy);
 
     /* set error if server side closed */
@@ -514,7 +522,7 @@ err:
             /*
              * Report an error back to the sender. Sender will recycle msg.
              */
-            vfio_user_set_error(msg->hdr, EINVAL);
+            vfio_user_set_error(msg->hdr, lost ? ECONNRESET : EINVAL);
             msg->complete = true;
             qemu_cond_signal(&msg->cv);
         }
@@ -697,6 +705,13 @@ static bool vfio_user_send_queued(VFIOUserProxy *proxy, VFIOUserMsg *msg,
                                   Error **errp)
 {
     int ret;
+
+    /* the server is gone: fail now instead of queueing until a timeout */
+    if (proxy->state != VFIO_PROXY_CONNECTED) {
+        error_setg_errno(errp, ECONNRESET, "vfio-user server %s disconnected",
+                         proxy->sockname);
+        return false;
+    }
 
     /* older coalesced writes go first */
     if (proxy->wr_multi != NULL &&
@@ -982,6 +997,113 @@ vfio_user_disable_posted_writes(VFIOUserProxy *proxy)
 static QLIST_HEAD(, VFIOUserProxy) vfio_user_sockets =
     QLIST_HEAD_INITIALIZER(vfio_user_sockets);
 
+/* capability values that apply until a VERSION reply says otherwise */
+static void vfio_user_set_default_caps(VFIOUserProxy *proxy)
+{
+    proxy->max_xfer_size = VFIO_USER_DEF_MAX_XFER;
+    proxy->max_send_fds = VFIO_USER_DEF_MAX_FDS;
+    proxy->max_dma = VFIO_USER_DEF_MAP_MAX;
+    proxy->dma_pgsizes = VFIO_USER_DEF_PGSIZE;
+    proxy->max_bitmap = VFIO_USER_DEF_MAX_BITMAP;
+    proxy->migr_pgsize = VFIO_USER_DEF_PGSIZE;
+    proxy->flags &= ~VFIO_PROXY_USE_MULTI;
+}
+
+static void vfio_user_arm_reconnect(VFIOUserProxy *proxy)
+{
+    timer_mod(proxy->reconnect_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + proxy->reconnect_ms);
+}
+
+/*
+ * Main loop, BQL held: the connection was lost.  Without reconnect the
+ * device stays failed; with it, the first redial is reconnect_ms from now.
+ */
+static void vfio_user_lost_bh(void *opaque)
+{
+    VFIOUserProxy *proxy = opaque;
+
+    if (proxy->reconnect_ms == 0 || timer_pending(proxy->reconnect_timer)) {
+        return;
+    }
+    warn_report("vfio-user %s: server disconnected, redialing every %u ms",
+                proxy->sockname, proxy->reconnect_ms);
+    vfio_user_arm_reconnect(proxy);
+}
+
+/*
+ * One redial attempt, main loop, BQL held.  Connecting a UNIX socket does
+ * not wait for the server: it succeeds, or fails with ENOENT/ECONNREFUSED
+ * while nothing listens yet.  The new channel replaces the dead one and the
+ * version and capabilities are negotiated again (the server may be another
+ * build); the iothread receives the reply.
+ */
+static bool vfio_user_redial(VFIOUserProxy *proxy, Error **errp)
+{
+    QIOChannelSocket *sioc = qio_channel_socket_new();
+    QIOChannel *ioc = QIO_CHANNEL(sioc);
+
+    if (qio_channel_socket_connect_sync(sioc, proxy->sockaddr, errp) < 0 ||
+        !qio_channel_set_blocking(ioc, false, errp)) {
+        object_unref(OBJECT(ioc));
+        return false;
+    }
+
+    WITH_QEMU_LOCK_GUARD(&proxy->lock) {
+        assert(proxy->state == VFIO_PROXY_ERROR);
+        /* its messages were failed when it was lost; its fd handler is gone */
+        object_unref(OBJECT(proxy->ioc));
+        proxy->ioc = ioc;
+        vfio_user_set_default_caps(proxy);
+        proxy->state = VFIO_PROXY_CONNECTED;
+        qio_channel_set_aio_fd_handler(proxy->ioc, proxy->ctx,
+                                       vfio_user_recv, NULL, NULL, proxy);
+    }
+
+    return vfio_user_validate_version(proxy, errp);
+}
+
+static void vfio_user_reconnect_timer(void *opaque)
+{
+    VFIOUserProxy *proxy = opaque;
+    Error *local_err = NULL;
+    bool connected;
+
+    if (!vfio_user_redial(proxy, &local_err)) {
+        trace_vfio_user_reconnect_retry(proxy->sockname,
+                                        error_get_pretty(local_err));
+        error_free(local_err);
+        vfio_user_arm_reconnect(proxy);
+        WITH_QEMU_LOCK_GUARD(&proxy->lock) {
+            /* a failed handshake drops the new connection again */
+            vfio_user_connection_lost(proxy);
+        }
+        return;
+    }
+
+    if (proxy->restore_fn != NULL &&
+        !proxy->restore_fn(proxy->restore_opaque, &local_err)) {
+        WITH_QEMU_LOCK_GUARD(&proxy->lock) {
+            connected = proxy->state == VFIO_PROXY_CONNECTED;
+        }
+        if (!connected) {
+            /* lost again while setting up: the loss BH redials */
+            warn_reportf_err(local_err, "vfio-user %s: reconnect: ",
+                             proxy->sockname);
+            return;
+        }
+        error_reportf_err(local_err, "vfio-user %s: device not restored, "
+                          "it stays failed: ", proxy->sockname);
+        proxy->reconnect_ms = 0;
+        WITH_QEMU_LOCK_GUARD(&proxy->lock) {
+            vfio_user_connection_lost(proxy);
+        }
+        return;
+    }
+
+    info_report("vfio-user %s: reconnected", proxy->sockname);
+}
+
 VFIOUserProxy *vfio_user_connect_dev(SocketAddress *addr, Error **errp)
 {
     VFIOUserProxy *proxy;
@@ -1009,15 +1131,8 @@ VFIOUserProxy *vfio_user_connect_dev(SocketAddress *addr, Error **errp)
     proxy->sockaddr = QAPI_CLONE(SocketAddress, addr);
     proxy->ioc = ioc;
 
-    /* init defaults */
-    proxy->max_xfer_size = VFIO_USER_DEF_MAX_XFER;
-    proxy->max_send_fds = VFIO_USER_DEF_MAX_FDS;
-    proxy->max_dma = VFIO_USER_DEF_MAP_MAX;
-    proxy->dma_pgsizes = VFIO_USER_DEF_PGSIZE;
-    proxy->max_bitmap = VFIO_USER_DEF_MAX_BITMAP;
-    proxy->migr_pgsize = VFIO_USER_DEF_PGSIZE;
-
     proxy->flags = VFIO_PROXY_CLIENT;
+    vfio_user_set_default_caps(proxy);
     proxy->state = VFIO_PROXY_CONNECTED;
 
     qemu_mutex_init(&proxy->lock);
@@ -1029,6 +1144,7 @@ VFIOUserProxy *vfio_user_connect_dev(SocketAddress *addr, Error **errp)
 
     proxy->ctx = iothread_get_aio_context(vfio_user_iothread);
     proxy->req_bh = qemu_bh_new(vfio_user_request, proxy);
+    proxy->lost_bh = qemu_bh_new(vfio_user_lost_bh, proxy);
 
     QTAILQ_INIT(&proxy->outgoing);
     QTAILQ_INIT(&proxy->incoming);
@@ -1072,6 +1188,10 @@ void vfio_user_disconnect(VFIOUserProxy *proxy)
     proxy->ioc = NULL;
     qemu_bh_delete(proxy->req_bh);
     proxy->req_bh = NULL;
+    /* state is not CONNECTED: no loss can schedule lost_bh any more */
+    qemu_bh_delete(proxy->lost_bh);
+    proxy->lost_bh = NULL;
+    g_clear_pointer(&proxy->reconnect_timer, timer_free);
 
     proxy->state = VFIO_PROXY_CLOSING;
     QTAILQ_FOREACH_SAFE(r1, &proxy->outgoing, next, r2) {
@@ -1123,76 +1243,33 @@ void vfio_user_disconnect(VFIOUserProxy *proxy)
     g_free(proxy);
 }
 
-void vfio_user_set_reconnect(VFIOUserProxy *proxy,
-                             void (*reconnect_fn)(void *opaque), void *opaque)
+void vfio_user_set_reconnect(VFIOUserProxy *proxy, uint32_t interval_ms,
+                             bool (*restore_fn)(void *opaque, Error **errp),
+                             void *opaque)
 {
-    WITH_QEMU_LOCK_GUARD(&proxy->lock) {
-        proxy->reconnect = true;
-        proxy->reconnect_fn = reconnect_fn;
-        proxy->reconnect_opaque = opaque;
-    }
-}
+    bool lost;
 
-/*
- * Redial the server after it dropped the connection and re-negotiate the
- * vfio-user version and capabilities.  The server (e.g. a restarted host-side
- * backend) may not have re-bound its listening socket yet, so retry with a
- * short backoff up to a bounded ceiling.  Runs on the main loop with BQL held;
- * the handshake reply is pumped by the proxy's iothread once the receive
- * handler below is re-armed.
- *
- * On success the proxy is CONNECTED with a fresh channel and empty queues; the
- * caller must then replay device state (DMA maps, interrupts) and reset.
- */
-bool vfio_user_proxy_redial(VFIOUserProxy *proxy, Error **errp)
-{
-    QIOChannelSocket *sioc;
-    QIOChannel *ioc;
-    unsigned attempt = 0;
-    /* ~30s ceiling at 50ms/attempt - a safety bound, not a target */
-    const unsigned max_attempts = 600;
-    const unsigned long backoff_us = 50 * 1000;
+    proxy->reconnect_ms = interval_ms;
+    proxy->restore_fn = restore_fn;
+    proxy->restore_opaque = opaque;
 
-    sioc = qio_channel_socket_new();
-    ioc = QIO_CHANNEL(sioc);
-
-    while (qio_channel_socket_connect_sync(sioc, proxy->sockaddr, errp) < 0) {
-        if (++attempt >= max_attempts) {
-            object_unref(OBJECT(ioc));
-            return false;
+    if (interval_ms == 0) {
+        if (proxy->reconnect_timer != NULL) {
+            timer_del(proxy->reconnect_timer);
         }
-        error_free(*errp);
-        *errp = NULL;
-        g_usleep(backoff_us);
+        return;
     }
 
-    if (!qio_channel_set_blocking(ioc, false, errp)) {
-        object_unref(OBJECT(ioc));
-        return false;
+    if (proxy->reconnect_timer == NULL) {
+        proxy->reconnect_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                              vfio_user_reconnect_timer, proxy);
     }
-
     WITH_QEMU_LOCK_GUARD(&proxy->lock) {
-        if (proxy->ioc != NULL) {
-            object_unref(OBJECT(proxy->ioc));
-        }
-        proxy->ioc = ioc;
-
-        /* in-flight messages belonged to the dead connection */
-        vfio_user_flush_queues(proxy);
-
-        proxy->state = VFIO_PROXY_CONNECTED;
+        lost = proxy->state == VFIO_PROXY_ERROR;
     }
-
-    /* re-arm the receive handler on the proxy's iothread */
-    qio_channel_set_aio_fd_handler(proxy->ioc, proxy->ctx,
-                                   vfio_user_recv, NULL, NULL, proxy);
-
-    /* re-negotiate version + capabilities with the (possibly new) server */
-    if (!vfio_user_validate_version(proxy, errp)) {
-        return false;
+    if (lost && !timer_pending(proxy->reconnect_timer)) {
+        vfio_user_arm_reconnect(proxy);
     }
-
-    return true;
 }
 
 void vfio_user_request_msg(VFIOUserHdr *hdr, uint16_t cmd,

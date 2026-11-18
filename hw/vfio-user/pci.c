@@ -10,7 +10,6 @@
 #include <sys/ioctl.h>
 #include "qapi-visit-sockets.h"
 #include "qemu/error-report.h"
-#include "qemu/lockable.h"
 
 #include "hw/core/qdev-properties.h"
 #include "hw/vfio/pci.h"
@@ -28,7 +27,7 @@ struct VFIOUserPCIDevice {
     bool send_queued;   /* all sends are queued */
     uint32_t wait_time; /* timeout for message replies */
     bool no_post;       /* all region writes are sync */
-    bool reconnect;     /* redial the server if it drops the socket */
+    uint32_t reconnect_ms; /* redial interval after a disconnect, 0: off */
 };
 
 /*
@@ -234,50 +233,73 @@ static VFIODeviceOps vfio_user_pci_ops = {
 };
 
 /*
- * Main-loop handler scheduled when the server drops the socket and
- * reconnect=on.  The guest keeps the device bound: we redial the server,
- * replay the guest DMA mappings, reset the server-side device (which bumps
- * the backend's handshake generation so the guest driver re-handshakes), and
- * re-send the current interrupt configuration.  On failure the proxy latches
- * into the error state, matching stock behaviour.
+ * The server came back (x-reconnect-ms): set the device up again on the new
+ * connection.  Main loop, BQL held, version already negotiated.
+ *
+ * docs/interop/vfio-user.rst "Server Disconnection": on a disconnect the
+ * client resets the device and the guest's error handling drives recovery.
+ * "Client Disconnection": the server drops the client's memory regions and
+ * IRQ fds, and a reconnecting client re-establishes them.  So: check that
+ * the same device is behind the socket, map guest memory again, reset the
+ * device (VFIO_USER_DEVICE_RESET) and send the interrupt eventfds of the
+ * current guest interrupt mode.  Guest-visible config space stays as the
+ * guest programmed it in QEMU; the device itself starts from reset.
  */
-static void vfio_user_pci_reconnect(void *opaque)
+static bool vfio_user_pci_restore(void *opaque, Error **errp)
 {
     VFIOUserPCIDevice *udev = opaque;
     VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(udev);
     VFIODevice *vbasedev = &vdev->vbasedev;
-    VFIOUserProxy *proxy = vbasedev->proxy;
-    VFIOUserContainer *container;
-    Error *local_err = NULL;
+    struct vfio_device_info info;
 
-    if (!vfio_user_proxy_redial(proxy, &local_err)) {
-        error_reportf_err(local_err,
-                          "vfio-user %s: reconnect failed: ", vbasedev->name);
-        WITH_QEMU_LOCK_GUARD(&proxy->lock) {
-            proxy->state = VFIO_PROXY_ERROR;
-        }
-        return;
+    if (!vfio_user_get_device_info(vbasedev->proxy, &info, errp)) {
+        return false;
+    }
+    if (info.flags != vbasedev->flags ||
+        info.num_regions != vbasedev->num_initial_regions ||
+        info.num_irqs != vbasedev->num_irqs) {
+        error_setg(errp, "a different device is behind the socket: flags 0x%x"
+                   " regions %u irqs %u, realized with 0x%x / %u / %u",
+                   info.flags, info.num_regions, info.num_irqs,
+                   vbasedev->flags, vbasedev->num_initial_regions,
+                   vbasedev->num_irqs);
+        return false;
     }
 
-    /* replay every guest DMA mapping onto the fresh server */
-    container = VFIO_IOMMU_USER(vbasedev->bcontainer);
-    if (!vfio_user_container_replay_maps(container, &local_err)) {
-        error_reportf_err(local_err,
-                          "vfio-user %s: DMA map replay failed: ",
-                          vbasedev->name);
-        WITH_QEMU_LOCK_GUARD(&proxy->lock) {
-            proxy->state = VFIO_PROXY_ERROR;
-        }
-        return;
+    if (!vfio_user_container_replay_maps(
+            VFIO_IOMMU_USER(vbasedev->bcontainer), errp)) {
+        error_prepend(errp, "DMA map replay: ");
+        return false;
     }
 
-    /* reset the server-side device; bumps the backend handshake generation */
-    vfio_user_device_reset(proxy);
+    if (vbasedev->reset_works) {
+        vfio_user_device_reset(vbasedev->proxy);
+    }
 
-    /* the reset cleared the server's IRQ state - re-send the current config */
     vfio_pci_replay_irqs(vdev);
+    return true;
+}
 
-    info_report("vfio-user %s: reconnected", vbasedev->name);
+/*
+ * A BAR mmap'd at realize maps the first server's memory into the guest;
+ * after a server restart it would keep pointing there.  Refuse reconnect
+ * for such devices instead of letting guest accesses split between two
+ * servers.
+ */
+static bool vfio_user_pci_has_mmaps(VFIOPCIDevice *vdev)
+{
+    int i, j;
+
+    for (i = 0; i < PCI_ROM_SLOT; i++) {
+        VFIORegion *region = &vdev->bars[i].region;
+
+        for (j = 0; j < region->nr_mmaps; j++) {
+            if (region->mmaps[j].mmap != NULL) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static void vfio_user_pci_realize(PCIDevice *pdev, Error **errp)
@@ -384,8 +406,14 @@ static void vfio_user_pci_realize(PCIDevice *pdev, Error **errp)
     vfio_pci_register_err_notifier(vdev);
     vfio_pci_register_req_notifier(vdev);
 
-    if (udev->reconnect) {
-        vfio_user_set_reconnect(proxy, vfio_user_pci_reconnect, udev);
+    if (udev->reconnect_ms) {
+        if (vfio_user_pci_has_mmaps(vdev)) {
+            warn_report("%s: x-reconnect-ms ignored: the device has mmap'd "
+                        "BARs", vbasedev->name);
+        } else {
+            vfio_user_set_reconnect(proxy, udev->reconnect_ms,
+                                    vfio_user_pci_restore, udev);
+        }
     }
 
     return;
@@ -440,6 +468,19 @@ static void vfio_user_pci_finalize(Object *obj)
     }
 }
 
+static void vfio_user_pci_exit(PCIDevice *pdev)
+{
+    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(pdev);
+    PCIDeviceClass *parent =
+        PCI_DEVICE_CLASS(object_class_by_name(TYPE_VFIO_PCI_DEVICE));
+
+    /* no redial may set up a device that is being torn down */
+    if (vdev->vbasedev.proxy != NULL) {
+        vfio_user_set_reconnect(vdev->vbasedev.proxy, 0, NULL, NULL);
+    }
+    parent->exit(pdev);
+}
+
 static void vfio_user_pci_reset(DeviceState *dev)
 {
     VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(dev);
@@ -468,7 +509,7 @@ static const Property vfio_user_pci_properties[] = {
     DEFINE_PROP_BOOL("x-send-queued", VFIOUserPCIDevice, send_queued, false),
     DEFINE_PROP_UINT32("x-msg-timeout", VFIOUserPCIDevice, wait_time, 5000),
     DEFINE_PROP_BOOL("x-no-posted-writes", VFIOUserPCIDevice, no_post, false),
-    DEFINE_PROP_BOOL("reconnect", VFIOUserPCIDevice, reconnect, false),
+    DEFINE_PROP_UINT32("x-reconnect-ms", VFIOUserPCIDevice, reconnect_ms, 0),
 };
 
 static void vfio_user_pci_set_socket(Object *obj, Visitor *v, const char *name,
@@ -516,6 +557,7 @@ static void vfio_user_pci_class_init(ObjectClass *klass, const void *data)
 
     dc->desc = "VFIO over socket PCI device assignment";
     pdc->realize = vfio_user_pci_realize;
+    pdc->exit = vfio_user_pci_exit;
 }
 
 static const TypeInfo vfio_user_pci_info = {

@@ -167,16 +167,29 @@ static int vfio_user_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
 bool vfio_user_container_replay_maps(VFIOUserContainer *container, Error **errp)
 {
     VFIOContainer *bcontainer = VFIO_IOMMU(container);
+    VFIOUserProxy *proxy = container->proxy;
+
+    /* the container's mapping geometry came from the first server */
+    if (proxy->dma_pgsizes != bcontainer->pgsizes ||
+        proxy->max_dma < bcontainer->dma_max_mappings) {
+        error_setg(errp, "server DMA page sizes 0x%" PRIx64 " / max mappings "
+                   "%" PRIu64 " differ from the realized 0x%" PRIx64
+                   " / %u", proxy->dma_pgsizes, proxy->max_dma,
+                   (uint64_t)bcontainer->pgsizes, bcontainer->dma_max_mappings);
+        return false;
+    }
 
     /*
-     * Re-registering the memory listener replays a region_add for every
-     * existing flat section, which re-sends each DMA_MAP to the server.  The
-     * matching region_del unmaps emitted during unregister are suppressed via
-     * proxy->reconnecting since the new server has nothing mapped yet.
+     * docs/interop/vfio-user.rst "Client Disconnection": a server drops all
+     * client memory regions when the client goes away, and a restarted
+     * server has none, so the client maps them again.  Re-registering the
+     * memory listener replays a region_add (DMA_MAP) for every current
+     * section; the region_del (DMA_UNMAP) of the unregister is suppressed,
+     * there is nothing mapped on this connection to unmap.
      */
-    container->proxy->reconnecting = true;
+    proxy->reconnecting = true;
     vfio_listener_unregister(bcontainer);
-    container->proxy->reconnecting = false;
+    proxy->reconnecting = false;
 
     return vfio_listener_register(bcontainer, errp);
 }
