@@ -48,6 +48,16 @@ static int vfio_user_dma_unmap(const VFIOContainer *bcontainer,
     Error *local_err = NULL;
     int ret = 0;
 
+    /*
+     * While replaying maps onto a freshly reconnected server there is nothing
+     * to unmap: the server's DMA table is empty.  Suppressing these unmaps lets
+     * us re-register the memory listener (which emits a region_del for every
+     * section) without flooding the new connection with spurious traffic.
+     */
+    if (container->proxy->reconnecting) {
+        return 0;
+    }
+
     VFIOUserDMAUnmap *msgp = g_malloc(sizeof(*msgp));
 
     vfio_user_request_msg(&msgp->hdr, VFIO_USER_DMA_UNMAP, sizeof(*msgp), 0);
@@ -152,6 +162,23 @@ static int vfio_user_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
     }
 
     return ret;
+}
+
+bool vfio_user_container_replay_maps(VFIOUserContainer *container, Error **errp)
+{
+    VFIOContainer *bcontainer = VFIO_IOMMU(container);
+
+    /*
+     * Re-registering the memory listener replays a region_add for every
+     * existing flat section, which re-sends each DMA_MAP to the server.  The
+     * matching region_del unmaps emitted during unregister are suppressed via
+     * proxy->reconnecting since the new server has nothing mapped yet.
+     */
+    container->proxy->reconnecting = true;
+    vfio_listener_unregister(bcontainer);
+    container->proxy->reconnecting = false;
+
+    return vfio_listener_register(bcontainer, errp);
 }
 
 static int

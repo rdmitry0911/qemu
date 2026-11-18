@@ -2737,6 +2737,38 @@ void vfio_pci_post_reset(VFIOPCIDevice *vdev)
     vfio_quirk_reset(vdev);
 }
 
+/*
+ * Re-send the device's current interrupt configuration to a server that has
+ * just been (re)connected and therefore has no IRQ state of its own.  The
+ * eventfds in vdev->msi_vectors[] and the INTx notifier are unchanged by a
+ * reconnect, so this reuses the same enable paths used after a reset without
+ * re-registering the guest-visible vector notifiers.
+ */
+void vfio_pci_replay_irqs(VFIOPCIDevice *vdev)
+{
+    Error *err = NULL;
+
+    switch (vdev->interrupt) {
+    case VFIO_INT_MSIX:
+        if (vdev->nr_vectors) {
+            vfio_enable_vectors(vdev, true);
+        } else {
+            vfio_enable_msix_no_vec(vdev);
+        }
+        break;
+    case VFIO_INT_MSI:
+        vfio_enable_vectors(vdev, false);
+        break;
+    case VFIO_INT_INTx:
+        if (!vfio_intx_enable(vdev, &err)) {
+            error_reportf_err(err, VFIO_MSG_PREFIX, vdev->vbasedev.name);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 bool vfio_pci_host_match(PCIHostDeviceAddress *addr, const char *name)
 {
     char tmp[13];

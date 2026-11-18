@@ -20,4 +20,10 @@ struct VFIOUserContainer {
 
 OBJECT_DECLARE_SIMPLE_TYPE(VFIOUserContainer, VFIO_IOMMU_USER);
 
+/*
+ * After a reconnect, the server's DMA table is empty.  Re-walk the guest
+ * address space and re-send every DMA_MAP.  Runs on the main loop, BQL held.
+ */
+bool vfio_user_container_replay_maps(VFIOUserContainer *container, Error **errp);
+
 #endif /* HW_VFIO_USER_CONTAINER_H */

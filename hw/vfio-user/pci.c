@@ -10,9 +10,11 @@
 #include <sys/ioctl.h>
 #include "qapi-visit-sockets.h"
 #include "qemu/error-report.h"
+#include "qemu/lockable.h"
 
 #include "hw/core/qdev-properties.h"
 #include "hw/vfio/pci.h"
+#include "hw/vfio-user/container.h"
 #include "hw/vfio-user/device.h"
 #include "hw/vfio-user/proxy.h"
 
@@ -26,6 +28,7 @@ struct VFIOUserPCIDevice {
     bool send_queued;   /* all sends are queued */
     uint32_t wait_time; /* timeout for message replies */
     bool no_post;       /* all region writes are sync */
+    bool reconnect;     /* redial the server if it drops the socket */
 };
 
 /*
@@ -230,6 +233,53 @@ static VFIODeviceOps vfio_user_pci_ops = {
     .vfio_load_config = NULL,
 };
 
+/*
+ * Main-loop handler scheduled when the server drops the socket and
+ * reconnect=on.  The guest keeps the device bound: we redial the server,
+ * replay the guest DMA mappings, reset the server-side device (which bumps
+ * the backend's handshake generation so the guest driver re-handshakes), and
+ * re-send the current interrupt configuration.  On failure the proxy latches
+ * into the error state, matching stock behaviour.
+ */
+static void vfio_user_pci_reconnect(void *opaque)
+{
+    VFIOUserPCIDevice *udev = opaque;
+    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(udev);
+    VFIODevice *vbasedev = &vdev->vbasedev;
+    VFIOUserProxy *proxy = vbasedev->proxy;
+    VFIOUserContainer *container;
+    Error *local_err = NULL;
+
+    if (!vfio_user_proxy_redial(proxy, &local_err)) {
+        error_reportf_err(local_err,
+                          "vfio-user %s: reconnect failed: ", vbasedev->name);
+        WITH_QEMU_LOCK_GUARD(&proxy->lock) {
+            proxy->state = VFIO_PROXY_ERROR;
+        }
+        return;
+    }
+
+    /* replay every guest DMA mapping onto the fresh server */
+    container = VFIO_IOMMU_USER(vbasedev->bcontainer);
+    if (!vfio_user_container_replay_maps(container, &local_err)) {
+        error_reportf_err(local_err,
+                          "vfio-user %s: DMA map replay failed: ",
+                          vbasedev->name);
+        WITH_QEMU_LOCK_GUARD(&proxy->lock) {
+            proxy->state = VFIO_PROXY_ERROR;
+        }
+        return;
+    }
+
+    /* reset the server-side device; bumps the backend handshake generation */
+    vfio_user_device_reset(proxy);
+
+    /* the reset cleared the server's IRQ state - re-send the current config */
+    vfio_pci_replay_irqs(vdev);
+
+    info_report("vfio-user %s: reconnected", vbasedev->name);
+}
+
 static void vfio_user_pci_realize(PCIDevice *pdev, Error **errp)
 {
     ERRP_GUARD();
@@ -334,6 +384,10 @@ static void vfio_user_pci_realize(PCIDevice *pdev, Error **errp)
     vfio_pci_register_err_notifier(vdev);
     vfio_pci_register_req_notifier(vdev);
 
+    if (udev->reconnect) {
+        vfio_user_set_reconnect(proxy, vfio_user_pci_reconnect, udev);
+    }
+
     return;
 
 out_teardown:
@@ -414,6 +468,7 @@ static const Property vfio_user_pci_properties[] = {
     DEFINE_PROP_BOOL("x-send-queued", VFIOUserPCIDevice, send_queued, false),
     DEFINE_PROP_UINT32("x-msg-timeout", VFIOUserPCIDevice, wait_time, 5000),
     DEFINE_PROP_BOOL("x-no-posted-writes", VFIOUserPCIDevice, no_post, false),
+    DEFINE_PROP_BOOL("reconnect", VFIOUserPCIDevice, reconnect, false),
 };
 
 static void vfio_user_pci_set_socket(Object *obj, Visitor *v, const char *name,

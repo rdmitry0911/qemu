@@ -50,6 +50,7 @@ enum proxy_state {
     VFIO_PROXY_ERROR = 2,
     VFIO_PROXY_CLOSING = 3,
     VFIO_PROXY_CLOSED = 4,
+    VFIO_PROXY_RECONNECTING = 5,
 };
 
 typedef QTAILQ_HEAD(VFIOUserMsgQ, VFIOUserMsg) VFIOUserMsgQ;
@@ -72,6 +73,17 @@ typedef struct VFIOUserProxy {
     AioContext *ctx;
     QEMUBH *req_bh;
     bool async_ops;
+
+    /*
+     * Client reconnect support.  When the server end of the socket is
+     * restarted (e.g. to load a new host-side backend), redial instead of
+     * failing permanently.  Only changed when BQL is held.
+     */
+    bool reconnect;             /* reconnect=on requested on the device */
+    bool reconnecting;          /* a redial/replay is in progress */
+    SocketAddress *sockaddr;    /* saved address to redial */
+    void (*reconnect_fn)(void *opaque); /* device-level reconnect orchestrator */
+    void *reconnect_opaque;
 
     /*
      * above only changed when BQL is held
@@ -108,6 +120,16 @@ void vfio_user_set_handler(VFIODevice *vbasedev,
                            void (*handler)(void *opaque, VFIOUserMsg *msg),
                            void *reqarg);
 bool vfio_user_validate_version(VFIOUserProxy *proxy, Error **errp);
+
+/*
+ * Enable client reconnect: when the socket drops, @reconnect_fn is scheduled
+ * on the main loop (BQL held) instead of latching VFIO_PROXY_ERROR.  It should
+ * call vfio_user_proxy_redial() and then replay device state.
+ */
+void vfio_user_set_reconnect(VFIOUserProxy *proxy,
+                             void (*reconnect_fn)(void *opaque), void *opaque);
+/* Redial the server and re-negotiate version/caps.  Runs on the main loop. */
+bool vfio_user_proxy_redial(VFIOUserProxy *proxy, Error **errp);
 
 VFIOUserFDs *vfio_user_getfds(int numfds);
 void vfio_user_putfds(VFIOUserMsg *msg);
